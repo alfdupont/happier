@@ -63,6 +63,20 @@ export async function githubConnect(
     const githubLoginUsername = githubLogin ? githubLogin.toLowerCase() : null;
     const preferredUsername = opts?.preferredUsername?.toString().trim().toLowerCase() || null;
 
+    // Step 0: Enforce AUTH_GITHUB_ALLOWED_USERS *before* creating or linking any
+    // account/identity records. Without this, the allowlist is only checked by
+    // enforceGitHubLoginEligibility() on later logins (existing accounts, socket
+    // reconnects) - a brand-new GitHub account can complete first-time signup and
+    // obtain a valid session token regardless of AUTH_GITHUB_ALLOWED_USERS. This
+    // mirrors the eligibility check that createOidcIdentityProvider(...).connect()
+    // already performs for OIDC providers.
+    const restrictions = resolveGitHubAuthRestrictionsFromEnv(process.env);
+    if (restrictions.allowedUsers.length > 0) {
+        if (!githubLoginUsername || !restrictions.allowedUsers.includes(githubLoginUsername)) {
+            throw new Error('not-eligible');
+        }
+    }
+
     // Step 1: Check if user is already connected to this exact GitHub account
     const existingIdentity = await db.accountIdentity.findFirst({
         where: { accountId: userId, provider: "github" },
