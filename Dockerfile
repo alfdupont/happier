@@ -298,6 +298,49 @@ RUN yarn workspace @happier-dev/release-runtime postinstall:real
 RUN yarn workspace @happier-dev/server postinstall:real
 RUN yarn workspace @happier-dev/server build
 
+# Keep the self-host image on the Debian slim runtime and install only the server
+# workspace dependency closure. The source builder above still uses the full workspace.
+FROM node:${NODE_VERSION}-bookworm-slim AS relay-server-runtime-base
+WORKDIR /repo
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
+ENV PORT=3005
+ENV RUN_MIGRATIONS=1
+
+FROM relay-server-runtime-base AS relay-server-runtime-deps
+ARG TARGETARCH
+ENV REDISMS_DISABLE_POSTINSTALL=1
+ENV YARN_CACHE_FOLDER=/tmp/.yarn-cache
+COPY package.json yarn.lock ./
+COPY apps/server/package.json apps/server/
+COPY packages/agents/package.json packages/agents/
+COPY packages/cli-common/package.json packages/cli-common/
+COPY packages/privacy-kit/package.json packages/privacy-kit/
+COPY packages/protocol/package.json packages/protocol/
+COPY packages/release-runtime/package.json packages/release-runtime/
+COPY scripts/pipeline/docker/prune-relay-server-runtime.sh /usr/local/bin/prune-relay-server-runtime
+COPY scripts/ci/yarn-install-with-retry.sh /usr/local/bin/yarn-install-with-retry
+RUN chmod +x /usr/local/bin/prune-relay-server-runtime /usr/local/bin/yarn-install-with-retry
+RUN --mount=type=cache,target=/tmp/.yarn-cache,sharing=locked \
+    yarn config set registry https://registry.npmjs.org/ \
+    && yarn-install-with-retry --frozen-lockfile --ignore-engines --network-timeout 600000 --prefer-offline --non-interactive --production=true --ignore-scripts \
+    && prune-relay-server-runtime "$TARGETARCH" - /repo/node_modules
+
+FROM server-builder AS relay-server-runtime-source
+ARG TARGETARCH
+COPY scripts/pipeline/docker/prune-relay-server-runtime.sh /usr/local/bin/prune-relay-server-runtime
+RUN chmod +x /usr/local/bin/prune-relay-server-runtime \
+    && prune-relay-server-runtime "$TARGETARCH" /repo/apps/server /repo/node_modules \
+    && rm -rf \
+    /repo/apps/server/node_modules \
+    /repo/packages/agents/node_modules \
+    /repo/packages/cli-common/node_modules \
+    /repo/packages/privacy-kit/node_modules \
+    /repo/packages/protocol/node_modules \
+    /repo/packages/release-runtime/node_modules
+
 FROM node:${NODE_VERSION} AS server
 WORKDIR /repo
 ARG SENTRY_RELEASE=""
@@ -328,11 +371,25 @@ FROM server AS server-worker
 ENV SERVER_ROLE=worker
 
 # Local relay server image for source-backed release candidate upgrade QA.
-FROM server AS relay-server-local-source
+FROM relay-server-runtime-base AS relay-server-local-source
+ARG SENTRY_RELEASE=""
+ENV SENTRY_RELEASE=$SENTRY_RELEASE
+ENV HAPPIER_RELEASE_SOURCE_SHA=$SENTRY_RELEASE
+COPY --from=relay-server-runtime-deps --chown=node:node /repo /repo
+COPY --from=relay-server-runtime-source --chown=node:node /repo/apps/server /repo/apps/server
+COPY --from=relay-server-runtime-source --chown=node:node /repo/packages/agents /repo/packages/agents
+COPY --from=relay-server-runtime-source --chown=node:node /repo/packages/cli-common /repo/packages/cli-common
+COPY --from=relay-server-runtime-source --chown=node:node /repo/packages/privacy-kit /repo/packages/privacy-kit
+COPY --from=relay-server-runtime-source --chown=node:node /repo/packages/protocol /repo/packages/protocol
+COPY --from=relay-server-runtime-source --chown=node:node /repo/packages/release-runtime /repo/packages/release-runtime
+COPY --from=server-builder --chown=node:node /repo/node_modules/.prisma /repo/node_modules/.prisma
+COPY --from=server-builder --chown=node:node /repo/node_modules/@prisma/engines /repo/node_modules/@prisma/engines
 USER root
-RUN mkdir -p /opt/happier/ui-web \
-    && chown -R node:node /opt/happier
+RUN mkdir -p /opt/happier/ui-web /data \
+    && chown -R node:node /opt/happier /data
 COPY --from=webapp-builder --chown=node:node /repo/apps/ui/dist /opt/happier/ui-web
+COPY --from=relay-server-runtime-source /repo/apps/server/scripts/run-server.sh /usr/local/bin/run-server
+RUN chmod +x /usr/local/bin/run-server
 ENV HAPPIER_SERVER_FLAVOR=light
 ENV HAPPY_SERVER_FLAVOR=light
 ENV HAPPIER_DB_PROVIDER=sqlite
@@ -343,7 +400,10 @@ ENV HAPPIER_SERVER_UI_DIR=/opt/happier/ui-web
 ENV HAPPIER_SERVER_UI_PREFIX=/
 ENV HAPPIER_SERVER_UI_REQUIRED=1
 ENV HAPPIER_SQLITE_AUTO_MIGRATE=1
+EXPOSE 3005
+VOLUME ["/data"]
 USER node
+CMD ["run-server"]
 
 # Relay server (self-host default: light + sqlite)
 FROM debian:12-slim AS relay-artifacts
@@ -355,8 +415,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tar minisign \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/pipeline/docker/fetch-verified-release-artifact.sh /usr/local/bin/fetch-verified-release-artifact
+COPY scripts/pipeline/docker/prune-relay-server-runtime.sh /usr/local/bin/prune-relay-server-runtime
 COPY scripts/release/installers/happier-release.pub /tmp/happier-release.pub
-RUN chmod +x /usr/local/bin/fetch-verified-release-artifact
+RUN chmod +x /usr/local/bin/fetch-verified-release-artifact /usr/local/bin/prune-relay-server-runtime
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) artifact_arch="x64" ;; \
@@ -372,19 +433,7 @@ RUN set -eux; \
       --arch "$artifact_arch" \
       --dest /opt/happier/server \
       --pubkey /tmp/happier-release.pub; \
-    rm -rf /opt/happier/server/generated/mysql-client /opt/happier/server/prisma/mysql; \
-    case "$TARGETARCH" in \
-      amd64) \
-        find /opt/happier/server/generated/sqlite-client -name '*.node' \
-            ! -name "libquery_engine-debian-openssl-3.0.x.so.node" -delete; \
-        rm -rf /opt/happier/server/node_modules/@img/sharp-libvips-linuxmusl-x64 \
-               /opt/happier/server/node_modules/@img/sharp-linuxmusl-x64 ;; \
-      arm64) \
-        find /opt/happier/server/generated/sqlite-client -name '*.node' \
-            ! -name "libquery_engine-linux-arm64-openssl-3.0.x.so.node" -delete; \
-        rm -rf /opt/happier/server/node_modules/@img/sharp-libvips-linuxmusl-arm64 \
-               /opt/happier/server/node_modules/@img/sharp-linuxmusl-arm64 ;; \
-    esac
+    prune-relay-server-runtime "$TARGETARCH" /opt/happier/server
 
 FROM debian:12-slim AS relay-server
 WORKDIR /opt/happier/server
