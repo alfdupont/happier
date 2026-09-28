@@ -41,6 +41,23 @@ Important:
 - npm installs expose the npm dist-tags (`@latest` and `@next`).
 - The rolling `dev` lane is installer-managed (`install-dev` / `hdev`), not a separate npm dist-tag.
 
+### Homebrew (coming soon)
+
+<Callout type="warn" title="Not published yet">
+The Homebrew formula is prepared but its tap is not public yet, so this command does not work
+today. Use the installer above until this notice is gone.
+</Callout>
+
+On macOS 13 (Ventura) or later and on Linux, the stable CLI will install from Happier's own tap:
+
+```bash
+brew install happier-dev/tap/happier
+```
+
+The formula installs the same signed release payload the installer does, into Homebrew's prefix,
+and links `happier` onto your `PATH`. It has no `brew services` entry: the background service is
+still set up by the CLI itself (`happier setup`, or `happier service install`).
+
 ## Updates
 
 How you update depends on how you installed the CLI:
@@ -48,6 +65,30 @@ How you update depends on how you installed the CLI:
 - **Installer install**: run the lane-specific command (`happier`, `hprev`, or `hdev`) with `self check` / `self update` (or rerun the matching installer endpoint). Installer installs keep the full CLI payload under `~/.happier/cli/current` and refresh the selected lane shim for you.
 - Stable is `~/.happier/cli/current`; preview/dev use `~/.happier/cli-preview/current` and `~/.happier/cli-dev/current`.
 - **npm install**: `npm install -g @happier-dev/cli@latest` (or `@next` for preview). npm does not currently expose a separate public `dev` dist-tag.
+- **Homebrew install** (once published): `brew upgrade happier`. `happier self update` recognises a Homebrew install and prints that command instead of replacing Homebrew's copy.
+
+### Using the desktop app with a CLI you installed yourself
+
+In the current development build (unreleased), when the desktop app sets up this computer and finds
+a `happier` it did not install (npm, Homebrew or a manual copy), it asks once, naming that CLI's
+version and path:
+
+- **Let Happier manage it** — the app installs its own CLI, puts it first on your `PATH` for new
+  terminals, and moves the background service to it. Your old copy is left in place; Settings ›
+  This computer › Command line shows the command that removes it (for example
+  `npm uninstall -g @happier-dev/cli` or `brew uninstall <formula>`). The app never runs it for you.
+- **Keep my own** — the app installs nothing and adds nothing to your `PATH`; the app, the
+  background service and your terminal all use your CLI. Updating it stays with you (for example
+  `npm install -g @happier-dev/cli@latest`). If it is too old for setup, the app says so and names
+  that command instead of replacing it.
+
+The answer applies to every Happier app on this computer. Change it any time in Settings › This
+computer › Command line. You are asked again only if the CLI you kept disappears or becomes too old
+for setup; if it disappears, the app asks before installing anything in its place.
+
+On Windows, a `happier` on the system-wide `Path` (for example from a machine-wide Node.js install)
+still runs first in new terminals after **Let Happier manage it**, because Windows puts the system
+`Path` ahead of yours. Remove that copy with the command Settings shows.
 
 The CLI can also show periodic update notices in TTY sessions; disable with:
 

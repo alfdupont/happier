@@ -43,9 +43,14 @@ import {
   resolveOpenCodeRuntimeAuthSelection,
 } from '../connectedServices/createOpenCodeConnectedServiceRuntimeAuthAdapter';
 import { extractOpenCodeSessionMessageId, parseOpenCodeToolPart } from './openCodeMessageParsing';
-import { canonicalizeOpenCodeConfiguredMcpToolName } from './openCodeMcpToolNames';
 import {
-  isKnownUnavailableOpenCodeModel,
+  buildOpenCodeSessionScopedPermissionRuleset,
+  canonicalizeOpenCodeConfiguredMcpToolName,
+  projectOpenCodeSessionMcpServers,
+} from './openCodeMcpToolNames';
+import {
+  isOpenCodeModelSelectable,
+  modelSupportsReasoningVariants,
   parseOpenCodeModelId,
   resolveOpenCodeDefaultProviderIdFromModelId,
 } from './openCodeModelParsing';
@@ -65,7 +70,6 @@ import {
   resolveOpenCodeUserMessageIdFromMetadata,
   upsertOpenCodeUserMessageIdInMetadata,
 } from './openCodeUserMessageIds';
-import { buildOpenCodeSessionPermissionRuleset } from '@/backends/openCodeFamily/permission/openCodeFamilyPermissionPolicy';
 import { resolvePreferredChangeTitleToolNameForProvider } from '@/agent/prompting/coding/providerToolAliasRegistry';
 import { extractOpenCodeFileDiff } from '../utils/extractOpenCodeFileDiff';
 import { readOpenCodeSessionRuntimeHandleFromMetadata } from '../utils/opencodeSessionAffinity';
@@ -244,6 +248,7 @@ export function createOpenCodeServerRuntime(params: {
   }>;
 }, deps: OpenCodeServerRuntimeDeps = {}) {
   const provider: ACPProvider = 'opencode';
+  const mcpProjection = projectOpenCodeSessionMcpServers(params.session.sessionId, params.mcpServers);
   const createClient = deps.createClient ?? createOpenCodeServerRuntimeClient;
   const env = params.env ?? process.env;
   let connectedBrokerPreflight: Promise<OpenCodeBrokerReadiness> | null = null;
@@ -339,17 +344,20 @@ export function createOpenCodeServerRuntime(params: {
   const configOverrides: Record<string, unknown> = {};
   let omitCustomMessageIdForResumedSession = false;
   let ensuredMcpServersForDirectory = false;
+  let currentMcpDirectory = params.directory;
   let mcpServerRegistrationInFlight: Promise<void> | null = null;
   let mcpServerRegistrationRerunRequested = false;
-  const requiredMcpServerName = params.happierMcpAdmission.kind === 'required'
-    ? 'happier'
+  const registeredMcpServers: Array<{ directory: string; name: string }> = [];
+  const requiresHappierMcpServer = params.happierMcpAdmission.kind === 'required';
+  const requiredMcpServerName = requiresHappierMcpServer
+    ? mcpProjection.requiredHappierServerName
     : null;
   let requiredMcpServerReadiness = {
     deferred: createDeferred<RequiredMcpServerReadinessOutcome>(),
   };
   if (
-    requiredMcpServerName
-    && !Object.prototype.hasOwnProperty.call(params.mcpServers, requiredMcpServerName)
+    requiresHappierMcpServer
+    && !requiredMcpServerName
   ) {
     requiredMcpServerReadiness.deferred.resolve({
       status: 'failed',
@@ -439,7 +447,7 @@ export function createOpenCodeServerRuntime(params: {
   }>();
 
   const resolveSessionPermissionRuleset = (): ReadonlyArray<{ permission: string; pattern: string; action: 'ask' | 'allow' | 'deny' }> =>
-    buildOpenCodeSessionPermissionRuleset(params.getPermissionMode?.() ?? 'default');
+    buildOpenCodeSessionScopedPermissionRuleset(params.getPermissionMode?.() ?? 'default', mcpProjection);
 
   const partTypeByPartKey = new Map<string, string>();
   const suppressedLivePartKeys = new Set<string>();
@@ -470,7 +478,7 @@ export function createOpenCodeServerRuntime(params: {
     const normalizedTool = toolRaw.trim();
     const toolLower = normalizedTool.toLowerCase();
     const canonicalMcpToolName =
-      canonicalizeOpenCodeConfiguredMcpToolName(normalizedTool, params.mcpServers);
+      canonicalizeOpenCodeConfiguredMcpToolName(normalizedTool, mcpProjection);
     return canonicalMcpToolName ?? (toolLower === 'grep' ? 'search' : normalizedTool);
   };
 
@@ -781,7 +789,10 @@ export function createOpenCodeServerRuntime(params: {
       const [config, agents, providers] = await Promise.all([
         c.globalConfigGet().catch(() => ({})),
         c.agentsList().catch(() => []),
-        c.providersList().catch(() => []),
+        c.providersList().catch(() => {
+          logger.infoFile('[OpenCodeServer] Model discovery failed; retaining the last available model list');
+          return null;
+        }),
       ]);
 
       const defaultModelId = typeof (config as any)?.model === 'string' ? String((config as any).model).trim() : '';
@@ -803,16 +814,11 @@ export function createOpenCodeServerRuntime(params: {
         for (const key of keys) {
           const modelRec = modelsRec[key];
           const modelId = normalizeString(asRecord(modelRec)?.id) || key;
-          if (isKnownUnavailableOpenCodeModel({ providerID: providerId, modelID: modelId })) continue;
-          const modelStatus = normalizeString(asRecord(modelRec)?.status);
-          if (modelStatus && modelStatus !== 'active') continue;
-          const capabilities = asRecord((asRecord(modelRec) as any)?.capabilities);
-          const input = capabilities ? asRecord((capabilities as any)?.input) : null;
-          if (input && (input as any).text === false) continue;
+          if (!isOpenCodeModelSelectable({ providerID: providerId, modelID: modelId, modelRecord: modelRec })) continue;
           const fullId = `${providerId}/${modelId}`;
           const name = normalizeString(asRecord(modelRec)?.name) || modelId;
           const description = normalizeString(asRecord(modelRec)?.family) || '';
-          const supportsReasoning = capabilities ? capabilities.reasoning === true : false;
+          const supportsReasoning = modelSupportsReasoningVariants(modelRec);
           const contextWindowTokens = readContextWindowTokensFromModelRecord(asRecord(modelRec) ?? {});
           const modelOptions: SessionModelEntry['modelOptions'] | null = supportsReasoning
             ? (buildOpenCodeThinkingModelOptionsFromVariants((asRecord(modelRec) as any)?.variants, variantCandidate) as SessionModelEntry['modelOptions'])
@@ -827,8 +833,14 @@ export function createOpenCodeServerRuntime(params: {
         }
       }
 
+      // Released `Agent.Info` separates the switchable `id` from the display `name`; V1 published
+      // only `name`, so it remains the fallback identity.
       const availableModes = (Array.isArray(agents) ? agents : [])
-        .map((a) => ({ id: normalizeString((a as any)?.name), name: normalizeString((a as any)?.name), description: normalizeString((a as any)?.description) }))
+        .map((a) => ({
+          id: normalizeString((a as any)?.id) || normalizeString((a as any)?.name),
+          name: normalizeString((a as any)?.name) || normalizeString((a as any)?.id),
+          description: normalizeString((a as any)?.description),
+        }))
         .filter((a) => a.id && a.name)
         .map((a) => ({ id: a.id, name: a.name, ...(a.description ? { description: a.description } : {}) }));
 
@@ -840,9 +852,11 @@ export function createOpenCodeServerRuntime(params: {
         (selectedModelId && availableModelIds.has(selectedModelId) ? selectedModelId : '')
         || (defaultModelId && availableModelIds.has(defaultModelId) ? defaultModelId : '')
         || availableModels[0]?.id
-        || '';
-      currentContextWindowTokens =
-        availableModels.find((model) => model.id === currentModelId)?.contextWindowTokens ?? null;
+        || selectedModelId || defaultModelId || 'default';
+      if (providers !== null) {
+        currentContextWindowTokens =
+          availableModels.find((model) => model.id === currentModelId)?.contextWindowTokens ?? null;
+      }
       const snapshot = await params.session.ensureMetadataSnapshot({ timeoutMs: 60_000 }).catch(() => null);
       if (!snapshot) return;
 
@@ -863,20 +877,22 @@ export function createOpenCodeServerRuntime(params: {
           currentModeId,
           availableModes,
         },
-        sessionModelsV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModelId,
-          availableModels,
-        },
-        acpSessionModelsV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModelId,
-          availableModels,
-        },
+        ...(providers !== null ? {
+          sessionModelsV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModelId,
+            availableModels,
+          },
+          acpSessionModelsV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModelId,
+            availableModels,
+          },
+        } : {}),
       }));
     })().catch((error) => {
       logger.debug('[OpenCodeServer] Failed publishing session options metadata (non-fatal)', error);
@@ -921,12 +937,7 @@ export function createOpenCodeServerRuntime(params: {
       for (const [modelKey, modelValue] of Object.entries(models)) {
         const model = asRecord(modelValue);
         const modelID = normalizeString(model?.id) || modelKey;
-        if (isKnownUnavailableOpenCodeModel({ providerID: providerId, modelID })) continue;
-        const status = normalizeString(model?.status);
-        if (status && status !== 'active') continue;
-        const capabilities = asRecord(model?.capabilities);
-        const input = capabilities ? asRecord(capabilities.input) : null;
-        if (input && input.text === false) continue;
+        if (!isOpenCodeModelSelectable({ providerID: providerId, modelID, modelRecord: model })) continue;
         return {
           providerID: providerId,
           modelID: normalizeString(model?.id) || modelKey,
@@ -935,26 +946,6 @@ export function createOpenCodeServerRuntime(params: {
     }
 
     throw new Error('OpenCode server compactContext requires an active model');
-  };
-
-  const modelIsSelectable = (model: Readonly<{
-    providerID: string;
-    modelID: string;
-    modelRecord?: unknown;
-  }>): boolean => {
-    const providerID = normalizeString(model.providerID);
-    const modelID = normalizeString(model.modelID);
-    if (!providerID || !modelID) return false;
-    if (isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
-
-    const record = asRecord(model.modelRecord);
-    if (!record) return true;
-    const status = normalizeString(record.status);
-    if (status && status !== 'active') return false;
-    const capabilities = asRecord(record.capabilities);
-    const input = capabilities ? asRecord(capabilities.input) : null;
-    if (input && input.text === false) return false;
-    return true;
   };
 
   const findModelForProvider = (
@@ -969,7 +960,7 @@ export function createOpenCodeServerRuntime(params: {
     const providerInfo = providers.find((providerRecord) => normalizeString(providerRecord.id) === normalizedProviderId);
     const models = asRecord(providerInfo?.models);
     if (!models) {
-      return modelIsSelectable({ providerID: normalizedProviderId, modelID: normalizedModelId })
+      return isOpenCodeModelSelectable({ providerID: normalizedProviderId, modelID: normalizedModelId })
         ? { providerID: normalizedProviderId, modelID: normalizedModelId }
         : null;
     }
@@ -978,7 +969,7 @@ export function createOpenCodeServerRuntime(params: {
       ?? Object.values(models).find((candidate) => normalizeString(asRecord(candidate)?.id) === normalizedModelId);
     if (!modelRecord) return null;
     const resolvedModelId = normalizeString(asRecord(modelRecord)?.id) || normalizedModelId;
-    return modelIsSelectable({ providerID: normalizedProviderId, modelID: resolvedModelId, modelRecord })
+    return isOpenCodeModelSelectable({ providerID: normalizedProviderId, modelID: resolvedModelId, modelRecord })
       ? { providerID: normalizedProviderId, modelID: resolvedModelId }
       : null;
   };
@@ -1024,7 +1015,7 @@ export function createOpenCodeServerRuntime(params: {
 
     const parsed = parseOpenCodeModelId(trimmed);
     if (parsed) {
-      if (!modelIsSelectable(parsed)) return null;
+      if (!isOpenCodeModelSelectable(parsed)) return null;
       return options.validateQualifiedModel === true
         ? await validateQualifiedModelAgainstProviderInventory(parsed)
         : parsed;
@@ -1049,7 +1040,7 @@ export function createOpenCodeServerRuntime(params: {
     if (matches.length === 1) return matches[0];
 
     if (defaultProviderId) {
-      return modelIsSelectable({ providerID: defaultProviderId, modelID: trimmed })
+      return isOpenCodeModelSelectable({ providerID: defaultProviderId, modelID: trimmed })
         ? { providerID: defaultProviderId, modelID: trimmed }
         : null;
     }
@@ -1093,72 +1084,6 @@ export function createOpenCodeServerRuntime(params: {
 
   let scheduleAuthoritativeRequestInventoryRefresh: () => void = () => {};
 
-  const handleUntrustedObservation = (evt: OpenCodeGlobalEvent): Promise<void> | void => {
-    const type = normalizeString(evt.payload.type);
-    const props = asRecord(evt.payload.properties);
-
-    if (type === 'message.updated') {
-      const info = asRecord(props?.info);
-      if (!info) return;
-      const observedSessionId = normalizeString(info.sessionID);
-      if (!turnPromptActive) {
-        if (sessionId && observedSessionId === sessionId) {
-          // The event is only a content-free invalidation. The inventory reader remains the
-          // authority for externally authored transcript rows.
-          scheduleExternalSessionTranscriptProjection();
-        }
-        return;
-      }
-      if (!isExactCurrentTurnAssistantObservation(info)) return;
-      return handleEvent(evt);
-    }
-
-    if (
-      type === 'message.part.updated'
-      || type === 'message.part.created'
-      || type === 'message.part.delta'
-    ) {
-      if (!turnPromptActive) return;
-      const part = type === 'message.part.delta' ? props : asRecord(props?.part);
-      if (!part) return;
-      const observedSessionId = normalizeString(part.sessionID);
-      const messageId = normalizeString(part.messageID);
-      if (!observedSessionId || !messageId) return;
-      if (observedSessionId === sessionId) {
-        if (!isCurrentTurnObservationMessageId(messageId)) return;
-        return handleEvent(evt);
-      }
-      // A child session is admitted only after the current parent turn's Task tool established the
-      // exact sidechain mapping. Old or unrelated global-bus frames therefore remain inert.
-      if (resolveSidechainIdForRemoteSession(observedSessionId)) {
-        return handleEvent(evt);
-      }
-      return;
-    }
-
-    if (type === 'todo.updated') {
-      const observedSessionId = normalizeString(props?.sessionID)
-        || normalizeString(asRecord(props?.session)?.id);
-      if (!observedSessionId || observedSessionId === sessionId) {
-        // The SSE frame is a wake-up only; the inventory reader remains authoritative.
-        publishNativeTodosWorkStateBestEffort();
-      }
-      return;
-    }
-
-    if (type === 'question.asked' || type === 'permission.asked') {
-      const observedSessionId = normalizeString(props?.sessionID);
-      if (
-        observedSessionId
-        && (observedSessionId === sessionId || sidechainIdByRemoteSessionId.has(observedSessionId))
-      ) {
-        // GlobalBus can replay the original event shape after reconnect. Treat it only as a wake:
-        // the provider's current pending-request lists are the authority for content and liveness.
-        scheduleAuthoritativeRequestInventoryRefresh();
-      }
-    }
-  };
-
   const attachSubscriptionIfNeeded = async (): Promise<void> => {
     if (subscriptionAbort) return;
     const c = await ensureClient();
@@ -1184,9 +1109,7 @@ export function createOpenCodeServerRuntime(params: {
         nextProviderEventSequence = eventSequence;
         const processEvent = (): Promise<void> | void => {
           try {
-            return delivery.provenance === 'untrusted-observation'
-              ? handleUntrustedObservation(evt)
-              : handleEvent(evt, { reconcileTranscriptOnConnect: !isInitialConnectionBoundary });
+            return handleEvent(evt, { reconcileTranscriptOnConnect: !isInitialConnectionBoundary });
           } catch (error) {
             logger.debug('[OpenCodeServer] Failed handling event (non-fatal)', error);
           }
@@ -3093,6 +3016,29 @@ export function createOpenCodeServerRuntime(params: {
           // OpenCode represents some freeform prompts as a single “type now” option with a `locations` field,
           // but Happier’s AskUserQuestion should treat these as typed answers (not a real selection).
           const hasLocations = Array.isArray((q as any).locations);
+          // Released V2 `custom: true` alongside options projects an explicit `freeform` marker
+          // (options plus free-text escape hatch). Preserve it verbatim: the existing hint/location
+          // heuristics must not strip a producer-declared freeform capability.
+          const incomingFreeformRaw = (q as any).freeform;
+          const hasExplicitFreeform =
+            incomingFreeformRaw === true ||
+            (incomingFreeformRaw !== false &&
+              incomingFreeformRaw !== null &&
+              incomingFreeformRaw !== undefined &&
+              typeof incomingFreeformRaw === 'object' &&
+              !Array.isArray(incomingFreeformRaw));
+          if (hasExplicitFreeform) {
+            const freeformRecord = asRecord(incomingFreeformRaw) ?? {};
+            const placeholder = normalizeString(freeformRecord.placeholder);
+            const description = normalizeString(freeformRecord.description);
+            return {
+              options,
+              freeform: {
+                ...(placeholder ? { placeholder } : {}),
+                ...(description ? { description } : {}),
+              },
+            };
+          }
           const hintOption = options.find((opt) => looksLikeFreeformQuestionHintLabel(opt.label)) ?? null;
           const isSingleOptionHint = options.length === 1 && hintOption !== null;
 
@@ -3460,6 +3406,11 @@ export function createOpenCodeServerRuntime(params: {
             lifecycleId: manualCompaction.lifecycleId,
             trigger: 'manual',
           });
+          // The delayed V2 ended/failed event settles the async admission left open by
+          // compactContext; release the manual lifecycle so liveness does not stick.
+          if (activeManualCompaction === manualCompaction) {
+            activeManualCompaction = null;
+          }
         }
         return;
       }
@@ -3634,7 +3585,9 @@ export function createOpenCodeServerRuntime(params: {
       const partID = normalizeString(rec.partID);
       const delta = normalizeString(rec.delta);
       if (!messageID || !partID || !delta) return;
-      const partType = partTypeByPartKey.get(`${sessionID}:${partID}`) ?? '';
+      // A producer that already knows the part kind states it, so a live delta never has to wait
+      // for the `*.started` frame that would otherwise register the kind.
+      const partType = normalizeString(rec.partType) || partTypeByPartKey.get(`${sessionID}:${partID}`) || '';
       const accumulationKey = `${sessionID}:${messageID}:${partType === 'reasoning' ? 'reasoning' : 'text'}`;
       const accumulated = accumulatedTextByPartKey.get(accumulationKey) ?? '';
       const nextAccumulated = delta.startsWith(accumulated) ? delta : accumulated + delta;
@@ -3821,7 +3774,7 @@ export function createOpenCodeServerRuntime(params: {
     requiredMcpServerReadiness = {
       deferred: createDeferred<RequiredMcpServerReadinessOutcome>(),
     };
-    if (!Object.prototype.hasOwnProperty.call(params.mcpServers, requiredMcpServerName)) {
+    if (!mcpProjection.requiredHappierServerName) {
       requiredMcpServerReadiness.deferred.resolve({
         status: 'failed',
         error: new Error('required Happier MCP server configuration is missing'),
@@ -3831,7 +3784,7 @@ export function createOpenCodeServerRuntime(params: {
 
   const registerMcpServersForCurrentDirectoryBestEffort = async (): Promise<void> => {
     if (ensuredMcpServersForDirectory) return;
-    if (!params.mcpServers || Object.keys(params.mcpServers).length === 0) return;
+    if (mcpProjection.registrations.length === 0) return;
     const requiredReadinessForRegistration = requiredMcpServerReadiness;
     let c: OpenCodeServerRuntimeClient;
     try {
@@ -3846,9 +3799,10 @@ export function createOpenCodeServerRuntime(params: {
       throw error;
     }
     let hadFailures = false;
-    for (const [name, cfg] of Object.entries(params.mcpServers)) {
-      const serverName = typeof name === 'string' ? name.trim() : '';
-      if (!serverName) continue;
+    const registrationDirectory = currentMcpDirectory;
+    for (const registration of mcpProjection.registrations) {
+      const serverName = registration.projectedName;
+      const cfg = registration.config;
       const cmd = typeof cfg?.command === 'string' ? cfg.command.trim() : '';
       if (!cmd) {
         if (
@@ -3872,6 +3826,7 @@ export function createOpenCodeServerRuntime(params: {
 
       try {
         const registrationStatus = await c.mcpAdd({
+          directory: registrationDirectory,
           name: serverName,
           config: {
             type: 'local',
@@ -3885,6 +3840,11 @@ export function createOpenCodeServerRuntime(params: {
           throw new Error(
             `OpenCode MCP server "${serverName}" returned status "${registrationStatus.status}"${detail}`,
           );
+        }
+        if (!registeredMcpServers.some((entry) => (
+          entry.directory === registrationDirectory && entry.name === serverName
+        ))) {
+          registeredMcpServers.push({ directory: registrationDirectory, name: serverName });
         }
         if (
           serverName === requiredMcpServerName
@@ -3935,7 +3895,7 @@ export function createOpenCodeServerRuntime(params: {
     turn: Deferred<void>,
     targetSessionId: string,
   ): Promise<RequiredMcpServerReadinessOutcome | null> => {
-    if (!requiredMcpServerName) return { status: 'ready' };
+    if (!requiresHappierMcpServer) return { status: 'ready' };
     for (;;) {
       if (!isActivePromptTurn(turn, targetSessionId)) return null;
       const readiness = requiredMcpServerReadiness;
@@ -3975,7 +3935,9 @@ export function createOpenCodeServerRuntime(params: {
     await pendingQueue.drainPending(drainOptions);
   };
 
-  const preferredOpenCodeChangeTitleToolName = resolvePreferredChangeTitleToolNameForProvider('opencode');
+  const preferredOpenCodeChangeTitleToolName = resolvePreferredChangeTitleToolNameForProvider('opencode', {
+    openCodeMcpClientName: mcpProjection.requiredHappierServerName,
+  });
   return {
     getSessionId: () => sessionId,
     shouldResumeAfterPermissionModeChange: () => true,
@@ -4024,6 +3986,7 @@ export function createOpenCodeServerRuntime(params: {
             if (c.setDirectoryOverride(sessionDirectory)) {
               resetServerConnectedReadiness();
             }
+            currentMcpDirectory = sessionDirectory;
             params.session.setRuntimeWorkingDirectory(sessionDirectory);
           } catch {
             // non-fatal
@@ -4093,6 +4056,7 @@ export function createOpenCodeServerRuntime(params: {
           if (c.setDirectoryOverride(createdDirectory)) {
             resetServerConnectedReadiness();
           }
+          currentMcpDirectory = createdDirectory;
           params.session.setRuntimeWorkingDirectory(createdDirectory);
         } catch {
           // non-fatal
@@ -4441,9 +4405,17 @@ export function createOpenCodeServerRuntime(params: {
         providerSessionId: sessionId,
       });
 
+      let retainManualCompactionForDelayedEvent = false;
       try {
         await c.sessionSummarize({ sessionId, model, auto: false });
-        if (!manualCompaction.terminalObserved) {
+        // Released V2 `POST /api/session/:id/compact` durably admits a `SessionInbox.Compaction`
+        // request (`protocol session.ts session.compact`) and runs it at the next step boundary;
+        // the HTTP return is admission, not completion. The real lifecycle is
+        // `session.compaction.started|ended|failed`. Emitting completed here would falsely
+        // complete before the provider runs, so the manual lifecycle stays open for the delayed
+        // event. V1 `summarize` is synchronous, so its HTTP return stays the completion signal.
+        const v2AsyncAdmission = c.supportsInFlightSteer();
+        if (!v2AsyncAdmission && !manualCompaction.terminalObserved) {
           sendContextCompactionEvent({
             type: 'context-compaction',
             phase: 'completed',
@@ -4453,6 +4425,9 @@ export function createOpenCodeServerRuntime(params: {
             lifecycleId: manualCompaction.lifecycleId,
             providerSessionId: sessionId,
           });
+        }
+        if (v2AsyncAdmission && !manualCompaction.terminalObserved) {
+          retainManualCompactionForDelayedEvent = true;
         }
       } catch (error) {
         if (!manualCompaction.terminalObserved) {
@@ -4473,10 +4448,20 @@ export function createOpenCodeServerRuntime(params: {
         rejectTurn(error);
         throw error;
       } finally {
-        if (activeManualCompaction === manualCompaction) {
-          activeManualCompaction = null;
+        // V2 async admission keeps the manual lifecycle open for the delayed ended/failed
+        // event; clearing here would orphan the real completion and falsely idle the turn.
+        if (
+          retainManualCompactionForDelayedEvent &&
+          !manualCompaction.terminalObserved &&
+          activeManualCompaction === manualCompaction
+        ) {
+          // Keep activeManualCompaction and compactionInProgress for the event owner.
+        } else {
+          if (activeManualCompaction === manualCompaction) {
+            activeManualCompaction = null;
+          }
+          compactionInProgress = false;
         }
-        compactionInProgress = false;
       }
     },
 
@@ -4544,10 +4529,25 @@ export function createOpenCodeServerRuntime(params: {
       omitCustomMessageIdForResumedSession = false;
       suppressSessionErrorAbortNotificationForSessionId = null;
       for (const key of Object.keys(configOverrides)) delete configOverrides[key];
-      // OpenCode owns MCP registrations per directory and server name. Another Happier session may
-      // have replaced the same name, so this session must not disconnect it during local teardown.
+      // OpenCode owns MCP registrations per directory and server name. Because another Happier
+      // session cannot replace this session's projected names, teardown removes only registrations
+      // that this runtime successfully established.
       invalidateMcpServersForCurrentDirectory();
       mcpServerRegistrationRerunRequested = false;
+      const registrationInFlight = mcpServerRegistrationInFlight;
+      if (registrationInFlight) await registrationInFlight;
+      if (client) {
+        for (const registration of registeredMcpServers.splice(0)) {
+          try {
+            await client.mcpDisconnect(registration);
+          } catch (error) {
+            logger.debug('[OpenCodeServer] Failed to disconnect session-scoped MCP server (non-fatal)', {
+              ...registration,
+              error,
+            });
+          }
+        }
+      }
       if (subscriptionAbort) {
         try {
           subscriptionAbort.abort();
