@@ -1,26 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { readSharedManagedOpenCodeServerStateBestEffort } from './sharedManagedServer';
+
 vi.mock('./openCodeSse', () => ({
   subscribeSseJson: vi.fn(),
 }));
 
-vi.mock('./sharedManagedServer', () => ({
+vi.mock('./sharedManagedServer', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./sharedManagedServer')>(),
   ensureSharedManagedOpenCodeServerBaseUrl: vi.fn(),
-  isLoopbackManagedOpenCodeBaseUrl: (rawBaseUrl: string) => {
-    const value = rawBaseUrl.trim();
-    if (!value) return false;
-    try {
-      const url = new URL(value);
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-      const port = Number.parseInt(url.port, 10);
-      if (!Number.isFinite(port) || port <= 0) return false;
-      const host = url.hostname.toLowerCase();
-      return host === 'localhost' || host === '::1' || host.startsWith('127.');
-    } catch {
-      return false;
-    }
-  },
-  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(),
+  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(async () => null),
+  readSharedManagedOpenCodeServerStateByBaseUrlBestEffort: vi.fn(async () => null),
 }));
 
 type FakeResponse = {
@@ -51,6 +41,7 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.mocked(readSharedManagedOpenCodeServerStateBestEffort).mockResolvedValue(null);
 
     for (const key of [
       'HAPPIER_OPENCODE_SERVER_URL',
@@ -154,11 +145,13 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
       disconnect: 'error',
       initialEventPath: '/event?directory=%2Ftmp',
       replacementEventPath: '/api/event',
-      replacementSessionPath: '/api/session?directory=%2Ftmp',
+      replacementSessionPath: '/api/session?directory=%2Ftmp&order=asc',
       replacementBoundary: { type: 'server.connected', data: {} },
+      // Released wire frame from the real v2.0.15 binary (`/api/event`): streamed parts are
+      // identified by (assistantMessageID, ordinal), not the preview `textID`.
       replacementEvent: {
-        type: 'session.next.text.delta',
-        data: { sessionID: 'ses_1', assistantMessageID: 'msg_1', textID: 'txt_1', delta: 'v2' },
+        type: 'session.text.delta',
+        data: { sessionID: 'ses_1', assistantMessageID: 'msg_1', ordinal: 0, delta: 'v2' },
       },
       expectedEventType: 'message.part.delta',
     },
@@ -560,6 +553,7 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.mocked(readSharedManagedOpenCodeServerStateBestEffort).mockResolvedValue(null);
     for (const key of [
       'HAPPIER_OPENCODE_SERVER_URL',
       'HAPPIER_OPENCODE_SSE_RECONNECT_BASE_DELAY_MS',
@@ -765,8 +759,8 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
     });
     vi.stubGlobal('fetch', fetchSpy as any);
 
-    const { readSharedManagedOpenCodeServerStateBestEffort } = await import('./sharedManagedServer');
-    const readMock = readSharedManagedOpenCodeServerStateBestEffort as unknown as ReturnType<typeof vi.fn>;
+    const { readSharedManagedOpenCodeServerStateByBaseUrlBestEffort } = await import('./sharedManagedServer');
+    const readMock = readSharedManagedOpenCodeServerStateByBaseUrlBestEffort as unknown as ReturnType<typeof vi.fn>;
 
     const changes: unknown[] = [];
     const { createOpenCodeServerRuntimeClient } = await import('./client');
@@ -776,9 +770,10 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
       onManagedServerIdentityChanged: (change) => changes.push(change),
     });
 
-    // Explicit URL mode is not managed: identity is null and state is never read.
+    // Explicit URL mode does not adopt managed lifecycle identity. A loopback URL does perform one
+    // state read so an exact managed endpoint can consume its retained credential safely.
     expect(client.getManagedServerIdentity()).toBeNull();
-    expect(readMock).not.toHaveBeenCalled();
+    expect(readMock).toHaveBeenCalledWith('http://127.0.0.1:9999');
     expect(changes).toHaveLength(0);
 
     await client.dispose();

@@ -8,6 +8,7 @@ import { windowsTerminalCapability } from '@/capabilities/registry/toolWindowsTe
 import { executionRunsCapability } from '@/capabilities/registry/toolExecutionRuns';
 import { systemTasksCapability } from '@/capabilities/registry/toolSystemTasks';
 import { installableDepCapabilities } from '@/capabilities/registry/installableDeps';
+import { withProviderCliUpdates } from '@/capabilities/cliUpdate/providerCliUpdates';
 import { createCapabilitiesService } from '@/capabilities/service';
 import type { Capability } from '@/capabilities/service';
 import type {
@@ -319,9 +320,9 @@ async function invokeCliProbeMethod(
     const preflightAdapter = entry?.getPreflightSessionControlsProbeAdapter
         ? await entry.getPreflightSessionControlsProbeAdapter().catch(() => null)
         : null;
-    const requiresMaterializedAuth = Boolean(
-        connectedServices && preflightAdapter?.connectedServiceAuth === 'materialized-env',
-    );
+    const requiresMaterializedAuth = preflightAdapter?.connectedServiceAuth === 'materialized-env'
+        && Boolean(connectedServices && Object.values(connectedServices.bindingsByServiceId)
+            .some((binding) => binding.source === 'connected'));
     const probeContext = await resolveProbeBackendContext(
         { ...params, agentId },
         { requireCredentials: requiresMaterializedAuth },
@@ -385,7 +386,7 @@ async function invokeCliProbeMethod(
         };
 
         if (method === 'probeModels') {
-            const result = await probeAgentModelsBestEffort(commonParams);
+            const result = await probeAgentModelsBestEffort({ ...commonParams, bypassCache: params?.bypassCache === true });
             return { ok: true, result };
         }
         if (method === 'probeModes') {
@@ -478,9 +479,9 @@ export async function createCliCapabilitiesService(): Promise<ReturnType<typeof 
         (Object.values(AGENTS) as AgentCatalogEntry[]).map(async (entry) => {
             if (entry.getCliCapabilityOverride) {
                 const override = await entry.getCliCapabilityOverride();
-                return augmentCliCapabilityWithProbeModels(override, entry.id);
+                return withProviderCliUpdates(augmentCliCapabilityWithProbeModels(override, entry.id), entry.id);
             }
-            return createGenericCliCapability(entry.id);
+            return withProviderCliUpdates(createGenericCliCapability(entry.id), entry.id);
         }),
     );
 
