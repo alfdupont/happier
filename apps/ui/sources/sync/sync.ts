@@ -244,6 +244,7 @@ import { projectManager } from './runtime/orchestration/projectManager';
 import { clearMountedSessionRealtimeScmConsumerScopes } from './runtime/sessionRealtimeScmConsumers';
 import { voiceHooks } from '@/voice/context/voiceHooks';
 import { notifyActivityReady } from '@/activity/notifications/runtime/activityLocalNotificationBus';
+import { isBrowserNotificationDeliveryEnabled } from '@/activity/notifications/browserNotificationDelivery';
 import { Message } from './domains/messages/messageTypes';
 import { EncryptionCache } from './encryption/encryptionCache';
 import { nowServerMs } from './runtime/time';
@@ -1327,7 +1328,7 @@ class Sync {
 
           // Listen for app state changes to pause sync + run a single centralized resume pipeline.
           AppState.addEventListener('change', (nextAppState) => {
-              if (this.usesPersistentDesktopSync && nextAppState !== 'active') {
+              if (nextAppState !== 'active' && this.keepsSyncConnectedWhileHidden()) {
                   this.clearNativeInactiveCheckpointTimer();
                   this.isForeground = true;
                   setServerReachabilityNetworkAllowed(true);
@@ -1373,6 +1374,9 @@ class Sync {
                       if (hardBoundary) {
                           this.userRequestLeases.clear();
                           this.deferredWebVisibilityTeardown = null;
+                      } else if (this.keepsSyncConnectedWhileHidden()) {
+                          // Page unload and freeze remain hard boundaries.
+                          return;
                       } else if (this.userRequestLeases.size > 0) {
                           this.deferredWebVisibilityTeardown = () => pauseForWebBackground(tag);
                           return;
@@ -1489,6 +1493,17 @@ class Sync {
                   }
               }
           }
+      }
+
+      /**
+       * Whether sync stays connected while the app or tab is hidden: always for the desktop app,
+       * and for a browser tab that shows notifications, since those are raised from live session
+       * events. react-native-web reports a hidden tab both as AppState 'background' and through
+       * the document visibility listener, so both pause paths consult this one rule.
+       */
+      private keepsSyncConnectedWhileHidden(): boolean {
+          return this.usesPersistentDesktopSync
+              || (Platform.OS === 'web' && isBrowserNotificationDeliveryEnabled());
       }
 
       public getSyncTuning(): SyncTuning {

@@ -281,6 +281,27 @@ describe('sync AppState pause/resume', () => {
         expect(pauseController.isPaused()).toBe(false);
     });
 
+    it('keeps a web tab connected when AppState reports background while browser notifications are granted', async () => {
+        // react-native-web reports a hidden tab as AppState 'background'.
+        const browserGlobals = globalThis as unknown as { Notification?: unknown };
+        const originalNotification = browserGlobals.Notification;
+        browserGlobals.Notification = Object.assign(function FakeNotification() {}, { permission: 'granted' });
+
+        try {
+            const { sync } = await import('./sync');
+            const handler = Array.from(appStateHandlers)[0];
+            expect(handler).toBeTruthy();
+            const pauseController = (sync as unknown as { pauseController: PauseController }).pauseController;
+
+            handler!('background');
+
+            expect(apiSocketDisconnect).not.toHaveBeenCalled();
+            expect(pauseController.isPaused()).toBe(false);
+        } finally {
+            browserGlobals.Notification = originalNotification;
+        }
+    });
+
     it('quiesces native crypto worker dispatch on background and resumes it on active', async () => {
         const { Encryption } = await import('./encryption/encryption');
         const markQuiescentSpy = vi.spyOn(Encryption, 'markNativeCryptoWorkerQueueQuiescent');
@@ -518,6 +539,59 @@ describe('sync AppState pause/resume', () => {
             expect(pauseController.isPaused()).toBe(false);
         } finally {
             globalWithDocument.document = originalDocument;
+        }
+    });
+
+    it('keeps web sync connected while hidden when browser notifications are granted, until a hard boundary', async () => {
+        const browserGlobals = globalThis as unknown as { document?: unknown; Notification?: unknown };
+        const originalDocument = browserGlobals.document;
+        const originalNotification = browserGlobals.Notification;
+        const handlers = new Map<string, Set<() => void>>();
+        const windowHandlers = new Map<string, Set<() => void>>();
+        const documentStub = {
+            visibilityState: 'visible',
+            addEventListener: (event: string, listener: () => void) => {
+                const set = handlers.get(event) ?? new Set<() => void>();
+                set.add(listener);
+                handlers.set(event, set);
+            },
+            removeEventListener: (event: string, listener: () => void) => {
+                handlers.get(event)?.delete(listener);
+            },
+            dispatchEvent: (_event: unknown) => {},
+        };
+        const globalWithEvents = globalThis as unknown as {
+            addEventListener?: (event: string, listener: () => void) => void;
+        };
+        const originalAddEventListener = globalWithEvents.addEventListener;
+        globalWithEvents.addEventListener = (event: string, listener: () => void) => {
+            const set = windowHandlers.get(event) ?? new Set<() => void>();
+            set.add(listener);
+            windowHandlers.set(event, set);
+        };
+        browserGlobals.document = documentStub;
+        // Browser boundary: notification permission granted for this site.
+        browserGlobals.Notification = Object.assign(function FakeNotification() {}, { permission: 'granted' });
+
+        try {
+            const { sync } = await import('./sync');
+            const pauseController = (sync as unknown as { pauseController: PauseController }).pauseController;
+
+            // A hidden tab must keep receiving session events, or no notification can ever fire.
+            documentStub.visibilityState = 'hidden';
+            for (const handler of handlers.get('visibilitychange') ?? []) handler();
+
+            expect(apiSocketDisconnect).not.toHaveBeenCalled();
+            expect(pauseController.isPaused()).toBe(false);
+
+            // Unloading or freezing the page still disconnects.
+            for (const handler of windowHandlers.get('pagehide') ?? []) handler();
+            expect(apiSocketDisconnect).toHaveBeenCalledTimes(1);
+            expect(pauseController.isPaused()).toBe(true);
+        } finally {
+            browserGlobals.document = originalDocument;
+            browserGlobals.Notification = originalNotification;
+            globalWithEvents.addEventListener = originalAddEventListener;
         }
     });
 
