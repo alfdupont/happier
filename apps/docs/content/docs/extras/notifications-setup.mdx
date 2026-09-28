@@ -53,6 +53,7 @@ Platform details:
 **Development builds:** the web app shows browser notifications for the same events, using your **Local notifications** settings in **Settings → Notifications**. Open **Browser notifications → Browser permission** and allow notifications when your browser asks. If you blocked them earlier, allow notifications for the site in your browser's settings.
 
 - A Happier tab must be open. It can be in the background, but a closed tab receives nothing. For alerts while no tab is open, use push on your phone or a webhook.
+- While browser notifications are allowed, a hidden Happier tab stays connected so it can notify you. Without them, a hidden tab disconnects to save resources and catches up when you return.
 - A notification for the session you are looking at is skipped while the tab is visible and focused.
 - A background tab always shows the notification and plays a short sound. While the tab is in front, **Foreground behavior** applies: `full` plays the sound, `silent` shows the notification without it, and `off` shows nothing.
 - Happier plays the sound itself and shows the browser notification silently, so you hear the same sound everywhere, including on systems that play none for browser notifications.
