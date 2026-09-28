@@ -3280,6 +3280,19 @@ const zhHantOverrides: DeepPartial<TranslationStructure> = {
                 errorSubtitle: '無法讀取 macOS 通知權限',
             },
         },
+        browser: {
+            title: '瀏覽器通知',
+            footer: '只要 Happier 分頁保持開啟（即使在背景），就會顯示帶提示音的通知。已關閉的分頁不會收到通知。',
+            permission: {
+                title: '瀏覽器權限',
+                checkingSubtitle: '正在檢查瀏覽器通知權限',
+                grantedSubtitle: '此瀏覽器允許 Happier 顯示通知',
+                notGrantedSubtitle: '按一下以在此瀏覽器中允許通知',
+                blockedSubtitle: '已被封鎖。請在瀏覽器設定中允許此網站的通知',
+                unsupportedSubtitle: '此瀏覽器不支援通知',
+                errorSubtitle: '無法讀取瀏覽器通知權限',
+            },
+        },
         push: {
             title: '推播通知',
             footer: '當工作階段需要你注意時，這些通知會由你的 CLI 透過 Expo 傳送。',

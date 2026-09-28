@@ -3948,6 +3948,19 @@ export const it: TranslationStructure = {
         errorSubtitle: "Impossibile leggere il permesso notifiche di macOS",
       },
     },
+    browser: {
+      title: 'Notifiche del browser',
+      footer: 'Mostra una notifica con un suono finché una scheda di Happier è aperta, anche in background. Le schede chiuse non ricevono nulla.',
+      permission: {
+        title: 'Permesso del browser',
+        checkingSubtitle: 'Verifica del permesso notifiche del browser',
+        grantedSubtitle: 'Questo browser consente a Happier di mostrare notifiche',
+        notGrantedSubtitle: 'Fai clic per consentire le notifiche in questo browser',
+        blockedSubtitle: 'Bloccate. Consenti le notifiche per questo sito nelle impostazioni del browser',
+        unsupportedSubtitle: 'Questo browser non supporta le notifiche',
+        errorSubtitle: 'Impossibile leggere il permesso notifiche del browser',
+      },
+    },
     push: {
       title: "Notifiche push",
       footer:

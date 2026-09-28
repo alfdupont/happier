@@ -3415,6 +3415,19 @@ export const ca: TranslationStructure = {
                 errorSubtitle: 'No s’ha pogut llegir el permís de notificacions de macOS',
             },
         },
+        browser: {
+            title: 'Notificacions del navegador',
+            footer: 'Mostra una notificació amb so mentre hi hagi una pestanya de Happier oberta, fins i tot en segon pla. Les pestanyes tancades no reben res.',
+            permission: {
+                title: 'Permís del navegador',
+                checkingSubtitle: 'Comprovant el permís de notificacions del navegador',
+                grantedSubtitle: 'Aquest navegador permet que Happier mostri notificacions',
+                notGrantedSubtitle: 'Fes clic per permetre les notificacions en aquest navegador',
+                blockedSubtitle: 'Bloquejades. Permet les notificacions d’aquest lloc a la configuració del navegador',
+                unsupportedSubtitle: 'Aquest navegador no admet notificacions',
+                errorSubtitle: 'No s’ha pogut llegir el permís de notificacions del navegador',
+            },
+        },
         push: {
             title: 'Notificacions push',
             footer: 'Aquestes notificacions s’envien des del teu CLI via Expo quan la teva sessió necessita atenció.',

@@ -3503,6 +3503,19 @@ export const zhHans: TranslationStructure = {
         errorSubtitle: "无法读取 macOS 通知权限",
       },
     },
+    browser: {
+      title: '浏览器通知',
+      footer: '只要 Happier 标签页处于打开状态（即使在后台），就会显示带提示音的通知。已关闭的标签页不会收到通知。',
+      permission: {
+        title: '浏览器权限',
+        checkingSubtitle: '正在检查浏览器通知权限',
+        grantedSubtitle: '此浏览器允许 Happier 显示通知',
+        notGrantedSubtitle: '点击以在此浏览器中允许通知',
+        blockedSubtitle: '已被阻止。请在浏览器设置中允许此网站的通知',
+        unsupportedSubtitle: '此浏览器不支持通知',
+        errorSubtitle: '无法读取浏览器通知权限',
+      },
+    },
     push: {
       title: "推送通知",
       footer:

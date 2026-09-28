@@ -3339,6 +3339,19 @@ export const en = {
                 errorSubtitle: 'Unable to read macOS notification permission',
             },
         },
+        browser: {
+            title: 'Browser notifications',
+            footer: 'Shows a notification with a sound while a Happier tab is open, even in the background. Closed tabs receive nothing.',
+            permission: {
+                title: 'Browser permission',
+                checkingSubtitle: 'Checking browser notification permission',
+                grantedSubtitle: 'This browser allows Happier to show notifications',
+                notGrantedSubtitle: 'Click to allow notifications in this browser',
+                blockedSubtitle: 'Blocked. Allow notifications for this site in your browser settings',
+                unsupportedSubtitle: 'This browser does not support notifications',
+                errorSubtitle: 'Unable to read browser notification permission',
+            },
+        },
         push: {
             title: 'Push notifications',
             footer: 'These notifications are sent from your CLI via Expo when your session needs attention.',
