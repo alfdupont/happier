@@ -152,6 +152,23 @@ describe('ActivityLocalNotificationRuntime', () => {
         });
     });
 
+    it('leaves hidden-session ready projections to push notifications on native', async () => {
+        const { ActivityLocalNotificationRuntime } = await import('./ActivityLocalNotificationRuntime');
+        const { notifyActivityReady } = await import('./activityLocalNotificationBus');
+
+        const tree = (await renderScreen(<ActivityLocalNotificationRuntime />)).tree;
+
+        await act(async () => {
+            notifyActivityReady('session-1', [], { origin: 'projection' });
+        });
+
+        expect(sendExpoLocalNotification).not.toHaveBeenCalled();
+
+        await act(async () => {
+            tree.unmount();
+        });
+    });
+
     it('uses the generic ready body when rich ready previews are disabled locally', async () => {
         const { ActivityLocalNotificationRuntime } = await import('./ActivityLocalNotificationRuntime');
         const { notifyActivityReady } = await import('./activityLocalNotificationBus');

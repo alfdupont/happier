@@ -3726,6 +3726,19 @@ export const pt: TranslationStructure = {
         errorSubtitle: 'Não foi possível ler a permissão de notificações do macOS',
       },
     },
+    browser: {
+      title: 'Notificações do navegador',
+      footer: 'Mostra uma notificação com som enquanto houver uma aba do Happier aberta, mesmo em segundo plano. Abas fechadas não recebem nada.',
+      permission: {
+        title: 'Permissão do navegador',
+        checkingSubtitle: 'Verificando a permissão de notificações do navegador',
+        grantedSubtitle: 'Este navegador permite que o Happier mostre notificações',
+        notGrantedSubtitle: 'Clique para permitir notificações neste navegador',
+        blockedSubtitle: 'Bloqueadas. Permita notificações deste site nas configurações do navegador',
+        unsupportedSubtitle: 'Este navegador não oferece suporte a notificações',
+        errorSubtitle: 'Não foi possível ler a permissão de notificações do navegador',
+      },
+    },
     push: {
       title: "Notificações push",
       footer:

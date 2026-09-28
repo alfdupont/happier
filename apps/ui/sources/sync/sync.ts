@@ -597,6 +597,7 @@ export type SyncMessageTransport = Readonly<{
 type ReadyNotificationProgress = Readonly<{
     seq: number;
     transcriptNotified: boolean;
+    activityNotified: boolean;
 }>;
 
 function createDefaultMessageTransport(): SyncMessageTransport {
@@ -7882,7 +7883,7 @@ class Sync {
               markSessionTranscriptDeferred: (sessionId, marker) => this.markSessionTranscriptDeferred(sessionId, marker),
               markSessionTranscriptStale: (sessionId, marker) => this.markSessionTranscriptStale(sessionId, marker),
               markSessionStateHydrationDeferred: (sessionId) => this.markSessionStateHydrationDeferred(sessionId),
-              onReadyProjectionAdvance: (sessionId, seq) => this.notifyReadyProjectionAdvance(sessionId, seq),
+              onReadyProjectionAdvance: (sessionId, seq) => this.notifyReadyProjectionAdvance(sessionId, seq, sourceServerId),
               assumeUsers: (userIds) => this.assumeUsers(userIds),
               applyTodoSocketUpdates: (changes) => this.applyTodoSocketUpdates(changes),
               invalidateMachines: () => this.machinesSync.invalidate(),
@@ -7995,7 +7996,21 @@ class Sync {
             [sessionId]: {
                 seq: normalizedSeq,
                 transcriptNotified: false,
+                activityNotified: false,
             },
+        };
+        return true;
+    }
+
+    /** Claims the activity notification for one ready turn; false when that turn already notified. */
+    private claimReadyActivityNotification(sessionId: string, seq: number | null): boolean {
+        if (seq === null || !Number.isFinite(seq)) return true;
+        const progress = this.readyNotificationProgressBySessionId[sessionId];
+        if (!progress || progress.seq !== Math.trunc(seq)) return true;
+        if (progress.activityNotified) return false;
+        this.readyNotificationProgressBySessionId = {
+            ...this.readyNotificationProgressBySessionId,
+            [sessionId]: { ...progress, activityNotified: true },
         };
         return true;
     }
@@ -8011,6 +8026,7 @@ class Sync {
                 [sessionId]: {
                     seq: normalizedSeq,
                     transcriptNotified: true,
+                    activityNotified: false,
                 },
             };
             return true;
@@ -8019,7 +8035,7 @@ class Sync {
             this.readyNotificationProgressBySessionId = {
                 ...this.readyNotificationProgressBySessionId,
                 [sessionId]: {
-                    seq: normalizedSeq,
+                    ...previous,
                     transcriptNotified: true,
                 },
             };
@@ -8028,9 +8044,18 @@ class Sync {
         return false;
     }
 
-    private notifyReadyProjectionAdvance(sessionId: string, seq: number): void {
+    private notifyReadyProjectionAdvance(sessionId: string, seq: number, sourceServerId?: string | null): void {
         if (!this.shouldNotifyReadyProjectionSeq(sessionId, seq)) return;
         voiceHooks.onReady(sessionId, []);
+        // A hidden session is routed projection-only, so its transcript (and the ready event in it)
+        // is not applied live: this projection is its only ready signal. Live transcript consumers
+        // notify from the transcript instead, which carries the preview text.
+        if (
+            !resolveSessionLiveConsumption(sessionId, sourceServerId).isFullContentConsumer
+            && this.claimReadyActivityNotification(sessionId, seq)
+        ) {
+            notifyActivityReady(sessionId, [], { origin: 'projection' });
+        }
     }
 
     private applyMessages = (
@@ -8091,7 +8116,7 @@ class Sync {
                 if (notifyVoice) {
                     voiceHooks.onReady(sessionId, liveEffectMessages);
                 }
-                if (notifyActivity) {
+                if (notifyActivity && this.claimReadyActivityNotification(sessionId, result.latestReadyEventSeq)) {
                     notifyActivityReady(sessionId, liveEffectMessages);
                 }
             }

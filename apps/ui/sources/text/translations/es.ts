@@ -3603,6 +3603,19 @@ export const es: TranslationStructure = {
         errorSubtitle: 'No se pudo leer el permiso de notificaciones de macOS',
       },
     },
+    browser: {
+      title: 'Notificaciones del navegador',
+      footer: 'Muestra una notificación con sonido mientras haya una pestaña de Happier abierta, incluso en segundo plano. Las pestañas cerradas no reciben nada.',
+      permission: {
+        title: 'Permiso del navegador',
+        checkingSubtitle: 'Comprobando el permiso de notificaciones del navegador',
+        grantedSubtitle: 'Este navegador permite que Happier muestre notificaciones',
+        notGrantedSubtitle: 'Haz clic para permitir las notificaciones en este navegador',
+        blockedSubtitle: 'Bloqueadas. Permite las notificaciones de este sitio en los ajustes del navegador',
+        unsupportedSubtitle: 'Este navegador no admite notificaciones',
+        errorSubtitle: 'No se pudo leer el permiso de notificaciones del navegador',
+      },
+    },
     push: {
       title: "Notificaciones push",
       footer:

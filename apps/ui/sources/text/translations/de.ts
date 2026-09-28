@@ -3338,6 +3338,19 @@ export const de: TranslationStructure = {
                 errorSubtitle: 'Die macOS-Benachrichtigungsberechtigung lässt sich nicht lesen',
             },
         },
+        browser: {
+            title: 'Browser-Benachrichtigungen',
+            footer: 'Zeigt eine Benachrichtigung mit Ton, solange ein Happier-Tab geöffnet ist, auch im Hintergrund. Geschlossene Tabs erhalten nichts.',
+            permission: {
+                title: 'Browser-Berechtigung',
+                checkingSubtitle: 'Browser-Benachrichtigungsberechtigung wird geprüft',
+                grantedSubtitle: 'Dieser Browser erlaubt Happier, Benachrichtigungen anzuzeigen',
+                notGrantedSubtitle: 'Klicken, um Benachrichtigungen in diesem Browser zu erlauben',
+                blockedSubtitle: 'Blockiert. Erlaube Benachrichtigungen für diese Website in den Browser-Einstellungen',
+                unsupportedSubtitle: 'Dieser Browser unterstützt keine Benachrichtigungen',
+                errorSubtitle: 'Browser-Benachrichtigungsberechtigung kann nicht gelesen werden',
+            },
+        },
         push: {
             title: 'Push-Benachrichtigungen',
             footer: 'Diese Benachrichtigungen sendet deine CLI über Expo, wenn deine Session Aufmerksamkeit braucht.',

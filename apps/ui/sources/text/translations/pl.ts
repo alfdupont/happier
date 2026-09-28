@@ -3634,6 +3634,19 @@ export const pl: TranslationStructure = {
         errorSubtitle: 'Nie można odczytać uprawnienia powiadomień macOS',
       },
     },
+    browser: {
+      title: 'Powiadomienia przeglądarki',
+      footer: 'Pokazuje powiadomienie z dźwiękiem, dopóki karta Happier jest otwarta, także w tle. Zamknięte karty nic nie otrzymują.',
+      permission: {
+        title: 'Uprawnienie przeglądarki',
+        checkingSubtitle: 'Sprawdzanie uprawnienia powiadomień przeglądarki',
+        grantedSubtitle: 'Ta przeglądarka pozwala Happier wyświetlać powiadomienia',
+        notGrantedSubtitle: 'Kliknij, aby zezwolić na powiadomienia w tej przeglądarce',
+        blockedSubtitle: 'Zablokowane. Zezwól na powiadomienia dla tej witryny w ustawieniach przeglądarki',
+        unsupportedSubtitle: 'Ta przeglądarka nie obsługuje powiadomień',
+        errorSubtitle: 'Nie można odczytać uprawnienia powiadomień przeglądarki',
+      },
+    },
     push: {
       title: "Powiadomienia push",
       footer:

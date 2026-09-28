@@ -339,6 +339,33 @@ describe('NotificationsSettingsView', () => {
         expect(tauriRequestPermissionMock).toHaveBeenCalledTimes(1);
     });
 
+    it('offers browser notification permission in a plain browser tab and requests it on press', async () => {
+        const browserGlobals = globalThis as unknown as { Notification?: unknown };
+        const originalNotification = browserGlobals.Notification;
+        const requestPermission = vi.fn(async () => 'granted' as NotificationPermission);
+        // Browser boundary: the Web Notifications API.
+        browserGlobals.Notification = Object.assign(function FakeNotification() {}, {
+            permission: 'default' as NotificationPermission,
+            requestPermission,
+        });
+
+        try {
+            const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
+
+            const screen = await renderSettingsView(<NotificationsSettingsView />);
+            await act(async () => {});
+
+            expect(screen.findRow('settings-notifications-desktop-permission')).toBeNull();
+            await act(async () => {
+                screen.pressRow('settings-notifications-browser-permission');
+            });
+
+            expect(requestPermission).toHaveBeenCalledTimes(1);
+        } finally {
+            browserGlobals.Notification = originalNotification;
+        }
+    });
+
     it('writes device-local badge settings through the local settings writer', async () => {
         const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
 

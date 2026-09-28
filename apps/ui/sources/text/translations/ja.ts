@@ -3896,6 +3896,19 @@ localTailscale: {
         errorSubtitle: "macOS 通知権限を読み取れませんでした",
       },
     },
+    browser: {
+      title: 'ブラウザ通知',
+      footer: 'Happier のタブが開いている間は、バックグラウンドでもサウンド付きで通知を表示します。閉じたタブには届きません。',
+      permission: {
+        title: 'ブラウザの権限',
+        checkingSubtitle: 'ブラウザの通知権限を確認中',
+        grantedSubtitle: 'このブラウザは Happier の通知表示を許可しています',
+        notGrantedSubtitle: 'クリックしてこのブラウザで通知を許可',
+        blockedSubtitle: 'ブロックされています。ブラウザの設定でこのサイトの通知を許可してください',
+        unsupportedSubtitle: 'このブラウザは通知に対応していません',
+        errorSubtitle: 'ブラウザの通知権限を読み取れません',
+      },
+    },
     push: {
       title: "プッシュ通知",
       footer:

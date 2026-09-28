@@ -3338,6 +3338,19 @@ export const fr: TranslationStructure = {
                 errorSubtitle: 'Impossible de lire la permission de notification macOS',
             },
         },
+        browser: {
+            title: 'Notifications du navigateur',
+            footer: 'Affiche une notification avec un son tant qu’un onglet Happier est ouvert, même en arrière-plan. Les onglets fermés ne reçoivent rien.',
+            permission: {
+                title: 'Permission du navigateur',
+                checkingSubtitle: 'Vérification de la permission de notification du navigateur',
+                grantedSubtitle: 'Ce navigateur autorise Happier à afficher des notifications',
+                notGrantedSubtitle: 'Clique pour autoriser les notifications dans ce navigateur',
+                blockedSubtitle: 'Bloquées. Autorise les notifications pour ce site dans les réglages du navigateur',
+                unsupportedSubtitle: 'Ce navigateur ne prend pas en charge les notifications',
+                errorSubtitle: 'Impossible de lire la permission de notification du navigateur',
+            },
+        },
         push: {
             title: 'Notifications push',
             footer: 'Ces notifications sont envoyées depuis ton CLI via Expo quand ta session demande ton attention.',
