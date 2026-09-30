@@ -2,13 +2,13 @@ import { createCatalogAcpBackend } from '@/agent/acp/createCatalogAcpBackend';
 import { resolveCliPathOverride } from '@/agent/acp/resolveCliPathOverride';
 import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import { isAcpModelConfigOptionLike, normalizeAcpConfigOptionChoices } from '@/agent/acp/configOptionChoiceNormalization';
-import type { AgentBackend } from '@/agent/core';
+import type { AgentBackend, SessionId } from '@/agent/core';
 import { AGENTS } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
 import { resolveProviderCliCommand } from '@/runtime/managedTools/providerCliResolution';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
-import { getAgentModelConfig, getAgentStaticModels } from '@happier-dev/agents';
+import { getAgentModelConfig, getAgentStaticModels, type AgentModelConfig } from '@happier-dev/agents';
 import { AsyncTtlCache, type BackendTargetRefV1, type ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
 import type { Credentials } from '@/persistence';
 import { validateCatalogAcpProbeSpawn } from './validateCatalogAcpProbeSpawn';
@@ -19,6 +19,7 @@ import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { normalizeContextWindowTokens } from '@/backends/modelCapabilities/contextWindowTokens';
 import { isAcpModelScopedConfigOption } from '@/agent/acp/runtime/sessionModelsState';
+import { logger } from '@/ui/logger';
 
 type ProbedAgentModelOptionValue = string | number | boolean | null;
 
@@ -345,13 +346,23 @@ async function probeModelsFromCliModelsCommand(params: {
   });
 }
 
-function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgentModel[] | null {
-  if (!Array.isArray(configOptionsRaw)) return null;
-
-  const configOptions = configOptionsRaw
+function readProbeConfigOptions(configOptionsRaw: unknown): Array<z.infer<typeof ProbeConfigOptionCandidateSchema>> {
+  if (!Array.isArray(configOptionsRaw)) return [];
+  return configOptionsRaw
     .map((optionRaw) => ProbeConfigOptionCandidateSchema.safeParse(optionRaw))
     .filter((parsed): parsed is Extract<typeof parsed, { success: true }> => parsed.success)
     .map((parsed) => parsed.data);
+}
+
+function readProbeModelScopedOptions(configOptionsRaw: unknown): ProbedAgentModelOption[] {
+  return readProbeConfigOptions(configOptionsRaw)
+    .filter(isAcpModelScopedConfigOption)
+    .map((option) => normalizeProbeModelOption(option))
+    .filter((option): option is ProbedAgentModelOption => option !== null);
+}
+
+function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgentModel[] | null {
+  const configOptions = readProbeConfigOptions(configOptionsRaw);
   if (configOptions.length === 0) return null;
 
   const candidate =
@@ -362,11 +373,6 @@ function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgen
   const optionsRaw = candidate.options ?? null;
   if (!optionsRaw) return null;
 
-  const modelScopedOptions = configOptions
-    .filter(isAcpModelScopedConfigOption)
-    .map((option) => normalizeProbeModelOption(option))
-    .filter((option): option is ProbedAgentModelOption => option !== null);
-
   const parsed = normalizeAcpConfigOptionChoices(optionsRaw, (value) => {
     const id = ProbeNonEmptyStringSchema.safeParse(value);
     return id.success ? id.data : null;
@@ -374,7 +380,6 @@ function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgen
     id: choice.value,
     name: choice.name,
     ...(choice.description ? { description: choice.description } : {}),
-    ...(modelScopedOptions.length > 0 ? { modelOptions: modelScopedOptions } : {}),
   } satisfies ProbedAgentModel));
 
   if (optionsRaw.length > 0 && parsed.length === 0) return null;
@@ -392,50 +397,139 @@ function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgen
   });
 }
 
+type ProbeModelsBackend = AgentBackend & Partial<{
+  getSessionModelState: () => { availableModels?: unknown } | null;
+  getSessionConfigOptionsState: () => unknown;
+  /** Resolve false on failed discovery; a ready empty list is still a successful observation. */
+  waitForSessionModels: () => Promise<boolean>;
+  setSessionConfigOption: (sessionId: SessionId, configId: string, value: string) => Promise<void>;
+}>;
+
+function preferSessionStartValues(
+  options: ReadonlyArray<ProbedAgentModelOption>,
+  sessionStartOptions: ReadonlyArray<ProbedAgentModelOption>,
+): ProbedAgentModelOption[] {
+  return options.map((option) => {
+    const startOption = sessionStartOptions.find((candidate) => candidate.id === option.id);
+    if (!startOption || !option.options?.some((choice) => choice.value === startOption.currentValue)) return option;
+    return { ...option, currentValue: startOption.currentValue };
+  });
+}
+
+/**
+ * Selects each listed model on the probe's own disposable session to record the model-scoped
+ * options ACP reports for it. Models that cannot be observed before the deadline are left out.
+ */
+async function observeModelScopedOptionsPerModel(params: {
+  backend: ProbeModelsBackend;
+  sessionId: SessionId;
+  models: ReadonlyArray<ProbedAgentModel>;
+  modelConfigOptionId: string | undefined;
+  deadlineAt: number;
+}): Promise<Map<string, ProbedAgentModelOption[]>> {
+  const observed = new Map<string, ProbedAgentModelOption[]>();
+  const { backend, sessionId, modelConfigOptionId } = params;
+  if (!modelConfigOptionId || !backend.setSessionConfigOption || !backend.getSessionConfigOptionsState) {
+    logger.debug('[agentModelsProbe] Per-model options need a model config option the backend can set; every model keeps the session options');
+    return observed;
+  }
+
+  const sessionConfigOptionsRaw = backend.getSessionConfigOptionsState();
+  const modelConfigOption = readProbeConfigOptions(sessionConfigOptionsRaw).find((option) => option.id === modelConfigOptionId);
+  if (!modelConfigOption) {
+    logger.debug(`[agentModelsProbe] Session reports no "${modelConfigOptionId}" config option; every model keeps the session options`);
+    return observed;
+  }
+  const sessionStartOptions = readProbeModelScopedOptions(sessionConfigOptionsRaw);
+
+  for (const model of params.models) {
+    if (model.id === 'default' || model.id === modelConfigOption.currentValue || model.modelOptions) continue;
+
+    const remainingMs = params.deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      logger.debug(`[agentModelsProbe] Probe deadline reached before model "${model.id}"; it and later models keep the session options`);
+      break;
+    }
+
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    const outcome = await Promise.race([
+      backend.setSessionConfigOption(sessionId, modelConfigOptionId, model.id).then(
+        () => 'selected' as const,
+        (error: unknown) => {
+          logger.debug(`[agentModelsProbe] Failed to select model "${model.id}" on the probe session; it keeps the session options`, error);
+          return 'failed' as const;
+        },
+      ),
+      new Promise<'timeout'>((resolve) => {
+        timerId = setTimeout(() => resolve('timeout'), remainingMs);
+      }),
+    ]).finally(() => {
+      if (timerId !== null) {
+        clearTimeout(timerId);
+      }
+    });
+    if (outcome === 'timeout') {
+      logger.debug(`[agentModelsProbe] Probe deadline reached while selecting model "${model.id}"; it and later models keep the session options`);
+      break;
+    }
+    if (outcome === 'selected') {
+      observed.set(
+        model.id,
+        preferSessionStartValues(readProbeModelScopedOptions(backend.getSessionConfigOptionsState()), sessionStartOptions),
+      );
+    }
+  }
+  return observed;
+}
+
 export async function probeModelsFromAcpBackend(params: {
   backend: AgentBackend;
   timeoutMs: number;
+  modelConfig?: Pick<AgentModelConfig, 'acpModelConfigOptionId' | 'acpModelOptionsScope'>;
 }): Promise<ReadonlyArray<ProbedAgentModel> | null> {
-  type ProbeModelsBackend = AgentBackend & Partial<{
-    getSessionModelState: () => { availableModels?: unknown } | null;
-    getSessionConfigOptionsState: () => unknown;
-    /** Resolve false on failed discovery; a ready empty list is still a successful observation. */
-    waitForSessionModels: () => Promise<boolean>;
-  }>;
-
   const backend: ProbeModelsBackend = params.backend;
 
   const timeoutMs = Math.max(250, params.timeoutMs);
+  const deadlineAt = Date.now() + timeoutMs;
   let timerId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timerId = setTimeout(() => reject(new Error(`ACP startSession timeout after ${timeoutMs}ms`)), timeoutMs);
   });
-  const modelsReady = await Promise.race([(async () => {
-    await backend.startSession();
+  const sessionId = await Promise.race([(async () => {
+    const started = await backend.startSession();
     // Session opening may deliberately return before optional model discovery. Both phases
     // consume this probe's existing deadline rather than granting discovery another timeout.
-    return await backend.waitForSessionModels?.() ?? true;
+    const modelsReady = await backend.waitForSessionModels?.() ?? true;
+    return modelsReady ? started.sessionId : null;
   })(), timeoutPromise]).finally(() => {
     if (timerId !== null) {
       clearTimeout(timerId);
     }
   });
-  if (!modelsReady) return null;
+  if (sessionId === null) return null;
 
-  if (typeof backend.getSessionModelState === 'function') {
-    const state = backend.getSessionModelState();
-    const modelsRaw = state?.availableModels;
-    const models = normalizeDynamicModels(modelsRaw);
-    if (models) return models;
-  }
+  const models =
+    normalizeDynamicModels(backend.getSessionModelState?.()?.availableModels)
+    ?? normalizeModelsFromConfigOptions(backend.getSessionConfigOptionsState?.());
+  if (!models) return null;
 
-  if (typeof backend.getSessionConfigOptionsState === 'function') {
-    const configOptions = backend.getSessionConfigOptionsState();
-    const models = normalizeModelsFromConfigOptions(configOptions);
-    if (models) return models;
-  }
+  // ACP reports model-scoped options (e.g. reasoning effort) only for the session's current model.
+  const sessionOptions = readProbeModelScopedOptions(backend.getSessionConfigOptionsState?.());
+  const observedOptions = params.modelConfig?.acpModelOptionsScope === 'per_model'
+    ? await observeModelScopedOptionsPerModel({
+      backend,
+      sessionId,
+      models,
+      modelConfigOptionId: params.modelConfig.acpModelConfigOptionId,
+      deadlineAt,
+    })
+    : new Map<string, ProbedAgentModelOption[]>();
 
-  return null;
+  return models.map((model) => {
+    if (model.id === 'default' || model.modelOptions) return model;
+    const modelOptions = observedOptions.get(model.id) ?? sessionOptions;
+    return modelOptions.length > 0 ? { ...model, modelOptions } : model;
+  });
 }
 
 export async function probeAgentModelsBestEffort(params: {
@@ -518,7 +612,7 @@ export async function probeAgentModelsBestEffort(params: {
         processEnv: params.processEnv,
       });
       if (configuredBackend) {
-        const models = await probeModelsFromAcpBackend({ backend: configuredBackend, timeoutMs }).catch(() => null);
+        const models = await probeModelsFromAcpBackend({ backend: configuredBackend, timeoutMs, modelConfig }).catch(() => null);
         if (models) {
           const res: ProbedAgentModelsResult = { ...fallback, availableModels: models, source: 'dynamic', observedAt: Date.now() };
           if (!usesProviderOwnedCache) {
@@ -643,7 +737,7 @@ export async function probeAgentModelsBestEffort(params: {
       });
       backend = created.backend;
 
-      const models = await probeModelsFromAcpBackend({ backend, timeoutMs }).catch(() => null);
+      const models = await probeModelsFromAcpBackend({ backend, timeoutMs, modelConfig }).catch(() => null);
       if (!models) {
         return failedResult();
       }

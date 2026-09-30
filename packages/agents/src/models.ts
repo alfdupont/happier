@@ -80,6 +80,18 @@ export type AgentModelConfig = Readonly<{
    */
   acpModelSetMethod?: 'set_model' | 'config_option';
   /**
+   * Which models the agent's model-scoped ACP config options (for example `reasoning_effort`)
+   * describe. ACP reports them only for the session's current model.
+   *
+   * - `session` (default): the reported options apply to every model.
+   * - `per_model`: each model offers its own options. The dynamic model probe selects each listed
+   *   model on its disposable probe session through `acpModelConfigOptionId` to record them, and
+   *   keeps the session's starting values where a model offers them, because a new session on that
+   *   model starts from them. Declare only for agents that do not persist a model selected over ACP
+   *   as the user's default.
+   */
+  acpModelOptionsScope?: 'session' | 'per_model';
+  /**
    * Controls whether Happy should attempt dynamic model probing for this provider.
    *
    * - `auto`: best-effort dynamic probing (CLI command and/or ACP session)
@@ -363,6 +375,8 @@ export const AGENT_MODEL_CONFIG: Readonly<Record<AgentId, AgentModelConfig>> = O
     supportsSelection: true,
     nonAcpApplyScope: 'next_prompt',
     acpModelConfigOptionId: 'model',
+    // Reasoning effort levels differ per model, and Copilot silently ignores unsupported levels.
+    acpModelOptionsScope: 'per_model',
     defaultMode: 'default',
     allowedModes: ['default'],
   },

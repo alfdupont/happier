@@ -241,4 +241,20 @@ describe('agent model config', () => {
       dynamicProbe: 'auto',
     });
   });
+
+  it('probes Copilot model options per model because its reasoning effort levels differ per model', () => {
+    expect(getAgentModelConfig('copilot')).toMatchObject({
+      acpModelConfigOptionId: 'model',
+      acpModelOptionsScope: 'per_model',
+    });
+  });
+
+  it('declares the model config option for every agent that probes model options per model', () => {
+    for (const agentId of AGENT_IDS) {
+      const config = getAgentModelConfig(agentId);
+      if (config.acpModelOptionsScope === 'per_model') {
+        expect(config.acpModelConfigOptionId, agentId).toBeTruthy();
+      }
+    }
+  });
 });

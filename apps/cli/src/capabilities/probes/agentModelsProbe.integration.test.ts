@@ -47,6 +47,59 @@ type ProbeBackendLike = Pick<AgentBackend, 'startSession'> & {
   getSessionConfigOptionsState: () => unknown;
 };
 
+// Mirrors GitHub Copilot's ACP behavior: reasoning effort levels differ per model, ACP reports
+// them for the session's current model only, and switching models resets effort to the model's
+// default ("medium") while a new session starts from the user's configured level ("high").
+const EFFORT_LEVELS_BY_MODEL: Readonly<Record<string, ReadonlyArray<string>>> = {
+  'model-a': ['low', 'medium', 'high'],
+  'model-b': ['low', 'medium', 'high', 'max'],
+  'model-c': ['minimal', 'low', 'medium'],
+  'model-d': [],
+};
+
+function buildPerModelEffortConfigOptionsSource(modelIdSource: string, effortSource: string): string {
+  const modelChoices = Object.keys(EFFORT_LEVELS_BY_MODEL).map((id) => ({ value: id, name: id.toUpperCase() }));
+  return `[
+      { id: "model", name: "Model", category: "model", type: "select", currentValue: ${modelIdSource}, options: ${JSON.stringify(modelChoices)} },
+      ...((levels) => levels.length === 0 ? [] : [{
+        id: "reasoning_effort",
+        name: "Reasoning effort",
+        category: "thought_level",
+        type: "select",
+        currentValue: ${effortSource},
+        options: levels.map((level) => ({ value: level, name: level })),
+      }])(${JSON.stringify(EFFORT_LEVELS_BY_MODEL)}[${modelIdSource}] ?? []),
+    ]`;
+}
+
+async function writePerModelEffortAcpAgent(dir: string): Promise<string> {
+  return await writeFakeAcpAgentScript({
+    dir,
+    sdkEntry: resolveAcpSdkEntryFromCwd(process.cwd()),
+    sessionPayloadSource: `{
+      sessionId: randomUUID(),
+      models: {
+        currentModelId: "model-a",
+        availableModels: ${JSON.stringify(Object.keys(EFFORT_LEVELS_BY_MODEL).map((id) => ({ modelId: id, name: id.toUpperCase() })))},
+      },
+      configOptions: ${buildPerModelEffortConfigOptionsSource('"model-a"', '"high"')},
+    }`,
+    setConfigOptionHandlerSource: `async ({ params }) => ({
+      configOptions: ${buildPerModelEffortConfigOptionsSource('params.value', '"medium"')},
+    })`,
+  });
+}
+
+function reasoningEffortModelOption(levels: ReadonlyArray<string>, currentValue: string) {
+  return {
+    id: 'reasoning_effort',
+    name: 'Reasoning effort',
+    type: 'select',
+    currentValue,
+    options: levels.map((level) => ({ value: level, name: level })),
+  };
+}
+
 describe('probeModelsFromAcpBackend', () => {
   it('extracts available models from ACP session/new and normalizes Default', async () => {
     const fixture = await createProbeTempDir('happier-acp-model-probe');
@@ -270,6 +323,75 @@ describe('probeModelsFromAcpBackend', () => {
     } finally {
       clearTimeoutSpy.mockRestore();
     }
+  });
+
+  it('applies the session model-scoped config options to ACP-listed models', async () => {
+    const fixture = await createProbeTempDir('happier-acp-model-probe-scoped-options');
+    const agentPath = await writePerModelEffortAcpAgent(fixture.dir);
+    const backend = new AcpBackend(createProbeBackendOptions({ cwd: fixture.dir, agentPath }));
+    try {
+      const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
+      // Without a per-model declaration the probe must not switch models on its session, so every
+      // model carries the options ACP reported for the session's current model.
+      const sessionOptions = [reasoningEffortModelOption(['low', 'medium', 'high'], 'high')];
+      expect(models).toEqual([
+        { id: 'default', name: 'Default' },
+        { id: 'model-a', name: 'MODEL-A', modelOptions: sessionOptions },
+        { id: 'model-b', name: 'MODEL-B', modelOptions: sessionOptions },
+        { id: 'model-c', name: 'MODEL-C', modelOptions: sessionOptions },
+        { id: 'model-d', name: 'MODEL-D', modelOptions: sessionOptions },
+      ]);
+    } finally {
+      await backend.dispose().catch(() => {});
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it('keeps the session options for models the per-model walk cannot observe within the probe deadline', async () => {
+    const modelIds = ['model-a', 'model-b', 'model-c', 'model-d'];
+    const effortOption = (levels: ReadonlyArray<string>, currentValue: string) => ({
+      ...reasoningEffortModelOption(levels, currentValue),
+      category: 'thought_level',
+    });
+    const modelOption = (currentValue: string) => ({
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue,
+      options: modelIds.map((id) => ({ value: id, name: id })),
+    });
+    let configOptions: unknown[] = [modelOption('model-a'), effortOption(['low', 'high'], 'high')];
+    const backend: ProbeBackendLike & {
+      setSessionConfigOption: (sessionId: string, configId: string, value: string) => Promise<void>;
+    } = {
+      startSession: async () => ({ sessionId: 'probe-session' }) as Awaited<ReturnType<AgentBackend['startSession']>>,
+      getSessionModelState: () => ({
+        currentModelId: 'model-a',
+        availableModels: modelIds.map((id) => ({ id, name: id })),
+      }),
+      getSessionConfigOptionsState: () => configOptions,
+      setSessionConfigOption: async (_sessionId, _configId, value) => {
+        if (value === 'model-b') throw new Error('model unavailable');
+        if (value === 'model-d') return await new Promise<void>(() => {});
+        configOptions = [modelOption(value), effortOption(['low'], 'low')];
+      },
+    };
+
+    const models = await probeModelsFromAcpBackend({
+      backend: backend as unknown as AgentBackend,
+      timeoutMs: 250,
+      modelConfig: { acpModelOptionsScope: 'per_model', acpModelConfigOptionId: 'model' },
+    });
+
+    const sessionOptions = [reasoningEffortModelOption(['low', 'high'], 'high')];
+    expect(models).toEqual([
+      { id: 'default', name: 'Default' },
+      { id: 'model-a', name: 'model-a', modelOptions: sessionOptions },
+      { id: 'model-b', name: 'model-b', modelOptions: sessionOptions },
+      { id: 'model-c', name: 'model-c', modelOptions: [reasoningEffortModelOption(['low'], 'low')] },
+      { id: 'model-d', name: 'model-d', modelOptions: sessionOptions },
+    ]);
   });
 });
 
@@ -572,6 +694,36 @@ process.exit(1);
         process.env.HAPPIER_CURSOR_PATH = prevOverride;
       } else {
         delete process.env.HAPPIER_CURSOR_PATH;
+      }
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it('discovers the reasoning effort levels of every Copilot model', async () => {
+    const fixture = await createProbeTempDir('happier-acp-model-probe-copilot-effort');
+    const agentPath = await writePerModelEffortAcpAgent(fixture.dir);
+    const prevOverride = process.env.HAPPIER_COPILOT_PATH;
+    process.env.HAPPIER_COPILOT_PATH = agentPath;
+    try {
+      const res = await probeAgentModelsBestEffort({
+        agentId: 'copilot',
+        cwd: fixture.dir,
+        timeoutMs: 10_000,
+      });
+      expect(res.source).toBe('dynamic');
+      expect(res.availableModels).toEqual([
+        { id: 'default', name: 'Default' },
+        { id: 'model-a', name: 'MODEL-A', modelOptions: [reasoningEffortModelOption(['low', 'medium', 'high'], 'high')] },
+        // A new session on this model starts from the configured level, not the switch default.
+        { id: 'model-b', name: 'MODEL-B', modelOptions: [reasoningEffortModelOption(['low', 'medium', 'high', 'max'], 'high')] },
+        { id: 'model-c', name: 'MODEL-C', modelOptions: [reasoningEffortModelOption(['minimal', 'low', 'medium'], 'medium')] },
+        { id: 'model-d', name: 'MODEL-D' },
+      ]);
+    } finally {
+      if (typeof prevOverride === 'string') {
+        process.env.HAPPIER_COPILOT_PATH = prevOverride;
+      } else {
+        delete process.env.HAPPIER_COPILOT_PATH;
       }
       await fixture.cleanup();
     }
