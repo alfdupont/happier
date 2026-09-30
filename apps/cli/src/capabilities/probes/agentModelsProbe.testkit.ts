@@ -29,8 +29,13 @@ export async function writeFakeAcpAgentScript(params: {
   dir: string;
   sdkEntry: string;
   sessionPayloadSource: string;
+  /** Source of an ACP SDK `async (context) => response` handler for `session/set_config_option`. */
+  setConfigOptionHandlerSource?: string;
 }): Promise<string> {
   const agentPath = resolve(join(params.dir, 'fake-agent.mjs'));
+  const setConfigOptionHandler = params.setConfigOptionHandlerSource
+    ? `\n  .onRequest("session/set_config_option", ${params.setConfigOptionHandlerSource})`
+    : '';
   const source = `import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -44,7 +49,7 @@ const app = acp.agent({ name: "happier-test-agent" })
   })
   .onRequest("session/new", async () => {
     return ${params.sessionPayloadSource};
-  })
+  })${setConfigOptionHandler}
   .onRequest("authenticate", async () => ({}))
   .onRequest("session/prompt", async () => ({ stopReason: "end_turn" }))
   .onNotification("session/cancel", async () => {});
