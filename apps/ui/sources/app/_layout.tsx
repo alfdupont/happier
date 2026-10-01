@@ -67,6 +67,7 @@ import { isTauriDesktop } from '@/utils/platform/tauri';
 import { installTauriExternalLinkClicks } from '@/utils/url/installTauriExternalLinkClicks';
 import { useIsTablet } from '@/utils/platform/responsive';
 import { ThemePreferenceTransitionHost } from '@/components/settings/appearance/ThemePreferenceTransitionHost';
+import { ThemeAccountSyncRuntime } from '@/components/settings/appearance/ThemeAccountSyncRuntime';
 import { useTauriMainWindowBackgroundColor } from '@/desktop/window/useTauriMainWindowBackgroundColor';
 import { OnboardingShowcaseAutoShowMount } from '@/onboarding/showcase';
 import { DesktopBackgroundServiceCloseGuard } from '@/setup/DesktopBackgroundServiceCloseGuard';
@@ -756,6 +757,7 @@ function AppBoot(props: {
                     <AuthProvider key={initState.authGeneration} initialCredentials={initState.credentials}>
                         <ThemeProvider value={props.navigationTheme}>
                             <StatusBarProvider />
+                            <ThemeAccountSyncRuntime />
                             <AppPaneModalProvider>
                                 <CommandPaletteProvider>
                                     <RealtimeProvider>

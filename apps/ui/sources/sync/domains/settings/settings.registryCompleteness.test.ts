@@ -41,6 +41,16 @@ describe('settings registry completeness', () => {
         expect(LOCAL_SETTING_ARTIFACTS.defaults).not.toHaveProperty('mobileWorkspaceExperienceV1');
     });
 
+    it('remembers the selected theme on the account while each device keeps its own theme locally', async () => {
+        const { ACCOUNT_SETTING_ARTIFACTS } = await import('./settings');
+        const { LOCAL_SETTING_ARTIFACTS } = await import('./registry/local/localSettingDefinitions');
+
+        expect(ACCOUNT_SETTING_ARTIFACTS.definitions.appearanceThemeSelectionV1.storageScope).toBe('account');
+        expect(ACCOUNT_SETTING_ARTIFACTS.defaults).toHaveProperty('appearanceThemeSelectionV1', null);
+        expect(LOCAL_SETTING_ARTIFACTS.definitions.themePreference.storageScope).toBe('local');
+        expect(LOCAL_SETTING_ARTIFACTS.definitions.themeProfiles.storageScope).toBe('local');
+    });
+
     it('owns lastUsedAgent in canonical account settings instead of the legacy compatibility bucket', async () => {
         const { ACCOUNT_SETTING_ARTIFACTS } = await import('./settings');
         const { ACCOUNT_LEGACY_SETTING_ARTIFACTS } = await import('./registry/account/accountLegacySettingDefinitions');

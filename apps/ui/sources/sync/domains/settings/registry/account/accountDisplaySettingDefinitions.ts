@@ -6,6 +6,8 @@ import {
 } from '@happier-dev/protocol';
 import { z } from 'zod';
 
+import { AccountThemeSelectionV1Schema } from '@/theme/profiles/themeAccountSelection';
+
 function bucketCount(value: number, smallMax: number, mediumMax: number): 'small' | 'medium' | 'large' {
     if (value <= smallMax) return 'small';
     if (value <= mediumMax) return 'medium';
@@ -19,6 +21,14 @@ function bucketBytes(value: number, smallMax: number, mediumMax: number): 'small
 }
 
 export const ACCOUNT_DISPLAY_SETTING_DEFINITIONS = defineSettingDefinitions({
+    appearanceThemeSelectionV1: {
+        // The theme itself stays local (see themePreference/themeProfiles); this only
+        // remembers the latest selection so a device without one can restore it.
+        schema: AccountThemeSelectionV1Schema,
+        default: null,
+        description: 'Last theme selected on any device, restored on devices that have no theme of their own',
+        storageScope: 'account',
+    },
     sessionThinkingDisplayMode: {
         schema: z.enum(['inline', 'tool', 'hidden']),
         default: 'inline',

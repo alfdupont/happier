@@ -10,6 +10,10 @@ export function applyLocalSettingsFromUi(delta: Partial<LocalSettings>): void {
   getStorage().getState().applyLocalSettings(delta, { source: 'ui' satisfies SettingsAnalyticsSource });
 }
 
+export function applyLocalSettingsFromSyncPull(delta: Partial<LocalSettings>): void {
+  getStorage().getState().applyLocalSettings(delta, { source: 'sync_pull' satisfies SettingsAnalyticsSource });
+}
+
 export function useApplySettings(): (delta: Partial<Settings>) => void {
   return React.useCallback((delta: Partial<Settings>) => {
     getSyncSingleton().applySettings(delta, { source: 'ui' satisfies SettingsAnalyticsSource });
