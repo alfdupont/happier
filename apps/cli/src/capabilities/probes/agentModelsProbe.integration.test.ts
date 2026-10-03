@@ -242,6 +242,42 @@ describe('probeModelsFromAcpBackend', () => {
     }
   }, 20_000);
 
+  it.each([true, false])('keeps session model options on the observed current model (models payload: %s)', async (withModels) => {
+    const fixture = await createProbeTempDir('happier-acp-model-probe-scoped');
+    const sdkEntry = resolveAcpSdkEntryFromCwd(process.cwd());
+    const effort = {
+      id: 'reasoning_effort', name: 'Reasoning effort', category: 'thought_level',
+      type: 'select', currentValue: 'high',
+      options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }],
+    };
+    const payload = {
+      sessionId: 'scoped-probe-session',
+      ...(withModels ? { models: {
+        currentModelId: 'model-a',
+        availableModels: [{ id: 'model-a', name: 'Model A' }, { id: 'model-b', name: 'Model B' }],
+      } } : {}),
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'model-a',
+          options: [{ value: 'model-a', name: 'Model A' }, { value: 'model-b', name: 'Model B' }] },
+        effort,
+        { id: 'approval', name: 'Approval', type: 'select', currentValue: 'ask',
+          options: [{ value: 'ask', name: 'Ask' }] },
+      ],
+    };
+    const agentPath = await writeFakeAcpAgentScript({ dir: fixture.dir, sdkEntry, sessionPayloadSource: JSON.stringify(payload) });
+    const backend = new AcpBackend(createProbeBackendOptions({ cwd: fixture.dir, agentPath }));
+    try {
+      const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
+      const { category: _category, ...expectedEffort } = effort;
+      expect(models?.find((model) => model.id === 'model-a')?.modelOptions).toEqual([expectedEffort]);
+      expect(models?.find((model) => model.id === 'model-b')?.modelOptions).toBeUndefined();
+      expect(models?.find((model) => model.id === 'default')?.modelOptions).toBeUndefined();
+    } finally {
+      await backend.dispose();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it('does not leak unhandled rejections when startSession times out first', async () => {
     let rejectStartSession!: (reason?: unknown) => void;
     const startSessionPromise = new Promise<Awaited<ReturnType<AgentBackend['startSession']>>>((_resolve, reject) => {
@@ -325,21 +361,20 @@ describe('probeModelsFromAcpBackend', () => {
     }
   });
 
-  it('applies the session model-scoped config options to ACP-listed models', async () => {
+  it('does not walk models without a per-model declaration', async () => {
     const fixture = await createProbeTempDir('happier-acp-model-probe-scoped-options');
     const agentPath = await writePerModelEffortAcpAgent(fixture.dir);
     const backend = new AcpBackend(createProbeBackendOptions({ cwd: fixture.dir, agentPath }));
     try {
       const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
-      // Without a per-model declaration the probe must not switch models on its session, so every
-      // model carries the options ACP reported for the session's current model.
-      const sessionOptions = [reasoningEffortModelOption(['low', 'medium', 'high'], 'high')];
+      // Without a per-model declaration the probe must not switch models on its session, so only
+      // the session's current model carries the options ACP reported.
       expect(models).toEqual([
         { id: 'default', name: 'Default' },
-        { id: 'model-a', name: 'MODEL-A', modelOptions: sessionOptions },
-        { id: 'model-b', name: 'MODEL-B', modelOptions: sessionOptions },
-        { id: 'model-c', name: 'MODEL-C', modelOptions: sessionOptions },
-        { id: 'model-d', name: 'MODEL-D', modelOptions: sessionOptions },
+        { id: 'model-a', name: 'MODEL-A', modelOptions: [reasoningEffortModelOption(['low', 'medium', 'high'], 'high')] },
+        { id: 'model-b', name: 'MODEL-B' },
+        { id: 'model-c', name: 'MODEL-C' },
+        { id: 'model-d', name: 'MODEL-D' },
       ]);
     } finally {
       await backend.dispose().catch(() => {});
@@ -347,7 +382,7 @@ describe('probeModelsFromAcpBackend', () => {
     }
   }, 20_000);
 
-  it('keeps the session options for models the per-model walk cannot observe within the probe deadline', async () => {
+  it('leaves models the per-model walk cannot observe within the probe deadline without options', async () => {
     const modelIds = ['model-a', 'model-b', 'model-c', 'model-d'];
     const effortOption = (levels: ReadonlyArray<string>, currentValue: string) => ({
       ...reasoningEffortModelOption(levels, currentValue),
@@ -384,13 +419,12 @@ describe('probeModelsFromAcpBackend', () => {
       modelConfig: { acpModelOptionsScope: 'per_model', acpModelConfigOptionId: 'model' },
     });
 
-    const sessionOptions = [reasoningEffortModelOption(['low', 'high'], 'high')];
     expect(models).toEqual([
       { id: 'default', name: 'Default' },
-      { id: 'model-a', name: 'model-a', modelOptions: sessionOptions },
-      { id: 'model-b', name: 'model-b', modelOptions: sessionOptions },
+      { id: 'model-a', name: 'model-a', modelOptions: [reasoningEffortModelOption(['low', 'high'], 'high')] },
+      { id: 'model-b', name: 'model-b' },
       { id: 'model-c', name: 'model-c', modelOptions: [reasoningEffortModelOption(['low'], 'low')] },
-      { id: 'model-d', name: 'model-d', modelOptions: sessionOptions },
+      { id: 'model-d', name: 'model-d' },
     ]);
   });
 });

@@ -4,6 +4,8 @@ import type { PermissionResult } from '@/agent/permissions/permissionResult';
 import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import type { AgentState, Metadata, PermissionMode } from '@/api/types';
+import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
+import { getSessionNotificationTitle } from '@/agent/runtime/readyNotificationContext';
 import { createKeyedStreamedTranscriptBridge } from '@/api/session/createKeyedStreamedTranscriptBridge';
 import type { StreamedTranscriptWriterSession } from '@/api/session/streamedTranscriptWriter';
 import { configuration } from '@/configuration';
@@ -64,6 +66,7 @@ import {
     looksLikeCodexApprovalRequestUserInput,
     markCodexAsyncQuestionDeliveryCompleted,
     normalizeCodexAsyncUserInputQuestionsToAskUserQuestionInput,
+    readPendingCodexAsyncQuestionRequest,
     readPendingCodexAsyncQuestionDelivery,
     type CodexAsyncQuestionDelivery,
     normalizeCodexRequestUserInputQuestionsToAskUserQuestionInput,
@@ -80,6 +83,7 @@ import {
     createCodexAppServerClient,
     isCodexAppServerJsonLineTooLargeError,
     type DisposableCodexAppServerClient,
+    type CodexAppServerRequestOptions,
 } from './client/createCodexAppServerClient';
 import {
     readCodexAppServerResumeRecoveryTimeoutMs,
@@ -113,6 +117,7 @@ import {
     isCodexAppServerDefinitiveMethodNotFoundError,
     isCodexAppServerMethodNotFoundError,
     isCodexAppServerNoActiveTurnToSteerError,
+    isCodexAppServerManagedGranularApprovalRejection,
 } from './appServerCompatibility';
 import { readCodexRateLimitsSnapshot } from './readCodexRateLimitsSnapshot';
 import {
@@ -371,7 +376,7 @@ type PendingRawAssistantFinal = Readonly<{
 
 const CODEX_TRANSCRIPT_INITIAL_CHECKPOINT_DELAY_MS = 0;
 
-type CodexAppServerPermissionSupport = 'unknown' | 'supported' | 'legacy';
+type CodexAppServerPermissionSupport = 'unknown' | 'supported' | 'legacy' | 'legacy-managed-scalar';
 
 type CodexAppServerPromptOptions = Readonly<{
     metadata?: unknown;
@@ -494,7 +499,21 @@ type PermissionHandlerSubset = Readonly<{
     cancelPendingRequest?: (requestId: string, reason: string) => boolean;
 }>;
 
-type RuntimeSession = ApiSessionClient;
+export type CodexAppServerRuntimeSession = Pick<ApiSessionClient,
+    'sessionId' | 'updateMetadata' | 'getMetadataSnapshot' | 'sendAgentMessage'
+    | 'sendAgentMessageCommitted' | 'sendCodexMessage' | 'sendSessionEvent'
+> & Partial<ApiSessionClient>;
+type RuntimeSession = CodexAppServerRuntimeSession;
+type AsyncQuestionSession = Pick<ApiSessionClient,
+    'getAgentStateSnapshot' | 'updateAgentState' | 'sendCodexMessageCommitted' | 'enqueueSessionUserMessage'
+>;
+
+function supportsAsyncQuestionDelivery(session: RuntimeSession): session is RuntimeSession & AsyncQuestionSession {
+    return typeof session.getAgentStateSnapshot === 'function'
+        && typeof session.updateAgentState === 'function'
+        && typeof session.sendCodexMessageCommitted === 'function'
+        && typeof session.enqueueSessionUserMessage === 'function';
+}
 type RuntimeSessionMediaMessage = Extract<AgentMessage, { type: 'session-media' }>;
 type RuntimeSessionMediaSource = RuntimeSessionMediaMessage['media'][number];
 type RuntimeSessionMediaPersistResult = SessionMediaPersistResult;
@@ -1242,6 +1261,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
 }>): Readonly<{
     getSessionId: () => string | null;
     getPublishedSessionId: () => string | null;
+    prepareThreadForCliAttach: () => Promise<string>;
     supportsInFlightSteer: () => boolean;
     supportsInFlightConfigApply: () => boolean;
     canSteerPrompt: () => boolean;
@@ -1300,12 +1320,15 @@ export function createCodexAppServerRuntime(params: Readonly<{
     rollbackConversation: (request: SessionRollbackRpcParams) => Promise<SessionRollbackRpcResult>;
 }> {
     const runtimeEnv = params.processEnv ?? process.env;
+    const asyncQuestionSession = supportsAsyncQuestionDelivery(params.session) ? params.session : null;
     const contextWindowRecoveryConfig = resolveCodexContextWindowRecoveryConfig({
         configured: params.contextWindowRecovery,
         runtimeEnv,
     });
     const lastPublishedThreadId: { value: string | null } = { value: null };
     let threadId: string | null = null;
+    // Happier metadata publication can fail independently of Codex rollout persistence.
+    let nativeReadyThreadId: string | null = null;
     let turnInFlight = false;
     let thinking = false;
     let pendingTurn: PendingTurn | null = null;
@@ -1940,25 +1963,48 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
     const getCurrentPermissionMode = (): PermissionMode => params.getPermissionMode?.() ?? params.permissionMode ?? 'default';
 
-    const buildCurrentPermissionParams = (target: 'thread' | 'turn'): Record<string, unknown> => {
-        const permissionMode = getCurrentPermissionMode();
-        if (permissionMode === 'default') return {};
-        if (permissionSupport === 'legacy') {
-            return buildCodexAppServerLegacyPermissionParams({
-                permissionMode,
-                directory: params.directory,
-                target,
-            });
-        }
-        return buildCodexAppServerPermissionsParams({ permissionMode });
-    };
-
     const buildCurrentLegacyPermissionParams = (target: 'thread' | 'turn'): Record<string, unknown> => {
         const permissionMode = getCurrentPermissionMode();
         return buildCodexAppServerLegacyPermissionParams({
             permissionMode,
             directory: params.directory,
             target,
+            managedScalarFallback: permissionSupport === 'legacy-managed-scalar',
+        });
+    };
+
+    const buildCurrentPermissionParams = (target: 'thread' | 'turn'): Record<string, unknown> => {
+        const permissionMode = getCurrentPermissionMode();
+        if (permissionMode === 'default') return {};
+        if (permissionSupport === 'legacy' || permissionSupport === 'legacy-managed-scalar') {
+            return buildCurrentLegacyPermissionParams(target);
+        }
+        return buildCodexAppServerPermissionsParams({ permissionMode });
+    };
+
+    const requestWithManagedPermissionFallback = (
+        client: DisposableCodexAppServerClient,
+        method: 'thread/start' | 'thread/resume' | 'turn/start',
+        target: 'thread' | 'turn',
+        requestParams: Record<string, unknown>,
+        options?: CodexAppServerRequestOptions,
+    ): Promise<unknown> => {
+        const approvalPolicy = requestParams.approvalPolicy;
+        if (permissionSupport !== 'legacy'
+            || normalizePermissionModeToIntent(getCurrentPermissionMode()) !== 'safe-yolo'
+            || !approvalPolicy || typeof approvalPolicy !== 'object' || Array.isArray(approvalPolicy)
+            || !Object.prototype.hasOwnProperty.call(approvalPolicy, 'granular')
+            || requestParams.approvalsReviewer !== 'auto_review') {
+            return client.request(method, requestParams, options);
+        }
+        return client.request(method, requestParams, options).catch(async (error: unknown) => {
+            if (!isCodexAppServerManagedGranularApprovalRejection(error, method)) throw error;
+            permissionSupport = 'legacy-managed-scalar';
+            logger.warn('[codex-app-server] Managed policy rejected Auto granular approvals; using on-request with user review for this session');
+            return await client.request(method, {
+                ...requestParams,
+                ...buildCurrentLegacyPermissionParams(target),
+            }, options);
         });
     };
 
@@ -2073,6 +2119,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         // `thread/start` can return an id before older Codex versions materialize resumable state.
         // A provider turn acknowledgement is the first boundary that proves the fresh thread has
         // accepted work, so only then may its id become Happier's durable resume identity.
+        nativeReadyThreadId = candidate.threadId;
         publishThreadId();
         const deferred = deferredUnacknowledgedTerminalNotifications.get(observedTurnId) ?? null;
         clearDeferredUnacknowledgedTerminalNotificationsForOwner(candidate.promise);
@@ -2213,11 +2260,13 @@ export function createCodexAppServerRuntime(params: Readonly<{
         body: Record<string, unknown>,
     ): Promise<void> => {
         const localId = `codex-async-question-${recordKind}:${itemId}`;
-        await params.session.sendCodexMessageCommitted({ ...body, id: localId }, { localId });
+        if (!asyncQuestionSession) return;
+        await asyncQuestionSession.sendCodexMessageCommitted({ ...body, id: localId }, { localId });
     };
 
     const markCodexAsyncQuestionDelivered = async (itemId: string): Promise<void> => {
-        await params.session.updateAgentState((current) => {
+        if (!asyncQuestionSession) return;
+        await asyncQuestionSession.updateAgentState((current) => {
             const completed = current.completedRequests?.[itemId];
             const marked = markCodexAsyncQuestionDeliveryCompleted(completed, itemId);
             if (marked === completed) return current;
@@ -2231,12 +2280,15 @@ export function createCodexAppServerRuntime(params: Readonly<{
         });
     };
 
+    const buildItemStateKey = (scopeId: string, itemId: string): string => `${scopeId}:${itemId}`;
+
     const deliverCodexAsyncQuestionAnswers = async (
         delivery: CodexAsyncQuestionDelivery,
     ): Promise<boolean> => {
         const reply = buildCodexAsyncUserInputReply(delivery);
         if (!reply) return false;
-        await params.session.enqueueSessionUserMessage({
+        if (!asyncQuestionSession) return false;
+        await asyncQuestionSession.enqueueSessionUserMessage({
             text: reply.text,
             localId: `codex-async-question:${delivery.itemId}`,
             meta: {
@@ -2256,9 +2308,71 @@ export function createCodexAppServerRuntime(params: Readonly<{
         return true;
     };
 
+    const handleCodexAsyncQuestion = async (questionParams: Readonly<{
+        itemId: string;
+        questions: unknown;
+        input: unknown;
+        itemKey: string;
+        persistedDelivery?: CodexAsyncQuestionDelivery | null;
+    }>): Promise<void> => {
+        const permissionHandler = params.permissionHandler;
+        if (!permissionHandler) return;
+        try {
+            await commitCodexAsyncQuestionRecord(questionParams.itemId, 'request', {
+                type: 'tool-call',
+                callId: questionParams.itemId,
+                name: 'AskUserQuestion',
+                input: questionParams.input,
+            });
+            if (questionParams.persistedDelivery) {
+                await deliverCodexAsyncQuestionAnswers(questionParams.persistedDelivery);
+                return;
+            }
+            const result = await permissionHandler.handleToolCall(
+                questionParams.itemId,
+                'AskUserQuestion',
+                questionParams.input,
+            );
+            const delivered = result.answers
+                ? await deliverCodexAsyncQuestionAnswers({
+                    itemId: questionParams.itemId,
+                    questions: questionParams.questions,
+                    answersByKey: result.answers,
+                })
+                : false;
+            if (!delivered) {
+                await commitCodexAsyncQuestionRecord(questionParams.itemId, 'result', {
+                    type: 'tool-call-result',
+                    callId: questionParams.itemId,
+                    output: { status: result.decision === 'abort' ? 'cancelled' : 'declined' },
+                });
+                await markCodexAsyncQuestionDelivered(questionParams.itemId);
+            }
+        } catch (error) {
+            // A repeated provider notification may safely retry deterministic transcript and
+            // pending-input identities after a transient failure.
+            handledAsyncQuestionItemKeys.delete(questionParams.itemKey);
+            throw error;
+        }
+    };
+
+    const cancelStaleCodexAsyncQuestion = async (itemId: string): Promise<boolean> => {
+        const canceled = params.permissionHandler?.cancelPendingRequest?.(
+            itemId,
+            'Codex async question could not be restored after session resume',
+        ) ?? false;
+        if (!canceled) return false;
+        await commitCodexAsyncQuestionRecord(itemId, 'result', {
+            type: 'tool-call-result',
+            callId: itemId,
+            output: { status: 'cancelled' },
+        });
+        return true;
+    };
+
     const recoverPersistedCodexAsyncQuestionAnswers = async (): Promise<void> => {
-        if (typeof params.session.getAgentStateSnapshot !== 'function') return;
-        const completedRequests = params.session.getAgentStateSnapshot()?.completedRequests;
+        if (!asyncQuestionSession) return;
+        const completedRequests = asyncQuestionSession.getAgentStateSnapshot()?.completedRequests;
         if (!completedRequests) return;
         for (const completed of Object.values(completedRequests)) {
             const delivery = readPendingCodexAsyncQuestionDelivery(completed);
@@ -2278,6 +2392,34 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     errorName: error instanceof Error ? error.name : typeof error,
                 });
             }
+        }
+    };
+
+    const recoverPendingCodexAsyncQuestions = async (): Promise<void> => {
+        const permissionHandler = params.permissionHandler;
+        if (!permissionHandler || !asyncQuestionSession) return;
+        const requests = asyncQuestionSession.getAgentStateSnapshot()?.requests;
+        if (!requests) return;
+        const streamScopeId = threadId ?? 'resumed-thread';
+        for (const [requestId, request] of Object.entries(requests)) {
+            const pending = readPendingCodexAsyncQuestionRequest(request);
+            if (!pending || pending.itemId !== requestId) continue;
+            const itemKey = buildItemStateKey(streamScopeId, pending.itemId);
+            if (handledAsyncQuestionItemKeys.has(itemKey)) continue;
+            handledAsyncQuestionItemKeys.add(itemKey);
+            if (!canSteerPrompt()) {
+                const canceled = await cancelStaleCodexAsyncQuestion(pending.itemId);
+                if (!canceled) handledAsyncQuestionItemKeys.delete(itemKey);
+                continue;
+            }
+            startDetachedProviderProjection('async-user-input-recovery', () => (
+                handleCodexAsyncQuestion({
+                    itemId: pending.itemId,
+                    questions: pending.questions,
+                    input: pending.input,
+                    itemKey,
+                })
+            ));
         }
     };
 
@@ -2309,7 +2451,6 @@ export function createCodexAppServerRuntime(params: Readonly<{
         override(text);
     };
 
-    const buildItemStateKey = (scopeId: string, itemId: string): string => `${scopeId}:${itemId}`;
     const buildRawFallbackStateKey = (scopeId: string): string => `${scopeId}:raw-response-item`;
     const buildItemStreamKey = (scopeId: string, kind: 'assistant' | 'reasoning', itemId: string): string =>
         `${scopeId}:${kind}:${itemId}`;
@@ -2485,7 +2626,9 @@ export function createCodexAppServerRuntime(params: Readonly<{
         }
 
         if (update.type === 'async-user-input-request') {
-            if (context.sidechainId || !params.permissionHandler) {
+            // Detached runs have no session state or pending-input queue. Keep their
+            // question visible through the same text projection as non-interactive sessions.
+            if (context.sidechainId || !params.permissionHandler || !asyncQuestionSession) {
                 await applyStreamUpdate({
                     type: 'assistant-text-final',
                     itemId: update.itemId,
@@ -2506,52 +2649,22 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 }, context);
                 return;
             }
-            const completedRequest = params.session.getAgentStateSnapshot()?.completedRequests?.[update.itemId];
+            const completedRequest = asyncQuestionSession.getAgentStateSnapshot()?.completedRequests?.[update.itemId];
             if (isCodexAsyncQuestionDeliveryCompleted(completedRequest, update.itemId)) return;
             const persistedDelivery = readPendingCodexAsyncQuestionDelivery(completedRequest);
             const itemKey = buildItemStateKey(context.streamScopeId, update.itemId);
             if (handledAsyncQuestionItemKeys.has(itemKey)) return;
             handledAsyncQuestionItemKeys.add(itemKey);
 
-            startDetachedProviderProjection('async-user-input-request', async () => {
-                try {
-                    await commitCodexAsyncQuestionRecord(update.itemId, 'request', {
-                        type: 'tool-call',
-                        callId: update.itemId,
-                        name: 'AskUserQuestion',
-                        input: toolInput,
-                    });
-                    if (persistedDelivery) {
-                        await deliverCodexAsyncQuestionAnswers(persistedDelivery);
-                        return;
-                    }
-                    const result = await params.permissionHandler!.handleToolCall(
-                        update.itemId,
-                        'AskUserQuestion',
-                        toolInput,
-                    );
-                    const delivered = result.answers
-                        ? await deliverCodexAsyncQuestionAnswers({
-                            itemId: update.itemId,
-                            questions: update.questions,
-                            answersByKey: result.answers,
-                        })
-                        : false;
-                    if (!delivered) {
-                        await commitCodexAsyncQuestionRecord(update.itemId, 'result', {
-                            type: 'tool-call-result',
-                            callId: update.itemId,
-                            output: { status: result.decision === 'abort' ? 'cancelled' : 'declined' },
-                        });
-                        await markCodexAsyncQuestionDelivered(update.itemId);
-                    }
-                } catch (error) {
-                    // A repeated provider notification may safely retry deterministic transcript and
-                    // pending-input identities after a transient failure.
-                    handledAsyncQuestionItemKeys.delete(itemKey);
-                    throw error;
-                }
-            });
+            startDetachedProviderProjection('async-user-input-request', () => (
+                handleCodexAsyncQuestion({
+                    itemId: update.itemId,
+                    questions: update.questions,
+                    input: toolInput,
+                    itemKey,
+                    persistedDelivery,
+                })
+            ));
             return;
         }
 
@@ -3745,6 +3858,8 @@ export function createCodexAppServerRuntime(params: Readonly<{
             return null;
         }
 
+        nativeReadyThreadId = activeThreadId;
+
         pendingTurnStartSeqInclusive = readLastObservedMessageSeq(params.session);
         activeTurnHasMeaningfulContextWindowRecoveryActivity = false;
         const changeTrackingReady = beginTurnChangeTracking();
@@ -4025,6 +4140,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                                 const nextThreadId = readThreadId(notificationParams);
                                 if (nextThreadId && nextThreadId !== threadId) {
                                     threadId = nextThreadId;
+                                    nativeReadyThreadId = nextThreadId;
                                     publishThreadId();
                                 }
                                 startDetachedProviderProjection('turn/started:context-window', () => (
@@ -4411,7 +4527,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         };
         let response: unknown;
         try {
-            response = await client.request('thread/resume', requestParams, resumeRequestOptions);
+            response = await requestWithManagedPermissionFallback(client, 'thread/resume', 'thread', requestParams, resumeRequestOptions);
             if (Object.prototype.hasOwnProperty.call(requestParams, 'permissions')) {
                 permissionSupport = 'supported';
             }
@@ -4428,7 +4544,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 }
                 permissionSupport = 'legacy';
                 try {
-                    response = await client.request('thread/resume', {
+                    response = await requestWithManagedPermissionFallback(client, 'thread/resume', 'thread', {
                         threadId: requestedThreadId,
                         cwd: params.directory,
                         ...(currentModelId ? { model: currentModelId } : {}),
@@ -4502,6 +4618,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             await finishPendingTurn({ flushReason: 'abort' });
         }
         if (options.publishThreadIdImmediately !== false) {
+            nativeReadyThreadId = nextThreadId;
             publishThreadId();
         }
         await publishActivePermissionProfile(startOrLoadResponse);
@@ -4574,7 +4691,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     };
                     let response: unknown;
                     try {
-                        response = await client.request('thread/start', requestParams);
+                        response = await requestWithManagedPermissionFallback(client, 'thread/start', 'thread', requestParams);
                         if (Object.prototype.hasOwnProperty.call(requestParams, 'permissions')) {
                             permissionSupport = 'supported';
                         }
@@ -4583,7 +4700,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                             throw error;
                         }
                         permissionSupport = 'legacy';
-                        response = await client.request('thread/start', {
+                        response = await requestWithManagedPermissionFallback(client, 'thread/start', 'thread', {
                             cwd: params.directory,
                             ...(currentModelId ? { model: currentModelId } : {}),
                             ...buildThreadServiceTierParams(currentServiceTier, hasServiceTierOverride),
@@ -4646,7 +4763,28 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 reason: 'startOrLoad',
             });
         }
+        startDetachedProviderProjection('async-user-input-recovery', recoverPendingCodexAsyncQuestions);
         startDetachedProviderProjection('async-user-input-recovery', recoverPersistedCodexAsyncQuestionAnswers);
+    };
+
+    const prepareThreadForCliAttach = async (): Promise<string> => {
+        const attachedThreadId = threadId;
+        if (!attachedThreadId) throw new Error('Codex native attachment requires an initialized thread');
+        if (nativeReadyThreadId !== attachedThreadId) {
+            const client = await ensureClient();
+            const name = getSessionNotificationTitle(() => params.session.getMetadataSnapshot())
+                ?? `Happier session ${params.session.sessionId}`;
+            await client.request('thread/name/set', { threadId: attachedThreadId, name });
+            // Codex paginated history is not resumable after thread/start alone.
+            // A truthful name plus a full read persists the zero-turn rollout.
+            const snapshot = await client.request('thread/read', { threadId: attachedThreadId, includeTurns: true });
+            if (readThreadId(snapshot) !== attachedThreadId || threadId !== attachedThreadId) {
+                throw new Error('Codex native attachment materialized a different thread');
+            }
+            nativeReadyThreadId = attachedThreadId;
+        }
+        publishThreadId();
+        return attachedThreadId;
     };
 
     const compactActiveThread = async (activeThreadId: string): Promise<void> => {
@@ -4908,6 +5046,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
     return {
         getSessionId: () => threadId,
+        prepareThreadForCliAttach,
         getPublishedSessionId: () => lastPublishedThreadId.value,
         // Codex app-server exposes `turn/steer`, which appends user input to the active in-flight
         // turn without interrupting it. This may not affect a currently-running tool until that
@@ -4960,6 +5099,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         },
         reset: async () => {
             threadId = null;
+            nativeReadyThreadId = null;
             currentModeId = null;
             currentCollaborationMode = null;
             currentModelId = null;
@@ -5239,7 +5379,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     };
                     let response: unknown;
                     try {
-                        response = await client.request('turn/start', turnStartParams);
+                        response = await requestWithManagedPermissionFallback(client, 'turn/start', 'turn', turnStartParams);
                         if (Object.prototype.hasOwnProperty.call(turnStartParams, 'permissions')) {
                             permissionSupport = 'supported';
                         }
@@ -5251,18 +5391,21 @@ export function createCodexAppServerRuntime(params: Readonly<{
                                 ...buildCurrentLegacyPermissionParams('turn'),
                             };
                             try {
-                                response = await client.request('turn/start', turnStartParams);
+                                response = await requestWithManagedPermissionFallback(client, 'turn/start', 'turn', turnStartParams);
                             } catch (legacyError) {
-                                if (input.length > 1 && isCodexAppServerInvalidParamsError(legacyError)) {
+                                if (input.length > 1 && isCodexAppServerInvalidParamsError(legacyError)
+                                    && !isCodexAppServerInvalidParamsForFieldError(legacyError, 'approval_policy')) {
                                     response = await client.request('turn/start', {
                                         ...turnStartParams,
+                                        ...buildCurrentLegacyPermissionParams('turn'),
                                         input: textOnlyInput,
                                     });
                                 } else {
                                     throw legacyError;
                                 }
                             }
-                        } else if (input.length > 1 && isCodexAppServerInvalidParamsError(error)) {
+                        } else if (input.length > 1 && isCodexAppServerInvalidParamsError(error)
+                            && !isCodexAppServerInvalidParamsForFieldError(error, 'approval_policy')) {
                             response = await client.request('turn/start', {
                                 ...turnStartParams,
                                 input: textOnlyInput,

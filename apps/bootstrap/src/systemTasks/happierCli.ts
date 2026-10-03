@@ -46,6 +46,10 @@ const DEFAULT_ENV_VAR_NAMES = [
  * Compared on the semver base only, so a preview or dev build of the same base satisfies it.
  */
 export const SETUP_CLI_VERSION_FLOOR = '0.2.13';
+// 0.2.13 also scopes daemon start-up reaping and service install conflicts to one relay, which is
+// what lets this computer run one daemon per relay ("connect to this relay too"); the status read
+// reports pinned services only for a CLI at the floor.
+
 
 export type SetupCapableLocalHappierCli = ResolvedLocalFirstPartyCommand & Readonly<{
   version: string;
@@ -105,6 +109,7 @@ export type LocalHappierJsonCommandParams = Readonly<{
   releaseRing: PublicReleaseRingId;
   processEnv?: NodeJS.ProcessEnv;
   allowJsonFailure?: boolean;
+  signal?: AbortSignal;
   /**
    * A CLI this caller already resolved through one of the resolvers below. Passing it runs the
    * command against exactly that CLI instead of resolving again, so a caller that issues several
@@ -119,18 +124,29 @@ export type LocalHappierJsonCommandParams = Readonly<{
  * command rather than a separate step a caller can forget.
  */
 export async function runLocalHappierJsonCommand(params: LocalHappierJsonCommandParams): Promise<unknown> {
+  params.signal?.throwIfAborted();
   const processEnv = params.processEnv ?? process.env;
   const cli = params.cli ?? await ensureLocalFirstPartyComponentCommand(resolveHappierCliParams({
     releaseRing: params.releaseRing,
     processEnv,
+    signal: params.signal,
   }));
   const { command } = cli;
+  // Service mutations already own OS-command, ownership-wait and recovery budgets. An outer
+  // minute can kill a valid Windows ownership wait (120s plus grace), or interrupt recovery.
+  const serviceArgs = params.args[0] === 'daemon' ? params.args.slice(1) : params.args;
+  const serviceMutation = serviceArgs[0] === 'service'
+    && ['install', 'start', 'stop', 'restart'].includes(serviceArgs[1] ?? '')
+    && !params.args.includes('--dry-run');
 
   const result = await runCommandCapture({
     command,
     args: params.args,
     env: resolveLocalHappierCliEnv(processEnv),
+    ...(serviceMutation ? { timeoutMs: 0 } : {}),
+    signal: params.signal,
   }).catch((error: unknown) => {
+    params.signal?.throwIfAborted();
     if (error instanceof CommandTimeoutError) {
       throw new systemTasks.SystemTaskExecutionError('cli_command_timeout', error.message);
     }
@@ -212,7 +228,8 @@ async function readLocalHappierCliVersion(params: Readonly<{
   return version;
 }
 
-function meetsSetupVersionFloor(version: string): boolean {
+/** Whether `version` (base only; an unreadable one never does) is a CLI desktop setup can drive. */
+export function meetsSetupVersionFloor(version: string): boolean {
   const base = normalizeSemverBase(version);
   return base !== null && compareVersions(base, SETUP_CLI_VERSION_FLOOR) >= 0;
 }
@@ -220,6 +237,25 @@ function meetsSetupVersionFloor(version: string): boolean {
 export type LocalHappierCliResolutionOverrides = Partial<LocalFirstPartyCommandAcquisitionDeps & {
   readVersion: typeof readLocalHappierCliVersion;
 }>;
+
+/**
+ * The Happier CLI already on this computer for a ring, with its version — never acquiring one.
+ * `null` when none is installed (or it cannot report a version): for a caller whose question is
+ * about what this computer already has, where downloading a CLI would answer nothing (R10-1).
+ */
+export async function resolveInstalledLocalHappierCli(
+  params: Readonly<{ releaseRing: PublicReleaseRingId; processEnv?: NodeJS.ProcessEnv; signal?: AbortSignal }>,
+  overrides: LocalHappierCliResolutionOverrides = {},
+): Promise<SetupCapableLocalHappierCli | null> {
+  const processEnv = params.processEnv ?? process.env;
+  const resolved = resolveExplicitOrInstalledLocalFirstPartyCommand(resolveHappierCliParams({ ...params, processEnv }));
+  if (!resolved) {
+    return null;
+  }
+  const version = await (overrides.readVersion ?? readLocalHappierCliVersion)({ command: resolved.command, processEnv }).catch(() => null);
+  params.signal?.throwIfAborted();
+  return version ? { ...resolved, version } : null;
+}
 
 /**
  * Resolve the Happier CLI for a ring — installing it when this machine has none — and report which

@@ -124,7 +124,24 @@ const AMBIENT_STATUS_DATA = {
     runtimeConvergence: { controlReachable: false, serviceOwnsRunningDaemon: false, machineIdMatches: false, cliVersionMatches: false },
 };
 
+/**
+ * The one move question (N1): a repair that would take this computer off the relay its service
+ * serves asks Move / Keep. `moveAnswer` is what the person presses; unset, the alert is dismissed
+ * (the presenter's "keep").
+ */
+const modalAnswers = vi.hoisted(() => ({ moveAnswer: null as string | null }));
+
 installServerSettingsHooksCommonModuleMocks({
+    modal: async () => {
+        const { createModalModuleMock } = await import('@/dev/testkit/mocks/modal');
+        return createModalModuleMock({
+            spies: {
+                alertAsync: async (_title, _body, buttons) => {
+                    buttons?.find((button) => button.text === modalAnswers.moveAnswer)?.onPress?.();
+                },
+            },
+        }).module;
+    },
     text: async () => {
         const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
         return createTextModuleMock({
@@ -196,6 +213,7 @@ describe('useRelayDriftBanner', () => {
         Reflect.deleteProperty(globalThis as { location?: unknown }, 'location');
         state.isTauriDesktop = false;
         state.accountId = 'acct_app';
+        modalAnswers.moveAnswer = null;
         state.activeServerSnapshot = {
             serverId: 'server-a',
             serverUrl: 'https://relay.example.test',
@@ -437,6 +455,49 @@ describe('useRelayDriftBanner', () => {
         });
 
         expect(cancelMock).toHaveBeenCalledWith('task_1');
+    });
+
+    it('keeps an executor start failure visible instead of making the action appear inert', async () => {
+        const { useRelayDriftBanner } = await import('./useRelayDriftBanner');
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        const startMock = vi.fn(async (spec: unknown) => {
+            const kind = (spec as { kind?: string }).kind;
+            if (kind === 'daemon.service.status.v1') {
+                return 'status_read_1';
+            }
+            throw new Error('setup bridge failed');
+        });
+        state.runner = createSystemTaskRunner({
+            mode: 'dev',
+            bridge: withStatusReadsAnswered({
+                start: startMock,
+                async subscribe() { return () => {}; },
+                async cancel() {},
+                async respond() {},
+            }),
+        });
+        state.cachedDoctorSnapshot = {
+            cachedAt: 1,
+            snapshot: {
+                capturedAt: '2026-03-29T00:00:00.000Z',
+                server: { activeServerId: 'server-a', serverUrl: '', publicServerUrl: '', webappUrl: '' },
+                accountId: null,
+                settings: { activeServerId: 'server-a', servers: [], knownAccountIds: [] },
+            },
+        };
+
+        let banner: RelayDriftBanner | null = null;
+        function Probe() {
+            banner = useRelayDriftBanner();
+            return null;
+        }
+        await renderScreen(React.createElement(Probe));
+
+        await renderer.act(async () => {
+            await banner?.onPress();
+        });
+
+        expect((banner as RelayDriftBanner | null)?.actionHint).toBe('settings.systemTaskStartFailed');
     });
 
     it('infers the active webapp url when repairing Happier Cloud relay drift', async () => {
@@ -754,6 +815,28 @@ describe('useRelayDriftBanner', () => {
         }));
     });
 
+    /**
+     * One daemon per relay: after "Connect to … too" this computer answers on the app's relay
+     * through that relay's own pinned service while the default-following one stays on the other
+     * relay. That is connected, not drift — switching relays must not prompt to move.
+     */
+    it('is null when the app relay has its own pinned service here, whichever relay the default-following one serves', async () => {
+        const elsewhere = localFactsForDaemon({ serverUrl: 'https://daemon-relay.example.test', serviceInstalled: true, controlReachable: true });
+        const pinnedHere = {
+            ...localFactsForDaemon({ serverUrl: 'https://relay.example.test', serviceInstalled: true, controlReachable: true }),
+            service: { installed: true, running: true, targetMode: 'pinned' },
+            managedBy: 'desktop',
+        };
+        const read = await renderDesktopBanner({
+            ...elsewhere,
+            pinnedServices: { complete: true, coexistence: true, services: [pinnedHere], unreadable: [] },
+            // Bootstrap's row for the app relay: its own pinned service serves it (D11-2).
+            serviceRows: [{ relayUrl: 'https://relay.example.test', state: 'connected', appManaged: true, serving: 'pinned', actions: ['restart', 'stop'] }],
+        });
+
+        expect(read()).toBeNull();
+    });
+
     it('still warns and offers repair when this computer has a background service that is not running', async () => {
         // An installed service that no longer answers is daemon knowledge and a real deviation,
         // unlike a computer that never had one.
@@ -829,6 +912,8 @@ describe('useRelayDriftBanner', () => {
         // changed the very facts it classifies, so continuing to project them would leave a
         // permanent "different relay" banner over a daemon that is now on the right relay.
         state.isTauriDesktop = true;
+        // The repair takes this computer off the daemon's relay, so it asks first (N1): "Move it".
+        modalAnswers.moveAnswer = 'setupSurface.relayMoveConfirm';
         const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
         const DRIFTED_STATUS_DATA = localFactsForDaemon({
             serverUrl: 'https://daemon-relay.example.test',
