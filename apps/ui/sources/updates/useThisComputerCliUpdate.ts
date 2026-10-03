@@ -1,13 +1,15 @@
 import * as React from 'react';
 
 import { useCliUpdateTask } from '@/components/settings/machines/localControl/useCliUpdateTask';
-import { desktopSetupCoordinator } from '@/setup/desktopSetupCoordinator';
+import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot';
+import { readKeptCliUpdateCommand } from '@/setup/deriveDesktopLocalSetupSnapshot';
+import { desktopSetupCoordinator, resolveThisComputerServiceForActiveRelay } from '@/setup/desktopSetupCoordinator';
+import { useActiveServerAccountScope } from '@/sync/domains/state/storage';
 import { t } from '@/text';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
 import { buildThisComputerCliUpdateItem } from './items/buildMachineUpdateItems';
 import type { UpdateItem } from './items/updateItem';
-import { recordUpdateCompleted } from './machineUpdateRuns';
 
 export type ThisComputerCliUpdate = Readonly<{
     /** `null` off the desktop app, and until this computer's inspection has answered. */
@@ -30,16 +32,21 @@ export function useThisComputerCliUpdate(): ThisComputerCliUpdate {
         desktopSetupCoordinator.readInspectionSnapshot,
         desktopSetupCoordinator.readInspectionSnapshot,
     );
-    const itemIdRef = React.useRef<string | null>(null);
-    const onSucceeded = React.useCallback(() => {
-        if (itemIdRef.current) recordUpdateCompleted(itemIdRef.current);
-    }, []);
-    const task = useCliUpdateTask({ onSucceeded });
-    const facts = desktop && inspection.status === 'resolved' ? inspection.facts : null;
-    const machineId = facts?.auth.machineId ?? null;
+    const serverId = useActiveServerSnapshot().serverId;
+    const activeScope = useActiveServerAccountScope();
+    const task = useCliUpdateTask();
+    // The machine is the one that answers for the app's relay — its own pinned service's when it has
+    // one here — so this row replaces that machine's row in the relay's machine list. The CLI facts
+    // are this computer's one CLI's, whichever service reports them.
+    const serving = desktop ? resolveThisComputerServiceForActiveRelay(inspection) : null;
+    // The command line is this computer's one CLI whichever service reports it, so it stays listed
+    // even when the app relay's own service could not be read; only the machine is then unknown.
+    const facts = desktop ? serving?.facts ?? (inspection.status === 'resolved' ? inspection.facts : null) : null;
+    const machineId = serving?.facts.auth.machineId ?? null;
     const cliUpdate = facts?.cliUpdate ?? null;
     const provenance = facts?.acquisition.provenance ?? null;
     const currentVersion = facts?.acquisition.version ?? cliUpdate?.currentVersion ?? null;
+    const keptCliUpdateCommand = facts ? readKeptCliUpdateCommand(facts) : null;
 
     const item = React.useMemo(() => {
         if (!facts) return null;
@@ -50,12 +57,15 @@ export function useThisComputerCliUpdate(): ThisComputerCliUpdate {
                 currentVersion,
                 latestVersion: cliUpdate?.latestVersion ?? null,
                 managed: provenance === 'managed' && cliUpdate?.managed !== false,
-                updateCommand: null,
+                updateCommand: keptCliUpdateCommand,
             },
             task: { running: task.running, step: task.running ? 'installing' : null, errorMessage: task.errorMessage },
         });
-    }, [cliUpdate?.latestVersion, cliUpdate?.managed, currentVersion, facts, machineId, provenance, task.errorMessage, task.running]);
+    }, [cliUpdate?.latestVersion, cliUpdate?.managed, currentVersion, facts, keptCliUpdateCommand, machineId, provenance, task.errorMessage, task.running]);
 
-    itemIdRef.current = item?.id ?? null;
-    return React.useMemo(() => ({ item, machineId, run: desktop ? task.start : NOOP }), [desktop, item, machineId, task.start]);
+    const run = React.useCallback(async () => {
+        if (!desktop || !item || !activeScope || activeScope.serverId !== serverId) return;
+        await task.start();
+    }, [activeScope, desktop, item, serverId, task.start]);
+    return React.useMemo(() => ({ item, machineId, run: desktop ? run : NOOP }), [desktop, item, machineId, run]);
 }

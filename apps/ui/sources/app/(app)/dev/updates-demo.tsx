@@ -46,6 +46,7 @@ function desktopSnapshot(state: DemoState): DesktopUpdaterSnapshot {
 function buildDemoGroups(state: DemoState): UpdatesGroup[] {
     const app = buildAppUpdateItem({
         platformOs: 'web',
+        desktopHost: true,
         title: 'Happier',
         native: { updateUrl: null, required: false },
         webUiUpdateAvailable: false,
@@ -145,6 +146,8 @@ export default function UpdatesDemoScreen() {
             summary: buildUpdatesSummary(groups.flatMap((group) => group.items)),
             groups,
             checkedAt: Date.now() - 2 * 60 * 60 * 1000,
+            uncheckedMachineCount: 0,
+            sessionsRunningOn: new Set(),
             runItem: asyncNoop,
             updateAll: asyncNoop,
             stopAfterCurrent: noop,
@@ -162,9 +165,9 @@ export default function UpdatesDemoScreen() {
             <Text style={styles.caption}>Pill</Text>
             <View style={styles.pills} testID="updates-demo.pills">
                 {PILL_SUMMARIES.map((summary) => (
-                    <UpdatesPopoverButton key={summary.phase} summary={summary} variant="pill" testID={`updates-demo.pill.${summary.phase}`} />
+                    <UpdatesPopoverButton key={summary.phase} summary={summary} variant="icon" testID={`updates-demo.pill.${summary.phase}`} />
                 ))}
-                <UpdatesPopoverButton summary={PILL_SUMMARIES[0]} variant="rail" testID="updates-demo.rail" />
+                <UpdatesPopoverButton summary={PILL_SUMMARIES[0]} variant="icon" testID="updates-demo.rail" />
             </View>
             </> : null}
             {only == null || only === 'popover' ? <>

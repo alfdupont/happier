@@ -890,7 +890,7 @@ function DesktopFallbackShellChrome(props: Readonly<{
                 {desktopWindowControls}
             </DesktopShellWindowControlsHost>
             <DesktopShellUpdateIndicatorHost>
-                <UpdatesEntry variant="pill" testID="root-shell-updates-pill" />
+                <UpdatesEntry variant="icon" testID="root-shell-updates-button" />
             </DesktopShellUpdateIndicatorHost>
         </View>
     );

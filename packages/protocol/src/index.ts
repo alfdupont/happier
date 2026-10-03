@@ -535,6 +535,7 @@ export {
 
 export {
   collectExpoPushTokensMarkedUnregistered,
+  getExpoErrorCode,
 } from './push/expoPushDelivery.js';
 
 export {
@@ -1790,6 +1791,13 @@ export {
 } from './sessionControl/sessionTerminalComposerClearV1.js';
 
 export {
+  SessionProviderCliAttachPrepareRequestV1Schema,
+  SessionProviderCliAttachPrepareResultV1Schema,
+  type SessionProviderCliAttachPrepareRequestV1,
+  type SessionProviderCliAttachPrepareResultV1,
+} from './sessionControl/sessionProviderCliAttachPrepareV1.js';
+
+export {
   SessionPendingInputInterruptAndRunRequestV1Schema,
   SessionPendingInputInterruptAndRunResultV1Schema,
   buildUnsupportedSessionPendingInputInterruptAndRunResult,
@@ -1911,6 +1919,8 @@ export {
   type SessionTerminalMetadata,
   type TerminalControlServiceabilityPolicy,
   createSessionTerminalMetadataSchema,
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
   resolveTerminalControlServiceabilityPolicy,
 } from './sessionMetadata/terminalMetadata.js';
 
@@ -3508,6 +3518,7 @@ export {
   BUG_REPORT_FALLBACK_MAX_LABELS,
   BUG_REPORT_FALLBACK_MAX_LABEL_LENGTH,
   buildBugReportFallbackIssueUrl,
+  buildBugReportExportBundle,
   formatBugReportFallbackIssueBody,
   appendBugReportReporterToSummary,
   hasAcceptedBugReportArtifactKind,
@@ -3527,13 +3538,10 @@ export {
   sanitizeBugReportStackContextPayload,
   sanitizeBugReportUrl,
   searchBugReportSimilarIssues,
-  buildBugReportExportBundle,
   serializeBugReportExportBundle,
   submitBugReportToService,
   trimBugReportTextToMaxBytes,
   type BugReportArtifactPayload,
-  type BugReportExportArtifact,
-  type BugReportExportBundle,
   type BugReportDeploymentType,
   type BugReportEnvironmentPayload,
   type BugReportFormPayload,

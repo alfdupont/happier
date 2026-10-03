@@ -89,8 +89,9 @@ async function readAppCredentials(page: Page): Promise<Readonly<{ token: string;
     return { token: parsed.token, secret: Uint8Array.from(Buffer.from(parsed.secret, 'base64url')) };
 }
 
-function shortAccountId(accountId: string): string {
-    return accountId.length > 8 ? accountId.slice(0, 8) : accountId;
+function accountIdHint(accountId: string): RegExp {
+    // Prove both ends identify the same account without duplicating the UI's display formatter.
+    return new RegExp(accountId.slice(0, 6) + '[^ ]*' + accountId.slice(-4));
 }
 
 function relayHost(url: string): string {
@@ -185,7 +186,7 @@ async function expectThisComputerReady(app: DesktopApp, machineId: string, timeo
         if (error instanceof Error) error.message += `\nreadiness proofs seen: ${JSON.stringify(proofs.map((call) => ({ method: call.method, ok: call.ack?.ok ?? null, error: call.ack?.error ?? null, injected: call.injected })))}`;
         throw error;
     }
-    await expect(app.page.getByTestId('desktop-setup-panel:panel')).toHaveCount(0, { timeout: timeoutMs });
+    await expect(app.page.getByTestId('desktop-setup-panel:veil')).toHaveCount(0, { timeout: timeoutMs });
     await expect(app.page.getByTestId('desktop-setup-panel:blocked')).toHaveCount(0);
 }
 
@@ -341,7 +342,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             await ensureAccountReadyForConnect({ page: app.page, timeoutMs: 180_000 });
             // R11: while this computer is still being set up the shell is already usable, and
             // leaving the Home does not pause setup (its owner is the shell, not the Home route).
-            await expect.poll(async () => (await app.page.getByTestId('desktop-setup-panel:panel').count()) > 0
+            await expect.poll(async () => (await app.page.getByTestId('desktop-setup-panel:veil').count()) > 0
                 && await app.page.getByTestId('nav-settings').first().isVisible(), {
                 message: 'the shell was never usable while the setup panel was up',
                 timeout: 120_000,
@@ -382,7 +383,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             await expect(title).toBeVisible({ timeout: 240_000 });
             const toLabel = /^Switch this computer to (.+)\?$/.exec((await title.textContent()) ?? '')?.[1] ?? '';
             const body = app.page.getByText(/^This computer is signed in to /);
-            await expect(body).toContainText(shortAccountId(accountB.accountId));
+            await expect(body).toContainText(accountIdHint(accountB.accountId));
             await expect(body).toContainText(toLabel);
             await expect(body).toContainText(relayHost(server.baseUrl));
 
@@ -390,9 +391,33 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             await app.page.getByTestId('web-modal-button-0').click();
             await expect(title).toHaveCount(0);
             await expect(app.page.getByTestId('nav-settings').first()).toBeVisible();
-            await expect(app.page.getByTestId('desktop-setup-panel:panel')).toHaveCount(0, { timeout: 60_000 });
+            await expect(app.page.getByTestId('desktop-setup-panel:veil')).toHaveCount(0, { timeout: 60_000 });
             // The Home says, in one sentence with one action, that this computer stays with B (R17).
-            await expect(app.page.getByTestId('relay-drift-banner')).toContainText(shortAccountId(accountB.accountId), { timeout: 60_000 });
+            await expect(app.page.getByTestId('relay-drift-banner')).toContainText(accountIdHint(accountB.accountId), { timeout: 60_000 });
+            // The same recovery action must remain readable inside the narrow desktop sidebar.
+            await app.page.setViewportSize({ width: 1042, height: 680 });
+            const driftCard = app.page.getByTestId('relay-drift-banner');
+            const driftAction = app.page.getByTestId('relay-drift-banner-primary');
+            await expect.poll(async () => {
+                const card = await driftCard.boundingBox();
+                const action = await driftAction.boundingBox();
+                return Boolean(card && action && action.x >= card.x && action.x + action.width <= card.x + card.width);
+            }).toBe(true);
+            await expect.poll(() => driftAction.evaluate((button) => {
+                const bounds = button.getBoundingClientRect();
+                const text = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
+                let node: Node | null;
+                while ((node = text.nextNode())) {
+                    if (!node.textContent?.trim()) continue;
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    for (const line of range.getClientRects()) {
+                        if (line.left < bounds.left || line.right > bounds.right || line.top < bounds.top || line.bottom > bounds.bottom) return false;
+                    }
+                }
+                return true;
+            })).toBe(true);
+            await app.page.setViewportSize({ width: 1280, height: 820 });
             expect(tasksOfKind(app.host, 'setup.thisComputer.v1').filter((task) => task.snapshot.result?.ok === true)).toEqual([]);
             expect(computer.stateFingerprint()).toEqual(before);
             expect(readRunningDaemonPids(computer)).toEqual(daemonPidsBefore);
@@ -459,7 +484,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
                 const body = app.page.getByText(/^This computer is signed in to /);
                 await expect(body).toContainText(relayHost(otherRelayUrl));
                 await expect(body).toContainText(relayHost(server.baseUrl));
-                await expect(body).toContainText(shortAccountId(otherAccount.accountId));
+                await expect(body).toContainText(accountIdHint(otherAccount.accountId));
                 await app.page.getByTestId('web-modal-button-1').click();
                 const converged = await expectConvergedOnAppRelay(app, computer, server.baseUrl);
                 expect(converged.daemonAccountId).toBe(converged.appAccountId);
@@ -560,7 +585,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             await expect(blocked).toBeVisible({ timeout: 60_000 });
 
             await app.page.getByTestId('desktop-setup-panel:continue-without').click();
-            await expect(app.page.getByTestId('desktop-setup-panel:panel')).toHaveCount(0, { timeout: 60_000 });
+            await expect(app.page.getByTestId('desktop-setup-panel:veil')).toHaveCount(0, { timeout: 60_000 });
             await app.page.getByTestId('nav-settings').first().click();
             await expect(app.page).toHaveURL(/\/settings/, { timeout: 60_000 });
         } catch (error) {

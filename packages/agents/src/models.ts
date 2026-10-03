@@ -83,12 +83,12 @@ export type AgentModelConfig = Readonly<{
    * Which models the agent's model-scoped ACP config options (for example `reasoning_effort`)
    * describe. ACP reports them only for the session's current model.
    *
-   * - `session` (default): the reported options apply to every model.
-   * - `per_model`: each model offers its own options. The dynamic model probe selects each listed
-   *   model on its disposable probe session through `acpModelConfigOptionId` to record them, and
-   *   keeps the session's starting values where a model offers them, because a new session on that
-   *   model starts from them. Declare only for agents that do not persist a model selected over ACP
-   *   as the user's default.
+   * - `session` (default): the reported options describe only the session's current model.
+   * - `per_model`: each model offers its own options. The dynamic model probe also selects each
+   *   other listed model on its disposable probe session through `acpModelConfigOptionId` to record
+   *   them, and keeps the session's starting values where a model offers them, because a new session
+   *   on that model starts from them. Declare only for agents that do not persist a model selected
+   *   over ACP as the user's default.
    */
   acpModelOptionsScope?: 'session' | 'per_model';
   /**
