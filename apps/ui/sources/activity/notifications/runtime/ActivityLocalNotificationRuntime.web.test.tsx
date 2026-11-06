@@ -71,7 +71,8 @@ const originalBrowserGlobals: BrowserGlobals = {
 let documentState = { visibilityState: 'hidden', focused: false };
 let activeViewingSessionIdValue: string | null = null;
 let localSettingsValue: Partial<LocalSettings> = {};
-const routerNavigate = vi.hoisted(() => vi.fn());
+let profileScopeValue: { serverId: string; accountId: string } | null = null;
+const routerPush = vi.hoisted(() => vi.fn());
 
 installActivityNotificationRuntimeCommonModuleMocks({
     reactNative: async () => {
@@ -94,6 +95,7 @@ installActivityNotificationRuntimeCommonModuleMocks({
                     },
                     localSettings: localSettingsValue,
                     settings: {},
+                    profileScope: profileScopeValue,
                 }),
             },
         });
@@ -102,12 +104,20 @@ installActivityNotificationRuntimeCommonModuleMocks({
 
 vi.mock('expo-router', async () => {
     const { createExpoRouterMock } = await import('@/dev/testkit/mocks/router');
-    return createExpoRouterMock({ router: { navigate: routerNavigate } }).module;
+    return createExpoRouterMock({ router: { push: routerPush } }).module;
 });
 
-vi.mock('@/sync/domains/server/serverProfiles', () => ({
-    getActiveServerUrl: () => 'https://stack.example.test',
-}));
+vi.mock('@/sync/domains/server/serverProfiles', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/domains/server/serverProfiles')>();
+    return {
+        ...actual,
+        getActiveServerUrl: () => 'https://stack.example.test',
+        getActiveServerSnapshot: () => ({
+            ...actual.getActiveServerSnapshot(),
+            serverId: 'srv-notification-test',
+        }),
+    };
+});
 
 vi.mock('@/sync/domains/session/activeViewingSession', () => ({
     getActiveViewingSessionId: () => activeViewingSessionIdValue,
@@ -133,8 +143,33 @@ async function renderRuntimeAndNotifyReady(
     });
 }
 
+async function renderRuntimeAndNotifyRequest(): Promise<void> {
+    const { ActivityLocalNotificationRuntime } = await import('./ActivityLocalNotificationRuntime');
+    const { notifyActivityAgentRequest } = await import('./activityLocalNotificationBus');
+
+    const tree: renderer.ReactTestRenderer = (await renderScreen(<ActivityLocalNotificationRuntime />)).tree;
+    await act(async () => {
+        notifyActivityAgentRequest({
+            sessionId: 'session-1',
+            requestId: 'request-1',
+            occurrenceId: 'occurrence-1',
+            requestKind: 'user_action',
+            toolName: 'AskUserQuestion',
+            toolArgs: {
+                questions: [{
+                    question: 'Which branch?',
+                    options: [{ label: 'Main\nbranch', description: 'Stable\ncode', value: 'main' }, { label: 'Develop', value: 'develop' }],
+                }],
+            },
+        });
+    });
+    await act(async () => {
+        tree.unmount();
+    });
+}
+
 describe('ActivityLocalNotificationRuntime (browser)', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
         browserGlobals.Notification = FakeNotification;
         browserGlobals.AudioContext = FakeAudioContext;
         browserGlobals.focus = vi.fn();
@@ -142,6 +177,11 @@ describe('ActivityLocalNotificationRuntime (browser)', () => {
             get visibilityState() { return documentState.visibilityState; },
             hasFocus: () => documentState.focused,
         };
+        const [{ storage }, { registerStorageStateReader }] = await Promise.all([
+            import('@/sync/domains/state/storage'),
+            import('@/sync/domains/state/storageStateReaderBridge'),
+        ]);
+        registerStorageStateReader(() => storage.getState());
     });
 
     afterEach(async () => {
@@ -151,7 +191,8 @@ describe('ActivityLocalNotificationRuntime (browser)', () => {
         documentState = { visibilityState: 'hidden', focused: false };
         activeViewingSessionIdValue = null;
         localSettingsValue = {};
-        routerNavigate.mockReset();
+        profileScopeValue = null;
+        routerPush.mockReset();
 
         const { resetActivityLocalNotificationRuntimeForTests } = await import('./activityLocalNotificationBus');
         resetActivityLocalNotificationRuntimeForTests();
@@ -234,9 +275,24 @@ describe('ActivityLocalNotificationRuntime (browser)', () => {
 
         expect(browserGlobals.focus).toHaveBeenCalled();
         expect(notification?.closed).toBe(true);
-        expect(routerNavigate).toHaveBeenCalledWith(
-            expect.stringContaining('session-1'),
-            expect.anything(),
-        );
+        expect(routerPush).toHaveBeenCalledWith(expect.stringContaining('session-1'));
+    });
+
+    it('shows the account-scoped question request and opens its session when clicked', async () => {
+        profileScopeValue = { serverId: 'srv-notification-test', accountId: 'account-1' };
+
+        await renderRuntimeAndNotifyRequest();
+
+        expect(FakeNotification.instances).toHaveLength(1);
+        const notification = FakeNotification.instances[0];
+        expect(notification?.title).toBe('Ready session');
+        expect(notification?.options.body).toBe('Which branch?\n1. Main branch — Stable code\n2. Develop');
+        act(() => {
+            notification?.onclick?.();
+        });
+
+        expect(browserGlobals.focus).toHaveBeenCalled();
+        expect(notification?.closed).toBe(true);
+        expect(routerPush).toHaveBeenCalledWith(expect.stringContaining('session-1'));
     });
 });

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createConnection, type Socket } from 'node:net';
 import { Duplex } from 'node:stream';
+import { access } from 'node:fs/promises';
+
+import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { withTempDir } from '@/testkit/fs/tempDir';
 
 vi.mock('node:net', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:net')>();
@@ -28,6 +32,80 @@ const clientFor = (socketPath: string) => {
 };
 
 describe('Herdr client workspace placement', () => {
+  it.skipIf(process.platform === 'win32')('serves and cleans up a socket fixture when TMPDIR exceeds the Unix socket path budget', async () => {
+    const env = createEnvKeyScope(['TMPDIR']);
+    let socketPath = '';
+    try {
+      await withTempDir(`herdr-${'long-'.repeat(24)}`, async directory => {
+        env.patch({ TMPDIR: directory });
+        await withHerdrApi(async api => {
+          socketPath = api.socketPath;
+          await expect(clientFor(socketPath).ensureServer()).resolves.toBe(socketPath);
+          await api.stop();
+          await api.start();
+          await expect(clientFor(socketPath).ensureServer()).resolves.toBe(socketPath);
+        });
+        await expect(access(socketPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      });
+    } finally {
+      env.restore();
+    }
+  });
+
+  it('retains an admitted server socket when the ambient named-server inventory changes', async () => {
+    await withHerdrApi(async selected => {
+      await withHerdrApi(async ambient => {
+        inventory.socketPath = ambient.socketPath;
+        const client = createHerdrClient({ binary: 'herdr', sessionName: 'work', socketPath: selected.socketPath,
+          actionTimeoutMs: 100, startupTimeoutMs: 100 });
+        await expect(client.ensureServer()).resolves.toBe(selected.socketPath);
+        expect(ambient.requests).toEqual([]);
+        expect(selected.requests.map(request => request.method)).toEqual(['session.snapshot']);
+      });
+    });
+  });
+
+  it('does not substitute a live ambient server for an unreachable admitted socket', async () => {
+    await withHerdrApi(async ambient => {
+      inventory.socketPath = ambient.socketPath;
+      const client = createHerdrClient({ binary: 'herdr', sessionName: 'work', socketPath: `${ambient.socketPath}.absent`,
+        actionTimeoutMs: 100, startupTimeoutMs: 100 });
+      await expect(client.ensureServer()).rejects.toMatchObject({ code: 'unreachable' });
+      expect(ambient.requests).toEqual([]);
+    });
+  });
+  it.each(['sendText', 'sendRaw'] as const)('preserves large escaped Unicode input through %s within the released request-line budget', async (method) => {
+    await withHerdrApi(async (api) => {
+      const client = createHerdrClient({
+        binary: 'herdr', sessionName: 'work', socketPath: api.socketPath,
+        actionTimeoutMs: 5_000, startupTimeoutMs: 5_000,
+      });
+      // Escaping expands this beyond 1 MiB even though its UTF-8 source fits.
+      const text = `${'\\'.repeat(512 * 1024)}🌈你好\n${'😀'.repeat(100_000)}`;
+      await expect(client[method]('managed', text)).resolves.toBeUndefined();
+      const writes = api.requests.filter((request) => request.method === (method === 'sendText' ? 'pane.send_input' : 'pane.send_text'));
+      expect(writes.map((request) => request.params.text).join('')).toBe(text);
+      for (const write of writes) {
+        expect(Buffer.byteLength(`${JSON.stringify({ id: 'happier', ...write })}\n`)).toBeLessThanOrEqual(1024 * 1024);
+        expect(String(write.params.text)).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+      }
+    }, { maxInitialRequestBytes: 1024 * 1024 });
+  });
+
+  it('does not split a Unicode scalar at an odd UTF-16 request boundary', async () => {
+    await withHerdrApi(async (api) => {
+      const client = createHerdrClient({
+        binary: 'herdr', sessionName: 'work', socketPath: api.socketPath,
+        actionTimeoutMs: 5_000, startupTimeoutMs: 5_000,
+      });
+      const text = '😀'.repeat(600_000);
+      await client.sendText('managed!', text);
+      const chunks = api.requests.map((request) => String(request.params.text));
+      expect(chunks.join('')).toBe(text);
+      for (const chunk of chunks) expect(chunk).toMatch(/^(?:😀)+$/u);
+    }, { maxInitialRequestBytes: 1024 * 1024 });
+  });
+
   it('preserves terminal Unicode when a socket chunk splits a UTF-8 character', async () => {
     const text = '你好 🌈';
     const response = Buffer.from(`${JSON.stringify({ id: 'happier', result: { read: { text } } })}\n`);

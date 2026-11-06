@@ -160,6 +160,7 @@ describe('compileBunBinary', () => {
                 outfile,
                 bunCommand: 'bun',
                 autoloadDotenv: false,
+                defines: { 'process.env.NODE_ENV': '"production"' },
                 runCommand: async (cmd, args) => {
                     calls.push({ cmd, args });
                     writeFileSync(outfile, 'compiled', 'utf8');
@@ -167,6 +168,7 @@ describe('compileBunBinary', () => {
             });
 
             expect(calls[0]?.args).toContain('--no-compile-autoload-dotenv');
+            expect(calls[0]?.args).toContain('--define=process.env.NODE_ENV="production"');
         } finally {
             rmSync(tempRoot, { recursive: true, force: true });
         }
@@ -194,7 +196,7 @@ describe('compileBunBinary', () => {
             expect(calls).toEqual([
                 {
                     cmd: 'bun',
-                    args: ['build', '--compile', '--no-cache', '--target=bun-windows-x64', entrypoint, '--outfile', outfile],
+                    args: ['build', '--compile', '--no-cache', '--target=bun-windows-x64', entrypoint, '--outfile', outfile, '--no-compile-autoload-bunfig'],
                     cwd: process.cwd(),
                 },
             ]);
@@ -219,6 +221,7 @@ describe('compileBunBinary', () => {
                 externals: ['redis'],
                 bunCommand: 'bun',
                 buildRunnerEntrypoint,
+                autoloadDotenv: false,
                 runCommand: async (cmd, args) => {
                     calls.push({ cmd, args });
                     writeFileSync(outfile, 'compiled', 'utf8');
@@ -232,6 +235,8 @@ describe('compileBunBinary', () => {
                     '--target=bun-linux-x64-baseline',
                     `--entrypoint=${entrypoint}`,
                     `--outfile=${outfile}`,
+                    '--no-compile-autoload-dotenv',
+                    '--no-compile-autoload-bunfig',
                     '--external=redis',
                 ],
             }]);

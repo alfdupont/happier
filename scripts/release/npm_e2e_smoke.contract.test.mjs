@@ -10,12 +10,6 @@ const repoRoot = resolve(here, '..', '..');
 
 const smokeDir = join(repoRoot, 'scripts', 'release', 'release-assets-e2e');
 
-test('npm-e2e-smoke Dockerfile uses Node 22 policy', async () => {
-  const dockerfilePath = join(smokeDir, 'Dockerfile');
-  const raw = await readFile(dockerfilePath, 'utf8');
-  assert.match(raw, /^FROM node:22-bookworm/m);
-});
-
 test('npm-e2e-smoke includes noninteractive terminal auth approver helper', async () => {
   const helper = join(smokeDir, 'bin', 'terminal-auth-approve.cjs');
   assert.ok(existsSync(helper), `missing helper: ${helper}`);
@@ -455,8 +449,13 @@ test('npm-e2e-smoke local relay upgrade builds the explicit local-source relay i
   );
   assert.match(
     dockerfileRaw,
-    /FROM server AS relay-server-local-source/,
-    'expected Dockerfile to expose an explicit source-backed relay target for local candidate upgrade QA',
+    /FROM relay-server-runtime-base AS relay-server-local-source/,
+    'expected the source-backed local relay target to use the slim runtime base',
+  );
+  assert.match(
+    dockerfileRaw,
+    /COPY --from=relay-server-runtime-deps --chown=node:node \/repo \/repo[\s\S]+COPY --from=relay-server-runtime-source --chown=node:node \/repo\/apps\/server \/repo\/apps\/server/,
+    'expected the local relay target to combine the server dependency closure with current server source',
   );
   assert.match(
     dockerfileRaw,

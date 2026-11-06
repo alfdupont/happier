@@ -1,16 +1,14 @@
 import { z } from 'zod';
 
 import type { ThemePreference } from '@/components/ui/layout/statusBarStyle';
-import { areAccountSettingsJsonValuesEqual } from '@/sync/domains/settings/accountSettingsStructuralEquality';
 
-import { parseThemeProfilesLocalState, ThemeProfilesLocalStateSchema } from './themeProfilePersistence';
-import type { ThemeProfilesLocalStateV1 } from './themeProfileTypes';
+import { ThemeProfileSelectionSchema, ThemeProfilesLocalStateSchema } from './themeProfilePersistence';
+import type { ThemeProfileSelectionByMode, ThemeProfileStoredSelectionByMode, ThemeProfilesLocalStateV1 } from './themeProfileTypes';
 
 //
-// The theme stays a per-device setting. The account only remembers the last
-// selection made on any device, so a device that has no theme of its own (a
-// fresh install, a browser that clears site data, or a logout) gets it back on
-// sign-in instead of falling back to the default.
+// The theme stays a per-device setting. The account remembers the last
+// selection made on any device as references into the canonical account
+// library, so an unset device can restore it without a second profile store.
 //
 
 export type ThemeSelectionV1 = Readonly<{
@@ -18,54 +16,52 @@ export type ThemeSelectionV1 = Readonly<{
     themeProfiles: ThemeProfilesLocalStateV1;
 }>;
 
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
+const AccountThemeProfilesSchema: z.ZodType<ThemeProfilesLocalStateV1> = z.unknown().transform((value) => {
+    const parsed = ThemeProfilesLocalStateSchema.parse(value);
+    if (!isRecord(value) || !Array.isArray(value.profiles) || value.profiles.length !== 0) return parsed;
+
+    // New records carry references to the account library. Older V1 records
+    // embed profile definitions and go through the legacy migration path.
+    const stored = ThemeProfileSelectionSchema.parse(value.activeProfileIds);
+    const activeProfileIds: ThemeProfileSelectionByMode = {
+        light: typeof stored.light === 'string' ? stored.light : null,
+        dark: typeof stored.dark === 'string' ? stored.dark : null,
+    };
+    return { ...parsed, activeProfileIds };
+});
+
 export const AccountThemeSelectionV1Schema: z.ZodType<ThemeSelectionV1 | null> = z
     .object({
         themePreference: z.enum(['light', 'dark', 'adaptive']),
-        themeProfiles: ThemeProfilesLocalStateSchema,
+        themeProfiles: AccountThemeProfilesSchema,
     })
     .nullable();
 
-export type ThemeAccountSyncAction =
-    | Readonly<{ kind: 'adopt'; selection: ThemeSelectionV1 }>
-    | Readonly<{ kind: 'publish'; selection: ThemeSelectionV1 }>
-    | null;
-
-/** The account copy carries only the custom profiles the selection uses, not the whole local library. */
+/** Remember IDs from the canonical account library, never a competing profile definition. */
 export const buildAccountThemeSelection = (local: ThemeSelectionV1): ThemeSelectionV1 => {
-    const activeIds = new Set(Object.values(local.themeProfiles.activeProfileIds));
     return {
         themePreference: local.themePreference,
-        themeProfiles: parseThemeProfilesLocalState({
-            profiles: local.themeProfiles.profiles.filter((profile) => activeIds.has(profile.id)),
+        themeProfiles: {
+            profiles: [],
             activeProfileIds: local.themeProfiles.activeProfileIds,
-        }).state,
+        },
     };
 };
 
-const isUnsetDeviceThemeSelection = (local: ThemeSelectionV1): boolean => (
-    local.themePreference === 'adaptive'
-    && local.themeProfiles.profiles.length === 0
-    && local.themeProfiles.activeProfileIds.light === null
-    && local.themeProfiles.activeProfileIds.dark === null
-);
-
-export const resolveThemeAccountSyncAction = (input: Readonly<{
-    /** The local selection last observed, or null on first observation. */
-    previousLocal: ThemeSelectionV1 | null;
-    local: ThemeSelectionV1;
-    account: ThemeSelectionV1 | null;
-}>): ThemeAccountSyncAction => {
-    const published = buildAccountThemeSelection(input.local);
-    if (areAccountSettingsJsonValuesEqual(published, input.account)) return null;
-
-    const localChanged = input.previousLocal !== null
-        && !areAccountSettingsJsonValuesEqual(input.previousLocal, input.local);
-    if (localChanged) return { kind: 'publish', selection: published };
-
-    if (input.account === null) {
-        // Backfill a theme chosen before the account could remember one.
-        return isUnsetDeviceThemeSelection(input.local) ? null : { kind: 'publish', selection: published };
-    }
-
-    return isUnsetDeviceThemeSelection(input.local) ? { kind: 'adopt', selection: input.account } : null;
-};
+/** A remembered account selection applies only while this device still has its default theme state. */
+export function isUnsetDeviceThemeSelection(local: Readonly<{
+    themePreference: ThemePreference;
+    themeProfiles: ThemeProfilesLocalStateV1;
+    themeProfileSelection: ThemeProfileStoredSelectionByMode | null;
+}>): boolean {
+    const stored = local.themeProfileSelection;
+    return local.themePreference === 'adaptive'
+        && local.themeProfiles.profiles.length === 0
+        && local.themeProfiles.activeProfileIds.light === null
+        && local.themeProfiles.activeProfileIds.dark === null
+        && (!stored || (stored.light === null && stored.dark === null));
+}

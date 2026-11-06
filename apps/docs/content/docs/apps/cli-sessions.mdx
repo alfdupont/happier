@@ -46,6 +46,17 @@ For the full workflows, see [Attach to a running session](/sessions/attach-to-se
 happier session create --title "My session" --message "Hello"
 ```
 
+For a scripted OpenCode session, choose the model and permission intent at creation:
+
+```bash
+happier session create --backend agent:opencode --model opencode/big-pickle \
+  --title "Demo" --prompt "Explain this repository" --permission-mode auto --json
+```
+
+`--title` sets the initial title. The agent can rename it later. Use
+`happier session set-title <session-id> "Demo"` to change the current title after
+the agent's initial rename; this does not lock the title against future agent updates.
+
 Target a different directory:
 
 ```bash
@@ -60,6 +71,9 @@ happier session create --path /path/to/repo --title "Repo session"
 happier session create --backend "agent:<agent-id>"
 happier session create --backend "acpBackend:<backend-id>"
 ```
+
+Built-in agent names are also accepted as shorthand: `--backend opencode`
+normalizes to `--backend agent:opencode`.
 
 When in doubt, inspect the canonical schema and available options via the action catalog:
 
@@ -126,6 +140,18 @@ Notes:
 - `--model` lets you target a specific model for that message when the backend supports it.
 - `--json` + explicit timeouts are recommended for scripts.
 
+### Display-only notices (development)
+
+Current development source can store an informational notice in session history without starting, resuming, or interrupting an Agent:
+
+```bash
+happier session send <session-id-or-prefix> "CI failed" --kind notice --from hub
+```
+
+`--no-deliver` is an alias for `--kind notice`. Notices use the transcript's informational styling; `--from` prefixes the displayed text with the sender label (or `Notice` when omitted). The label is display text, not a verified identity. Notices do not enter the Agent's input queue or supply context on its next turn. They cannot be combined with `--wait`, `--model`, or `--permission-mode`. Ordinary sends remain user prompts.
+
+Use `--local-id` to retain the same identity when retrying a notice after an unconfirmed write. Repeating the same identity and content does not create another transcript row. This option is not available in CLI 0.2.17.
+
 ### Choosing one message identity (`--local-id`)
 
 Development builds let CLI coordinators choose the message's `localId` before sending:
@@ -156,6 +182,17 @@ happier session history <session-id-or-prefix> --format raw --include-meta --inc
 
 Use `compact` when you want a simpler text-focused view.
 Use `raw` when you need provider payloads, metadata, or structured tool/message records.
+
+For readable structured progress, use the transcript action instead of parsing raw history:
+
+```bash
+happier session actions execute <session-id> session.transcript.get \
+  --input-json '{"includeTools":true,"limit":100}' --json
+```
+
+This returns semantic transcript items, including tool calls and results. Add
+`"includeRaw":true` when you also need their underlying records. Follow the returned
+pagination cursor to read more items. Compact history remains a text-focused view.
 
 ## Session control
 
@@ -243,6 +280,19 @@ Approve/deny in the app Inbox:
 - [Happier tools & actions](/extending/happier-tools)
 
 ### Decide approvals from the CLI (advanced)
+
+Agent tool permission requests use `session.permission.respond`:
+
+```bash
+happier session actions execute <session-id> session.permission.respond \
+  --input-json '{"decision":"allow"}' --json
+```
+
+Omitting `requestId` selects the request only when exactly one tool permission
+request is pending. If several are pending, supply the specific `requestId` from
+the request shown in Happier. Inspect supported decisions and fields with
+`happier session actions describe session.permission.respond --json`.
+This differs from approving a Happier action in the Inbox.
 
 For automation-heavy workflows, the same approval flow is also available through the generic action executor.
 

@@ -3,6 +3,7 @@ import spawn from 'cross-spawn';
 import { resolveAcpAuthenticationSelection } from './AcpAuthentication';
 import { buildAcpSpawnSpec } from './acpSpawn';
 import { createAcpClientConnection, type AcpClientConnection } from './connection/createAcpClientConnection';
+import { loadAcpSdk } from './connection/acpSdk';
 import { createAcpFilteredStdoutReadable } from './createAcpFilteredStdoutReadable';
 import { createAcpNdJsonStream } from './createAcpNdJsonStream';
 import { nodeToWebStreams } from './nodeToWebStreams';
@@ -20,6 +21,10 @@ export async function authenticateAcpAgent(params: Readonly<{
   onStderr: (text: string) => void;
   signal?: AbortSignal;
 }>): Promise<void> {
+  params.signal?.throwIfAborted();
+  // Load before spawning: an I/O-sized await between `interrupted` and its race
+  // would leave an early child error or abort unhandled.
+  await loadAcpSdk();
   params.signal?.throwIfAborted();
   const spec = buildAcpSpawnSpec(params);
   const child = spawn(spec.command, spec.args, spec.options);
@@ -43,7 +48,7 @@ export async function authenticateAcpAgent(params: Readonly<{
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', params.onStderr);
     const { writable, readable } = nodeToWebStreams(child.stdin, child.stdout);
-    connection = createAcpClientConnection({
+    connection = await createAcpClientConnection({
       name: 'happier-cli-login',
       transport: createAcpNdJsonStream(writable, createAcpFilteredStdoutReadable({ readable, transport })),
       handlers: {
@@ -81,7 +86,6 @@ export async function authenticateAcpAgent(params: Readonly<{
   } finally {
     clearTimeout(initializeTimer);
     if (onAbort) params.signal?.removeEventListener('abort', onAbort);
-    child.stderr?.removeListener('data', params.onStderr);
     connection?.close();
     try {
       await killProcessTree(child);
@@ -92,6 +96,9 @@ export async function authenticateAcpAgent(params: Readonly<{
       throw cleanupError;
     } finally {
       await connection?.closed.catch(() => {});
+      // ACP success on stdout can arrive before the browser link on stderr.
+      // Keep explicit-login output attached until provider cleanup has settled.
+      child.stderr?.removeListener('data', params.onStderr);
     }
   }
 }

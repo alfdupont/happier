@@ -145,7 +145,7 @@ function buildRecoveredRespawnDescriptor(params: Readonly<{
   const { spawnOptions, parsedRespawnDescriptor, credentials } = params;
   const rebuiltRespawn = spawnOptions
     ? buildSessionRunnerRespawnDescriptorV1FromSpawnOptions(spawnOptions, {
-      encryptionMaterial: credentials?.encryption,
+      encryptionMaterial: credentials?.encryption ?? undefined,
     })
     : null;
   if (!parsedRespawnDescriptor) {
@@ -175,7 +175,7 @@ function restoreSpawnOptionsFromRespawnDescriptor(params: Readonly<{
   }
   try {
     return buildSpawnSessionOptionsFromRespawnDescriptorV1(parsedRespawnDescriptor, {
-      encryptionMaterial: credentials?.encryption,
+      encryptionMaterial: credentials?.encryption ?? undefined,
     });
   } catch {
     return undefined;
@@ -448,6 +448,12 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
               })
           : 'not_applicable';
         if (attachment?.version === 2) {
+          const spawnOptions = applyRecoveredRuntimeSnapshot({
+            spawnOptions: restoreSpawnOptionsFromRespawnDescriptor({
+              parsedRespawnDescriptor: parseRecoveredRespawnDescriptor(marker.respawn), credentials: params.credentials,
+            }),
+            metadata: marker.metadata,
+          });
           disconnectedTerminalHostCandidates.push({
             sessionId,
             pid: marker.pid,
@@ -456,6 +462,7 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
             attachmentId: attachment.attachmentId,
             handle: attachment.handle,
             controlDescriptorStatus,
+            ...(spawnOptions ? { spawnOptions } : {}),
           });
           continue;
         }

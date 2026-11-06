@@ -1,7 +1,7 @@
 /**
  * OpenCode CLI Entry Point
  *
- * Runs the OpenCode agent through Happier CLI using ACP.
+ * Runs the OpenCode agent through Happier CLI using the selected server-native or ACP backend.
  */
 
 import type { PermissionMode } from '@/api/types';
@@ -11,8 +11,6 @@ import { initialMachineMetadata } from '@/daemon/machine/metadata';
 import { formatProviderPromptErrorMessage } from '@/agent/runtime/formatProviderPromptErrorMessage';
 import { runStandardAcpProvider, type StandardAcpProviderConfig, type StandardAcpProviderRunOptions } from '@/agent/runtime/runStandardAcpProvider';
 import { updateAgentStateBestEffort } from '@/api/session/sessionWritesBestEffort';
-
-import { OpenCodeTerminalDisplay } from '@/backends/opencode/ui/OpenCodeTerminalDisplay';
 
 import { maybeUpdateOpenCodeSessionIdMetadata, type OpenCodeSessionMetadataPublicationState } from './utils/opencodeSessionIdMetadata';
 import { createOpenCodeAcpRuntime } from './acp/runtime';
@@ -24,6 +22,7 @@ import { createOpenCodeServerRuntime } from './server/runtime';
 import { createOpenCodeSharedLocalControl } from './localControl/createOpenCodeSharedLocalControl';
 import { resolveOpenCodeLocalControlSupport } from './localControl/resolveOpenCodeLocalControlSupport';
 import { resolveOpenCodeBackendModeFromEnv } from './backendMode';
+import { hasHostedAttachedTerminalPresentation } from '@/agent/localControl/createAttachedTerminalSupervisor';
 
 export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
   credentials: Credentials;
@@ -37,6 +36,7 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
     serverBaseUrlExplicit: false,
   };
   const backendMode = resolveOpenCodeBackendModeFromEnv(process.env);
+  const hasHostedTerminal = backendMode === 'server' && hasHostedAttachedTerminalPresentation(opts.terminalRuntime);
   let serverRuntime: ReturnType<typeof createOpenCodeServerRuntime> | null = null;
   let currentSession: Parameters<NonNullable<StandardAcpProviderConfig['onAfterStart']>>[0]['session'] | null = null;
   let currentRuntime: Parameters<NonNullable<StandardAcpProviderConfig['onAfterStart']>>[0]['runtime'] | null = null;
@@ -48,8 +48,10 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
     support: resolveOpenCodeLocalControlSupport({
       backendMode,
       hasTTY: process.stdout.isTTY && process.stdin.isTTY,
+      hasHostedTerminal,
     }),
     startingMode: opts.startingMode ?? (opts.startedBy === 'terminal' && backendMode === 'server' ? 'local' : 'remote'),
+    terminalRuntime: opts.terminalRuntime,
     getSession: () => currentSession,
     getSessionId: () => currentRuntime?.getSessionId() ?? null,
     prepareAttachment: async () => prepareLocalAttachment ? await prepareLocalAttachment() : false,
@@ -85,7 +87,8 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
     agentMessageType: 'opencode',
     startRuntimeBeforeFirstPrompt: backendMode === 'server',
     machineMetadata: initialMachineMetadata,
-    terminalDisplay: OpenCodeTerminalDisplay,
+    terminalHostOwner: hasHostedTerminal ? 'runtime' : 'startup',
+    loadTerminalDisplay: async () => (await import('@/backends/opencode/ui/OpenCodeTerminalDisplay')).OpenCodeTerminalDisplay,
     resolveRuntimeDirectory: ({ session, metadata }) => session.getMetadataSnapshot()?.path ?? metadata.path,
     resolveKeepAliveMode: localControl.resolveKeepAliveMode,
     shouldRenderTerminalDisplay: () => localControl.shouldRenderTerminalDisplay(),

@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { preparePayloadMock, installPayloadMock, runCommandCaptureMock } = vi.hoisted(() => ({
   preparePayloadMock: vi.fn(),
@@ -150,7 +150,11 @@ describe('runLocalHappierJsonCommand', () => {
     }
   });
 
-  it('treats ok:false json responses as failed commands', async () => {
+  it.each([
+    { cliCode: 'not_installed', expectedCode: 'cli_command_failed', status: 0 },
+    { cliCode: 'service_manager_unavailable', expectedCode: 'service_manager_unavailable', status: 0 },
+    { cliCode: 'service_manager_unavailable', expectedCode: 'service_manager_unavailable', status: 1 },
+  ])('reports $cliCode from a failed CLI command (exit $status)', async ({ cliCode, expectedCode, status }) => {
     const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-cli-json-failure-'));
     const cliPath = join(rootDir, 'fake-happier');
 
@@ -162,8 +166,8 @@ describe('runLocalHappierJsonCommand', () => {
       );
       chmodSync(cliPath, 0o755);
       runCommandCaptureMock.mockResolvedValue({
-        status: 0,
-        stdout: '{"ok":false,"error":{"code":"not_installed"},"message":"service missing"}\n',
+        status,
+        stdout: `${JSON.stringify({ ok: false, error: cliCode === 'service_manager_unavailable' ? cliCode : { code: cliCode }, message: 'service missing' })}\n`,
         stderr: '',
       });
 
@@ -175,7 +179,7 @@ describe('runLocalHappierJsonCommand', () => {
           HAPPIER_BOOTSTRAP_CLI_PATH: cliPath,
         },
       })).rejects.toMatchObject({
-        code: 'cli_command_failed',
+        code: expectedCode,
         message: 'service missing',
       });
     } finally {
@@ -245,6 +249,17 @@ describe('the environment a Happier CLI runs with (R12, macOS)', () => {
 });
 
 describe('ensureSetupCapableLocalHappierCli', () => {
+  beforeEach(() => {
+    // The CLI subprocess boundary reports no running service in these floor/selection tests.
+    runCommandCaptureMock.mockImplementation(async ({ args }: Readonly<{ args: readonly string[] }>) => ({
+      status: 0, stderr: '', stdout: JSON.stringify(args.includes('list') ? { entries: [] } : {
+        server: { activeServerId: 'cloud', serverUrl: 'https://relay.example.test', localServerUrl: null, publicServerUrl: 'https://relay.example.test', webappUrl: 'https://app.example.test', comparableKey: 'relay.example.test' },
+        daemon: { running: false, serviceManaged: false, pid: null, httpPort: null },
+        service: { installed: false, running: false },
+        auth: { authenticated: false, machineRegistered: false, machineId: null, needsAuth: true, accountId: null },
+      }),
+    }));
+  });
   function withOverrideCli(run: (params: Readonly<{ cliPath: string; processEnv: NodeJS.ProcessEnv }>) => Promise<void>) {
     const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-setup-floor-'));
     const cliPath = join(rootDir, 'happier-override');
@@ -314,8 +329,8 @@ describe('ensureSetupCapableLocalHappierCli', () => {
       writeFileSync(join(happyHomeDir, 'default-cli-release-channel.json'), '{"releaseChannel":"stable"}\n', 'utf8');
       const readVersion = vi.fn(async () => SETUP_CLI_VERSION_FLOOR);
       // A temp repo root keeps the walk from finding this checkout as a repo-local override; an
-      // empty PATH keeps package-manager test runners from contributing their own happier binary.
-      const processEnv = { ...process.env, HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_BOOTSTRAP_CLI_PATH: '', HAPPIER_STACK_REPO_DIR: rootDir, PATH: '' };
+      // Empty PATH and a temp HOME keep macOS's supplemental search path out of the real user home.
+      const processEnv = { ...process.env, HOME: rootDir, HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_BOOTSTRAP_CLI_PATH: '', HAPPIER_STACK_REPO_DIR: rootDir, PATH: '' };
 
       await expect(ensureSetupCapableLocalHappierCli({ releaseRing: 'preview', processEnv }, { readVersion }))
         .resolves.toEqual({
@@ -390,7 +405,7 @@ describe('ensureSetupCapableLocalHappierCli', () => {
     }
   });
 
-  it('reacquires a managed CLI below the floor when the ring has a newer one', async () => {
+  it('updates a managed CLI below the floor when the ring has a newer one', async () => {
     const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-setup-floor-reacquire-'));
     const happyHomeDir = join(rootDir, '.happier-home');
     const binaryPath = join(happyHomeDir, 'cli', 'current', 'happier');
@@ -400,16 +415,23 @@ describe('ensureSetupCapableLocalHappierCli', () => {
         versionId: '0.2.12',
         binaryContents: '#!/bin/sh\nprintf "0.2.12\\n"\n',
       });
-      preparePayloadMock.mockResolvedValue({ versionId: SETUP_CLI_VERSION_FLOOR, payloadRoot: rootDir, cleanup: async () => {} });
-      installPayloadMock.mockResolvedValue(undefined);
-      const readVersion = vi.fn()
-        .mockResolvedValueOnce('0.2.12')
-        .mockResolvedValueOnce(SETUP_CLI_VERSION_FLOOR);
+      const payloadRoot = join(rootDir, 'payload');
+      mkdirSync(join(payloadRoot, 'package-dist'), { recursive: true });
+      writeFileSync(join(payloadRoot, 'package-dist', 'index.mjs'), 'export {};\n');
+      writeFileSync(join(payloadRoot, 'happier'), `#!/bin/sh\nprintf "${SETUP_CLI_VERSION_FLOOR}\\n"\n`);
+      chmodSync(join(payloadRoot, 'happier'), 0o755);
+      preparePayloadMock.mockResolvedValue({ versionId: SETUP_CLI_VERSION_FLOOR, payloadRoot, cleanup: async () => {} });
+      const readVersion = async ({ command }: Readonly<{ command: string }>) => {
+        const match = /printf "([^\\"]+)/u.exec(readFileSync(command, 'utf8'));
+        if (!match?.[1]) throw new Error(`no fixture version in ${command}`);
+        return match[1];
+      };
       const processEnv = { ...process.env, HAPPIER_HOME_DIR: happyHomeDir };
 
       await expect(ensureSetupCapableLocalHappierCli({ releaseRing: 'stable', processEnv }, { readVersion }))
         .resolves.toEqual({ command: binaryPath, provenance: 'managed', version: SETUP_CLI_VERSION_FLOOR });
-      expect(installPayloadMock).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(happyHomeDir, 'cli', 'current.version'), 'utf8').trim()).toBe(SETUP_CLI_VERSION_FLOOR);
+      expect(installPayloadMock).not.toHaveBeenCalled();
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
     }
@@ -539,7 +561,7 @@ describe('the one-CLI question (R12)', () => {
     symlinkSync(join(packageRoot, 'bin', 'happier.mjs'), command);
     return run({
       command,
-      processEnv: { HAPPIER_HOME_DIR: join(rootDir, 'home'), HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere'), PATH: npmBin },
+      processEnv: { HOME: rootDir, HAPPIER_HOME_DIR: join(rootDir, 'home'), HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere'), PATH: npmBin },
     }).finally(() => rmSync(rootDir, { recursive: true, force: true }));
   }
 

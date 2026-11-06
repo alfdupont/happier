@@ -1,6 +1,8 @@
 import chalk from 'chalk';
 import { randomUUID } from 'node:crypto';
 
+import type { BackendTargetRefV1 } from '@happier-dev/protocol';
+import { assertBackendEnabledByAccountSettings } from '@/settings/backendEnabled';
 import type { AgentId, CodexBackendMode } from '@happier-dev/agents';
 
 import type { Credentials } from '@/persistence';
@@ -17,7 +19,7 @@ import { logger } from '@/ui/logger';
 import { applyProfileToProcessEnv } from '@/settings/profiles/applyProfileToProcessEnv';
 import { buildProfileEnvOverlay } from '@/settings/profiles/buildProfileEnvOverlay';
 import { readProfilesFromAccountSettings } from '@/settings/profiles/readProfilesFromAccountSettings';
-import { resolveProfileForAgent } from '@/settings/profiles/resolveProfileForAgent';
+import { resolveProfileForBackendTarget } from '@/settings/profiles/resolveProfileForAgent';
 import { isPermissionMode, type PermissionMode } from '@/api/types';
 import {
   applyDeprecatedSessionStartAliasesForAgent,
@@ -36,6 +38,7 @@ import {
 } from '@/cli/connectedServices/resolveDirectConnectedServiceEnvironment';
 import { resolveDirectCliConnectedServiceBindings } from '@/cli/connectedServices/resolveDirectCliConnectedServiceBindings';
 import { HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY } from '@/agent/runtime/sessionConnectedServicesBindingsEnv';
+import { fail } from '@happier-dev/cli-common/output';
 
 type CommonBackendRunOptions = ParsedSessionStartArgs & {
   credentials: Credentials;
@@ -109,6 +112,7 @@ export async function runBackendSessionCliCommand<Extra extends Record<string, u
   agentIdForDeprecatedAliases?: AgentId;
   agentIdForAccountSettings?: AgentId;
   loadAccountSettings?: boolean;
+  backendTargetForProfiles?: BackendTargetRefV1;
   directoryFlags?: readonly string[];
   forwardModelFlag?: boolean;
   versionFlags?: readonly string[];
@@ -130,6 +134,20 @@ export async function runBackendSessionCliCommand<Extra extends Record<string, u
         const providerHelpArgs = [...parsed.providerArgs, '--help'];
         const providerHelpCommand = `${agentId} ${providerHelpArgs.join(' ')}`;
         console.log(`${buildRootHelpText()}
+${chalk.bold('Happier session options:')}
+  happier ${agentId} [options] [provider options]
+  --model <model-id>              Select the session model
+  --permission-mode <mode>       Set Happier permission intent (read_only, default, auto, yolo)
+  --agent-mode <mode-id>          Select a provider session mode
+  --launch-profile <id-or-name>  Apply a saved launch profile
+  --auth <default|native|cs:id>   Choose session authentication
+  --refresh-settings            Refresh account settings before starting
+  --resume <session-id>          Resume a provider session
+
+For scripted sessions with a title and initial prompt:
+  happier session create --backend ${agentId} --title "My session" --prompt "Hello"
+  happier session create --help
+
 ${chalk.gray('─'.repeat(60))}
 ${chalk.bold.cyan(`${agentId} CLI Options (from \`${providerHelpCommand}\`):`)}
 `);
@@ -172,12 +190,12 @@ ${chalk.bold.cyan(`${agentId} CLI Options (from \`${providerHelpCommand}\`):`)}
 
       const runPromise = params.loadRun();
 
-      let credentials = await readCredentials();
+      let credentials = params.context.sessionStart?.credentials ?? await readCredentials();
       if (!credentials) {
         const auth = await authAndSetupMachineIfNeeded();
         credentials = auth.credentials;
       } else {
-        await ensureMachineIdForCredentials(credentials);
+        if (!params.context.sessionStart) await ensureMachineIdForCredentials(credentials);
         if (
           shouldAutoStartDaemonAfterAuth({
             env: process.env,
@@ -193,10 +211,10 @@ ${chalk.bold.cyan(`${agentId} CLI Options (from \`${providerHelpCommand}\`):`)}
 
       const run = await runPromise;
 
-      let accountSettingsContext: AccountSettingsContext | null = null;
+      let accountSettingsContext: AccountSettingsContext | null = params.context.sessionStart?.accountSettingsContext ?? null;
       const agentIdForProfiles = params.agentIdForAccountSettings ?? params.agentIdForDeprecatedAliases;
 
-      if (params.agentIdForAccountSettings || params.loadAccountSettings || profileQuery) {
+      if (!accountSettingsContext && (params.agentIdForAccountSettings || params.loadAccountSettings || profileQuery)) {
         const accountSettingsBootstrapMode = startedBy === 'daemon' ? 'blocking' : 'fast';
         const snapshot = await bootstrapAccountSettingsContext({
           ...(agentIdForProfiles ? { agentId: agentIdForProfiles } : {}),
@@ -211,21 +229,26 @@ ${chalk.bold.cyan(`${agentId} CLI Options (from \`${providerHelpCommand}\`):`)}
         accountSettingsContext = await resolveSessionStartAccountSettingsContext({
           startedBy,
           snapshot,
+          refreshRequested: refreshSettings,
         });
       }
 
-      const permissionModeSeededByProfile = profileQuery && accountSettingsContext && agentIdForProfiles
+      const profileBackendTarget = params.backendTargetForProfiles ?? (agentIdForProfiles ? { kind: 'builtInAgent' as const, agentId: agentIdForProfiles } : null);
+      if (accountSettingsContext && profileBackendTarget) {
+        assertBackendEnabledByAccountSettings({ backendTarget: profileBackendTarget, settings: accountSettingsContext.settings });
+      }
+      const permissionModeSeededByProfile = profileQuery && accountSettingsContext && profileBackendTarget
         ? (() => {
-          const { customProfiles } = readProfilesFromAccountSettings(accountSettingsContext.settings as any);
-          const profile = resolveProfileForAgent({ agentId: agentIdForProfiles, query: profileQuery, customProfiles });
+          const { customProfiles } = readProfilesFromAccountSettings(accountSettingsContext.settings);
+          const profile = resolveProfileForBackendTarget({ backendTarget: profileBackendTarget, query: profileQuery, customProfiles });
           const promptSecretFn =
             startedBy !== 'daemon' && isInteractiveTerminal()
               ? promptSecret
               : null;
           return buildProfileEnvOverlay({
-            agentId: agentIdForProfiles,
+            backendTarget: profileBackendTarget,
             profile,
-            accountSettings: accountSettingsContext.settings as any,
+            accountSettings: accountSettingsContext.settings,
             credentials,
             processEnv: process.env,
             promptSecretFn,
@@ -319,7 +342,7 @@ ${chalk.bold.cyan(`${agentId} CLI Options (from \`${providerHelpCommand}\`):`)}
       }
     } catch (error) {
       logger.fatal(error);
-      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+      console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
       if (process.env.DEBUG) {
         console.error(error);
       }

@@ -318,6 +318,24 @@ describe('app.config.js', () => {
         expect(pkg.happierExpoRuntimeVersion).not.toBe('0.2.6-native');
     });
 
+    it('keeps JavaScript requiring Android file actions off the released 0.2.7-native OTA runtime', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            return getPublicConfig();
+        });
+        // Released binaries on this train do not contain HappierFileActions.
+        expect(exp.runtimeVersion).not.toBe('0.2.7-native');
+    });
+
+    it('keeps the upgraded Unistyles bindings off the previous native OTA train', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            return getPublicConfig();
+        });
+        // This train was built with Unistyles 3.2.4 and Nitro Modules 0.35.6.
+        expect(exp.runtimeVersion).not.toBe('0.2.8-native');
+    });
+
     it('allows forcing an Expo runtime policy for development diagnostics', () => {
         const exp = withCleanEnv(() => {
             process.env.APP_ENV = 'production';

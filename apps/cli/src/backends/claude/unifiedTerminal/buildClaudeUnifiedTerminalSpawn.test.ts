@@ -1,5 +1,6 @@
-import { readFile, rm, stat } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -81,21 +82,48 @@ async function readLaunchSpecFromSpawn(spawn: ClaudeUnifiedTerminalSpawn): Promi
 }
 
 describe('buildClaudeUnifiedTerminalSpawn', () => {
-  afterEach(() => {
+  const tempDirs: string[] = [];
+  it.each([false, true])('applies configured Happier attribution at the native terminal launch boundary (%s)', async (enabled) => {
+    await withPatchedEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDECODE: '1' }, async () => {
+      const spawn = await buildClaudeUnifiedTerminalSpawn({
+        path: '/workspace/project',
+        first: { message: 'hello', mode: { permissionMode: 'default', claudeCodeIncludeInNativeHistory: enabled } },
+        deps: {
+          resolveClaudeCliPath: () => '/usr/local/bin/claude',
+          isClaudeCliJavaScriptFile: () => false,
+          ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+          claudeLocalLauncherPath: '/happier/scripts/claude_local_launcher.cjs',
+          terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+        },
+      });
+      const launch = await readLaunchSpecFromSpawn(spawn);
+      expect(spawn.spawnEnv.CLAUDE_CODE_ENTRYPOINT).toBe(enabled ? 'happier' : undefined);
+      expect(launch.env?.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+      expect(launch.env?.CLAUDECODE).toBeUndefined();
+    });
+  });
+
+  afterEach(async () => {
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, 'platform', originalPlatformDescriptor);
     }
+    await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
   });
 
   it.each([
+    { model: 'claude-opus-5-5', current: 'medium', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'medium' },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: 'low' },
-    { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: undefined },
+    { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'high' },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: 'medium', expected: 'medium' },
     { model: 'claude-haiku-4-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: undefined },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: false, cliEffort: undefined, expected: undefined },
   ])('prepares empty resumed native launch with persisted effort and precedence ($model/$current/$cliEffort/$supportsEffort)', async (input) => {
     // Real readiness producer, model policy and native spawn serialization; only executable
     // discovery/process invocation are replaced. No queued message can seed this empty Resume.
+    const providerDir = await mkdtemp(join(tmpdir(), 'happier-unified-native-launch-'));
+    tempDirs.push(providerDir);
+    const cliPath = join(providerDir, 'claude');
+    await writeFile(cliPath, '', { mode: 0o755 });
     const initialMode: EnhancedMode = { permissionMode: 'read-only', model: input.model, reasoningEffort: input.current };
     const prepared = await prepareClaudeUnifiedTerminalInitialMode({
       initialMode,
@@ -117,7 +145,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
       first: { message: '', mode: initialMode },
       claudeArgs: ['--resume', 'existing-native-session', ...(input.cliEffort ? ['--effort', input.cliEffort] : [])],
       deps: {
-        resolveClaudeCliPath: () => '/usr/local/bin/claude',
+        resolveClaudeCliPath: () => cliPath,
         ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
         claudeLocalLauncherPath: '/happier/scripts/claude_local_launcher.cjs',
         terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
@@ -156,6 +184,43 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     expect(launchArgs.filter((arg) => arg === '--allow-dangerously-skip-permissions')).toHaveLength(1);
     expect(launchArgs).not.toContain('--dangerously-skip-permissions');
     expect(launchArgs).not.toContain('bypassPermissions');
+  });
+
+  it.each([
+    { permissionMode: 'default', sandbox: undefined, allowed: false },
+    { permissionMode: 'safe-yolo', sandbox: undefined, allowed: false },
+    { permissionMode: 'bypassPermissions', sandbox: undefined, allowed: false },
+    { permissionMode: 'default', sandbox: '1', allowed: true },
+  ] as const)('preserves root permission intent using the effective child sandbox ($permissionMode/$sandbox)', async ({ permissionMode, sandbox, allowed }) => {
+    const uidDescriptor = Object.getOwnPropertyDescriptor(process, 'getuid');
+    Object.defineProperty(process, 'getuid', { configurable: true, value: () => 0 });
+    patchProcessPlatform('linux');
+    try {
+      // The child overlay, rather than the runner's environment, decides sandbox status.
+      await withPatchedEnv({ IS_SANDBOX: '1', CLAUDE_CODE_BUBBLEWRAP: undefined }, async () => {
+        const spawn = await buildClaudeUnifiedTerminalSpawn({
+          path: '/workspace/project',
+          first: { message: 'hello', mode: { permissionMode } },
+          envOverlay: { IS_SANDBOX: sandbox ?? '0' },
+          deps: {
+            resolveClaudeCliPath: () => '/usr/local/bin/claude',
+            isClaudeCliJavaScriptFile: () => false,
+            ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+            terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+            resolveCommandInvocation: ({ command, args }) => ({ command, args: [...args] }),
+          },
+        });
+        const launch = await readLaunchSpecFromSpawn(spawn);
+        expect(launch.args?.includes('--allow-dangerously-skip-permissions')).toBe(allowed);
+        if (permissionMode !== 'default') {
+          expect(launch.args).toEqual(expect.arrayContaining(['--permission-mode', permissionMode === 'safe-yolo' ? 'auto' : permissionMode]));
+        }
+        expect(launch.env?.IS_SANDBOX).toBe(sandbox ?? '0');
+      });
+    } finally {
+      if (uidDescriptor) Object.defineProperty(process, 'getuid', uidDescriptor);
+      else Reflect.deleteProperty(process, 'getuid');
+    }
   });
 
   it('writes per-session runner diagnostics paths into the launch spec when a happy session id is available', async () => {

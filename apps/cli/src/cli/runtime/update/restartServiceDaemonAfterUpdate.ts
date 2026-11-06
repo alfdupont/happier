@@ -13,7 +13,7 @@ import { getReleaseRingCatalogEntry, type PublicReleaseRingId } from '@happier-d
 import { readDaemonStateForServerId } from '@/daemon/multiDaemon';
 import type { DaemonOwnerEvaluation } from '@/daemon/ownership/evaluateCurrentDaemonOwner';
 import { resolveDaemonStartupSourceServiceManagedState } from '@/daemon/ownership/daemonOwnershipMetadata';
-import { resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { happierHomeDirsMatch } from '@/daemon/ownership/happierHomeDirComparableKey';
 import { resolveDaemonServiceCliRuntimeFromEnv } from '@/daemon/service/cli';
 import {
   discoverInstalledDaemonServiceEntries,
@@ -67,7 +67,6 @@ async function listUserServicesOfThisHomeAndRing(
   processEnv: NodeJS.ProcessEnv,
 ): Promise<InstalledDaemonServiceEntry[]> {
   const runtime = resolveDaemonServiceCliRuntimeFromEnv({ channel, processEnv });
-  const homeKey = resolveHappierHomeDirComparableKey(runtime.happierHomeDir);
   const entries = (await Promise.all(
     resolveDaemonServiceDiscoveryTargets({
       platform: runtime.platform,
@@ -87,8 +86,7 @@ async function listUserServicesOfThisHomeAndRing(
   return entries.filter((entry, index) =>
     entries.findIndex((other) => other.path === entry.path) === index
     && entry.releaseChannel === channel
-    && homeKey !== null
-    && resolveHappierHomeDirComparableKey(entry.happierHomeDir) === homeKey);
+    && happierHomeDirsMatch(entry.happierHomeDir, runtime.happierHomeDir));
 }
 
 async function observeServiceBeforeUpdate(
@@ -97,6 +95,9 @@ async function observeServiceBeforeUpdate(
   channel: PublicReleaseRingId,
 ): Promise<ServiceDaemonBeforeCliUpdate<ServiceRestartTarget>> {
   const observed = await readDaemonStateForServerId(target.lifecycleServerId);
+  if (observed?.presence === 'unverified') {
+    throw new Error(`Daemon presence is unverified for service relay ${target.lifecycleServerId}; retry the update when authenticated control is available`);
+  }
   // The label the service hands its daemon (`HAPPIER_DAEMON_SERVICE_LABEL`), which the daemon records.
   const label = resolveDaemonServiceLaunchdLabel(entry.serverId, entry.releaseChannel, entry.targetMode);
   return {
@@ -227,6 +228,9 @@ async function restartServiceDaemonOntoInstalledCli(params: Readonly<{
   }
 
   const observed = await readDaemonStateForServerId(target.lifecycleServerId);
+  if (observed?.presence === 'unverified') {
+    throw new Error(`Daemon presence is unverified for service relay ${target.lifecycleServerId}; retry the update when authenticated control is available`);
+  }
   const runningVersion = observed?.running ? observed.state.startedWithCliVersion ?? null : null;
   if (runningVersion !== params.expectedVersion) {
     throw new Error(`the background service runs ${runningVersion ?? 'no daemon'} instead of ${params.expectedVersion}`);

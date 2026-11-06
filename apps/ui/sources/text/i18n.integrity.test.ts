@@ -24,6 +24,8 @@ const IGNORED_UNTRANSLATED_KEYS = new Set([
     'settingsSession.handoff.includeIgnoredMode.globsPlaceholder',
     'connectedServices.detail.prompts.accessTokenPlaceholder',
     'connectedServices.serviceNames.github',
+    // Provider product name, shared across locales.
+    'connectedServices.serviceNames.antigravity',
     'deps.installable.githubCli.title',
     // Product name, shared across locales.
     'deps.installable.difftastic.title',
@@ -70,6 +72,8 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
     it: new Set([
         // "Offline" is the standard Italian status word for a disconnected machine.
         'updates.offline',
+        // "Feedback" is an established Italian loanword used for user feedback.
+        'settingsAppearance.feedback',
         // "File" is the standard Italian computing noun, not an untranslated fallback.
         'notifications.activity.requestLabels.file',
         'settingsSession.sessionList.headerIdentityDisplayAvatarTitle',
@@ -483,6 +487,8 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
     ]),
     // These locales use the same spelling for this label.
     ca: new Set([
+        // "Context" is the Catalan word.
+        'agentInput.context.badgeLabel',
         'agentInput.suggestionGroups.sessions',
         'automations.form.schedule.manualTitle',
         // "Errors" is the Catalan plural of "error", not an untranslated fallback.
@@ -781,7 +787,8 @@ const UNTRANSLATED_PREFIX_BASELINE_COUNTS: Record<string, Record<string, number>
         'settingsSession.promptPersonalization.': 0,
         'commandPalette.commands.': 3,
         'releaseNotes.onboardingShowcase.': 0,
-        'sessionsList.': 6,
+        // +2: "Orange" and "Indigo" are the French colour names (sessionsList.appearance.colors).
+        'sessionsList.': 8,
     },
     ru: {
         'settingsAppearance.themeProfiles.': 106,
@@ -871,7 +878,8 @@ const UNTRANSLATED_PREFIX_BASELINE_COUNTS: Record<string, Record<string, number>
         'settingsSession.promptPersonalization.': 0,
         'commandPalette.commands.': 6,
         'releaseNotes.onboardingShowcase.': 0,
-        'sessionsList.': 1,
+        // +2: "Orange" and "Indigo" are the German colour names (sessionsList.appearance.colors).
+        'sessionsList.': 3,
     },
 };
 

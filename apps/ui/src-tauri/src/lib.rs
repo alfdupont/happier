@@ -31,8 +31,17 @@ mod startup;
 #[cfg(desktop)]
 mod shutdown;
 
+#[cfg(target_os = "linux")]
+mod linux_webkit_env;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// The main-thread native test harness reuses these modules with its own isolated setup.
+// Embed the product Info.plist only in the product entrypoint, not in that test executable.
+#[cfg(not(test))]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    linux_webkit_env::apply_before_gtk_init();
+
     let mut builder = tauri::Builder::default();
 
     // First, as the plugin requires: a second launch hands its arguments to this process and exits
@@ -42,6 +51,7 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             menu_bar::on_second_launch(app, args);
         }));
+        builder = builder.plugin(tauri_plugin_deep_link::init());
     }
 
     builder = builder
@@ -98,6 +108,7 @@ pub fn run() {
                 system_tasks::system_tasks_open_log_path,
                 system_tasks::respond_system_task_prompt,
                 window_chrome::desktop_get_window_chrome_policy,
+                window_chrome::desktop_set_native_title_bar,
                 window_chrome::desktop_get_window_state,
                 window_chrome::desktop_minimize_window,
                 window_chrome::desktop_toggle_window_maximize,
@@ -112,6 +123,15 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                // Windows/Linux already present the window through the single-instance callback.
+                #[cfg(target_os = "macos")]
+                {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    let handle = app.handle().clone();
+                    app.deep_link().on_open_url(move |_event| {
+                        window_chrome::request_show_main_window(&handle);
+                    });
+                }
                 system_tasks::set_desktop_bundle_id(&app.config().identifier);
                 autostart::register(app)?;
                 menu_bar::prepare_launch(app.handle());

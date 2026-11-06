@@ -1,6 +1,8 @@
 import { spawn, type SpawnOptions } from 'child_process';
+import { mkdir } from 'node:fs/promises';
 
 import { logger } from '@/ui/logger';
+import type { TerminalHostLaunchFailure } from '@/integrations/terminalHost/_types';
 
 import {
   buildPosixShellCommand,
@@ -50,6 +52,15 @@ export interface TmuxSpawnOptions extends Omit<SpawnOptions, 'env'> {
   // and efficiency - only variables that differ from the tmux server
   // environment need to be passed via -e flags.
 }
+
+export type TmuxSpawnResult = Readonly<{
+  sessionId?: string;
+  sessionName?: string;
+  windowName?: string;
+  windowId?: string;
+  pid?: number;
+  error?: string;
+}> & (Readonly<{ success: true }> | (Readonly<{ success: false }> & TerminalHostLaunchFailure));
 
 export class TmuxUtilities {
   /** Default session name to prevent interference */
@@ -164,10 +175,51 @@ export class TmuxUtilities {
       fullCmd.splice(baseCmd.length + 1, 0, '-t', target);
     }
 
-    return this.executeCommand(fullCmd, {
+    const detachedCreation = (commandName === 'new-session' || commandName === 'new-window') && cmd.includes('-d');
+    const printCreation = cmd.includes('-P');
+    if (detachedCreation) {
+      // Detached new-window does not change the native queue's current window.
+      // Capture the immutable created ID instead of resizing the previous window.
+      const formatIndex = fullCmd.indexOf('-F', baseCmd.length);
+      const format = formatIndex >= 0 ? fullCmd[formatIndex + 1] : commandName === 'new-session'
+        ? '#{session_name}:' : '#{session_name}:#{window_index}.#{pane_index}';
+      if (formatIndex >= 0) fullCmd.splice(formatIndex, 2);
+      fullCmd.splice(baseCmd.length + 1, 0, '-P', '-F', `#{window_id}\t${format ?? ''}`);
+    }
+
+    const result = await this.executeCommand(fullCmd, {
       ...(stdin !== undefined ? { stdin } : {}),
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     });
+    if (detachedCreation && result) {
+      const createdWindow = /^(@\d+)\t/.exec(result.stdout);
+      if (createdWindow) {
+        result.stdout = printCreation ? result.stdout.slice(createdWindow[0].length) : '';
+        // tmux 3.4's initial latest sizing includes unrelated sessions' clients.
+        // Native -a scopes sizing to this window, falling back to default-size.
+        // Restore inheritance immediately so later attached clients still resize it.
+        const windowId = createdWindow[1];
+        const localPolicy = await this.executeCommand([...baseCmd, 'show-options', '-w', '-t', windowId, 'window-size'], options);
+        if (!localPolicy || localPolicy.returncode !== 0) {
+          logger.warn('[TMUX] Failed to read detached window sizing policy', { windowId, stderr: localPolicy?.stderr });
+          return result;
+        }
+        const restorePolicy = localPolicy.stdout.trim() === 'window-size latest'
+          ? `set-option -w -t ${windowId} window-size latest`
+          : `set-option -wu -t ${windowId} window-size`;
+        const sizing = await this.executeCommand([...baseCmd, 'if-shell', '-F', '-t', windowId,
+          '#{&&:#{==:#{window-size},latest},#{==:#{session_attached},0}}',
+          `resize-window -a -t ${windowId} ; ${restorePolicy}`,
+        ], options);
+        if (!sizing || sizing.returncode !== 0) {
+          // Creation succeeded; do not convert this into a retryable launch error.
+          logger.warn('[TMUX] Failed to reconcile detached window geometry', { windowId: createdWindow[1], stderr: sizing?.stderr });
+        }
+      } else if (result.returncode === 0) {
+        logger.warn('[TMUX] Created window ID missing; detached geometry was not reconciled');
+      }
+    }
+    return result;
   }
 
   /**
@@ -511,9 +563,13 @@ export class TmuxUtilities {
     args: string[],
     options: TmuxSpawnOptions = {},
     env?: Record<string, string>,
-  ): Promise<{ success: boolean; sessionId?: string; sessionName?: string; windowName?: string; windowId?: string; pid?: number; error?: string }> {
+  ): Promise<TmuxSpawnResult> {
     let spawnScriptPath: string | null = null;
+    let launchDisposition: TerminalHostLaunchFailure['launchDisposition'] = 'not_started';
     try {
+      const socketRoot = this.tmuxCommandEnv?.TMUX_TMPDIR;
+      if (socketRoot) await mkdir(socketRoot, { recursive: true });
+
       // Check if tmux is available
       const tmuxCheck = await this.executeTmuxCommand(['list-sessions']);
       if (!tmuxCheck) {
@@ -670,11 +726,17 @@ export class TmuxUtilities {
       let createResult: TmuxCommandResult | null = null;
       let createWindowArgsForAttempt = createWindowArgs;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        // A lost or malformed reply cannot undo a command the server accepted.
+        launchDisposition = 'unconfirmed';
         createResult = await this.executeTmuxCommand(createWindowArgsForAttempt);
-        if (createResult && createResult.returncode === 0) break;
+        if (createResult && createResult.returncode === 0 && createResult.timedOut !== true) break;
 
         const stderr = createResult?.stderr;
-        const shouldRetry = attempt < maxAttempts && isTmuxWindowIndexConflict(stderr);
+        const explicitWindowConflict = !requireNewSession && createResult?.timedOut !== true && isTmuxWindowIndexConflict(stderr);
+        const explicitSessionConflict = requireNewSession && createResult?.timedOut !== true
+          && /(?:duplicate session|session .+ already exists)/i.test(stderr ?? '');
+        if (explicitWindowConflict || explicitSessionConflict) launchDisposition = 'not_started';
+        const shouldRetry = attempt < maxAttempts && explicitWindowConflict;
         if (!shouldRetry) break;
 
         // In high-concurrency starts, tmux may keep retrying the same conflicting index.
@@ -696,7 +758,7 @@ export class TmuxUtilities {
         }
       }
 
-      if (!createResult || createResult.returncode !== 0) {
+      if (!createResult || createResult.returncode !== 0 || createResult.timedOut === true) {
         const tIndex = createWindowArgsForAttempt.indexOf('-t');
         const target = tIndex >= 0 ? createWindowArgsForAttempt[tIndex + 1] : sessionName;
         const resourceKind = requireNewSession ? 'session' : 'window';
@@ -737,12 +799,23 @@ export class TmuxUtilities {
         pid: panePid,
       };
     } catch (error) {
-      if (spawnScriptPath) {
-        await removeTmuxSpawnScript(spawnScriptPath);
+      let cleanupIncomplete = false;
+      // The pane may still need its launch handoff after the client reply is lost.
+      // Without an immutable identity, do not guess which window to stop.
+      if (spawnScriptPath && launchDisposition !== 'unconfirmed') {
+        try {
+          await removeTmuxSpawnScript(spawnScriptPath);
+        } catch (cleanupError) {
+          cleanupIncomplete = true;
+          logger.debug('[TMUX] Launch handoff cleanup failed:', cleanupError);
+        }
       }
       logger.debug('[TMUX] Failed to spawn in tmux:', error);
+      logger.infoFile('[WARN] [TMUX] Runner creation failed', { launchDisposition, cleanupIncomplete });
       return {
         success: false,
+        launchDisposition,
+        cleanupIncomplete,
         error: error instanceof Error ? error.message : String(error),
       };
     }
@@ -781,7 +854,9 @@ export class TmuxUtilities {
         throw new TmuxSessionIdentifierError(`Window identifier required: ${sessionIdentifier}`);
       }
 
-      const result = await this.executeTmuxCommand(['kill-window'], parsed.session, parsed.window);
+      const result = await this.executeTmuxCommand([
+        'kill-window', '-t', formatTmuxSessionIdentifier(parsed, { exactSession: true }),
+      ]);
       return result !== null && result.returncode === 0;
     } catch (error) {
       if (error instanceof TmuxSessionIdentifierError) {

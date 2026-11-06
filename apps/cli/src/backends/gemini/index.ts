@@ -7,7 +7,6 @@ import { geminiConnectedServiceStateSharingDescriptor } from '@/backends/gemini/
 import { geminiUsageLimitRecoveryControlAdapter } from '@/backends/gemini/connectedServices/geminiUsageLimitRecoveryControlAdapter';
 import { geminiQuotaFetcherDescriptor } from '@/backends/gemini/connectedServices/quotaFetcher';
 import { resolveGeminiConnectedServiceSwitchContinuity } from '@/backends/gemini/connectedServices/resolveGeminiConnectedServiceSwitchContinuity';
-import { geminiDaemonSpawnHooks } from '@/backends/gemini/daemon/spawnHooks';
 import type { AgentCatalogEntry } from '../types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 
@@ -28,9 +27,9 @@ export const agent = {
   getCliCommandHandler: async () => (await import('@/backends/gemini/cli/command')).handleGeminiCliCommand,
   getCliCapabilityOverride: async () => (await import('@/backends/gemini/cli/capability')).cliCapability,
   getCliDetect: async () => (await import('@/backends/gemini/cli/detect')).cliDetect,
+  getPreflightSessionControlsProbeAdapter: async () => ({ connectedServiceAuth: 'materialized-env' as const }),
   getCliAuthSpec: async () => (await import('@/backends/gemini/cli/auth/geminiCliAuthSpec')).geminiCliAuthSpec,
   getCloudConnectTarget: async () => (await import('@/backends/gemini/cloud/connect')).geminiCloudConnect,
-  getDaemonSpawnHooks: async () => geminiDaemonSpawnHooks,
   getConnectedServiceMaterializer: async () => createGeminiConnectedServicesMaterializer(),
   getConnectedServiceRuntimeAuthAdapter: async () => createGeminiConnectedServiceRuntimeAuthAdapter(),
   getConnectedServiceCredentialLifecycleDescriptor: async () => geminiConnectedServiceCredentialLifecycleDescriptor,

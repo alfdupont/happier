@@ -1,8 +1,9 @@
 import { ChildProcess, type spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { withTempDir } from '@/testkit/fs/tempDir';
+import { expectTerminalNativeInvocation, terminalLauncherBoundary } from '@/testkit/process/terminalLauncher';
 
 import {
   resolveOpenCodeAttachChildEnv,
@@ -22,6 +23,7 @@ describe('OpenCode attach target authentication', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
+    vi.doUnmock('node:fs/promises');
     vi.resetModules();
   });
 
@@ -46,6 +48,7 @@ describe('OpenCode attach target authentication', () => {
         vi.stubEnv('HAPPIER_OPENCODE_SERVER_URL', '');
         vi.stubEnv('HAPPIER_OPENCODE_SERVER_XDG_ROOT_DIR', '');
         vi.resetModules();
+        const pool = join(root, 'opencode', 'managed-servers');
         const { resolveOpenCodeManagedServerLaunchFingerprint } = await import('../server/openCodeManagedServerEnv');
         const { runOpenCodeProviderAttach } = await import('../attach/runOpenCodeProviderAttach');
         const { maybeUpdateOpenCodeSessionIdMetadata } = await import('../utils/opencodeSessionIdMetadata');
@@ -55,7 +58,6 @@ describe('OpenCode attach target authentication', () => {
           baseEnv: process.env,
           xdgRootDir: null, isolateConfig: false,
         });
-        const pool = join(root, 'opencode', 'managed-servers');
         await mkdir(pool, { recursive: true });
         if (targetState !== 'missing') await writeFile(join(pool, `${fingerprint}.json`), JSON.stringify({
           baseUrl: 'http://127.0.0.1:4200', pid: 4200, startedAtMs: 1,
@@ -121,6 +123,7 @@ describe('OpenCode attach target authentication', () => {
         }
         const child = new ChildProcess();
         const spawnProcess = vi.fn(() => {
+          terminalLauncherBoundary(child);
           setImmediate(() => child.emit('exit', 0, null));
           return child;
         });
@@ -149,14 +152,14 @@ describe('OpenCode attach target authentication', () => {
             setImmediate(() => ownedChild.emit('exit', 0, null));
             return true;
           });
-          const ownedSpawn = vi.fn(() => ownedChild);
+          const ownedSpawn = vi.fn(() => terminalLauncherBoundary(ownedChild));
           const supervisor = createOpenCodeTuiSupervisor({ command: 'opencode-fixture', commandArgs: [], env: {},
             spawnProcess: ownedSpawn as unknown as typeof spawn });
           const target = { baseUrl: 'http://127.0.0.1:4200', directory: root, sessionId: 'native-target-session',
             managedServerLaunchFingerprint: selectedFingerprint };
           await expect(supervisor.attach(target)).resolves.toBe(true);
           expect(observedAuthorization).toEqual([targetAuthorization]);
-          expect(ownedSpawn).toHaveBeenCalledWith('opencode-fixture',
+          await expectTerminalNativeInvocation(ownedSpawn.mock.calls, 'opencode-fixture',
             ['--server', target.baseUrl, '--session', target.sessionId, root],
             expect.objectContaining({ env: { OPENCODE_PASSWORD: 'target-fixture-password' } }));
           await supervisor.dispose();
@@ -229,7 +232,7 @@ describe('OpenCode attach target authentication', () => {
           prepareProviderCliAttach: async ({ providerSessionId }) => ({ ok: true, providerSessionId }),
         })).resolves.toBe(0);
         expect(observedAuthorization).toEqual([targetAuthorization]);
-        expect(spawnProcess).toHaveBeenCalledWith('opencode-fixture',
+        await expectTerminalNativeInvocation(spawnProcess.mock.calls, 'opencode-fixture',
           ['--server', managed ? 'http://127.0.0.1:4200' : 'http://127.0.0.1:4200/', '--session', 'native-target-session', root],
           expect.objectContaining({ env: { OPENCODE_PASSWORD: 'target-fixture-password' } }));
       });
@@ -244,6 +247,33 @@ describe('OpenCode attach target authentication', () => {
       await mkdir(join(root, 'opencode', 'managed-servers'), { recursive: true });
       await writeFile(join(root, 'escape.json'), JSON.stringify({ baseUrl: 'http://127.0.0.1:4200', pid: 4200, startedAtMs: 1 }));
       await expect(readSharedManagedOpenCodeServerStateByLaunchFingerprintBestEffort('../../escape')).resolves.toBeNull();
+    });
+  });
+
+  it('resolves exact retained credentials when legacy and client-tracked servers share a fingerprint', async () => {
+    await withTempDir('opencode-pool-coexistence-', async root => {
+      vi.stubEnv('HAPPIER_HOME_DIR', root);
+      vi.stubEnv('HAPPIER_OPENCODE_SERVER_STATE_PATH', '');
+      vi.resetModules();
+      const { resolveSharedManagedOpenCodeServerStatePathForEnv } = await import('../server/sharedManagedServer');
+      const { resolveOpenCodeAttachTargetAuthHeaders } = await import('./openCodeAttachTargetAuth');
+      const currentPath = resolveSharedManagedOpenCodeServerStatePathForEnv();
+      const fingerprint = basename(currentPath, '.json');
+      for (const [directory, port, password] of [
+        [join(root, 'opencode', 'managed-servers'), 4200, 'legacy-secret'],
+        [join(root, 'opencode', 'managed-servers', 'clients-tracked'), 4300, 'tracked-secret'],
+      ] as const) {
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, `${fingerprint}.json`), JSON.stringify({
+          baseUrl: `http://127.0.0.1:${port}`, pid: port, startedAtMs: 1,
+          launchEnvFingerprint: fingerprint, authPassword: password,
+        }));
+      }
+      for (const [port, password] of [[4200, 'legacy-secret'], [4300, 'tracked-secret']] as const) {
+        await expect(resolveOpenCodeAttachTargetAuthHeaders({
+          baseUrl: `http://127.0.0.1:${port}`, managedServerLaunchFingerprint: fingerprint, env: ambientEnv,
+        })).resolves.toEqual({ Authorization: basic('opencode', password) });
+      }
     });
   });
 

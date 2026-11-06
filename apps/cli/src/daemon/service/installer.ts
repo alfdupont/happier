@@ -1,11 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
+import { prepareServicePlanCopies } from '@happier-dev/cli-common/service';
+
 import { configuration } from '@/configuration';
 
 import {
   applyDaemonServiceInstallPlan,
   applyDaemonServiceUninstallPlan,
+  assertDaemonServiceCommandsAvailable,
   type DaemonServiceCommandFailureMode,
 } from './apply';
 import {
@@ -37,7 +40,7 @@ import {
 } from '@happier-dev/cli-common/firstPartyRuntime';
 import { doesInstalledDaemonServiceDefinitionMatchExpected } from './doesInstalledDaemonServiceDefinitionMatchExpected';
 import { describeDaemonServiceRuntimeReplacement } from './readDaemonServiceDefinitionLauncher';
-import { resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { happierHomeDirsMatch } from '@/daemon/ownership/happierHomeDirComparableKey';
 import { getActiveServerProfile } from '@/server/serverProfiles';
 
 type SupportedPlatform = 'darwin' | 'linux' | 'win32';
@@ -304,10 +307,13 @@ export async function previewDaemonServiceInstall(options: Readonly<{
     !expectedInstalledFile
     || discoveredServices
       .filter((service) => daemonServiceMatchesInstallTarget(service, target))
-      .some((service) => service.path === expectedInstalledFile.path && doesInstalledDaemonServiceDefinitionMatchExpected({
-        installedPath: service.path,
-        expectedContents: expectedInstalledFile.content,
-      }))
+      // A Windows task still registered with a stale launcher action needs install to rewrite it.
+      .some((service) => service.path === expectedInstalledFile.path
+        && service.windowsLauncherUpgradeNeeded !== true
+        && doesInstalledDaemonServiceDefinitionMatchExpected({
+          installedPath: service.path,
+          expectedContents: expectedInstalledFile.content,
+        }))
   );
 
   // Only a switch between a CLI the user installed and the managed CLI — either way (R12/R13 b) —
@@ -365,8 +371,7 @@ function previewPlanFileForTarget(params: Readonly<{
  * service's definition names none). Only this CLI's own home can be read; any other is unknown.
  */
 async function resolveDefaultFollowingServerForHome(happierHomeDir: string): Promise<DaemonServiceRelay | null> {
-  const homeKey = resolveHappierHomeDirComparableKey(happierHomeDir);
-  if (homeKey === null || homeKey !== resolveHappierHomeDirComparableKey(configuration.happyHomeDir)) {
+  if (!happierHomeDirsMatch(happierHomeDir, configuration.happyHomeDir)) {
     return null;
   }
   try {
@@ -433,6 +438,20 @@ export async function installDaemonService(options: Readonly<{
     );
   }
 
+  if (options.runCommands !== false) {
+    assertDaemonServiceCommandsAvailable(preview.plan.commands);
+  }
+
+  // A runtime replacement is a real change even where the definition comparator treats launchers
+  // as equivalent (darwin), so the consented switch is written rather than skipped.
+  const installIsCurrent = preview.exactTargetIsConverged && preview.exactTargetMatchesExpectedDefinition
+    && !preview.exactTargetRuntimeReplacement && options.restartRunningDaemon !== true;
+  if (!installIsCurrent) {
+    // Reject a missing or invalid packaged asset, or a destination holding different bytes,
+    // before removing services or stopping the owner.
+    await prepareServicePlanCopies(preview.plan.copies);
+  }
+
   for (const service of preview.conflictPlan.servicesToRemove) {
     await uninstallDaemonService({
       platform,
@@ -449,10 +468,7 @@ export async function installDaemonService(options: Readonly<{
     });
   }
 
-  // A runtime replacement is a real change even where the definition comparator treats launchers
-  // as equivalent (darwin), so the consented switch is written rather than skipped.
-  if (preview.exactTargetIsConverged && preview.exactTargetMatchesExpectedDefinition
-    && !preview.exactTargetRuntimeReplacement && options.restartRunningDaemon !== true) {
+  if (installIsCurrent) {
     return;
   }
   await options.beforeApply?.();

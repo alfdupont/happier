@@ -41,6 +41,40 @@ function baseIncomingOptions(overrides: Partial<SpawnSessionOptions> = {}): Spaw
 }
 
 describe('resolveSessionRuntimeSnapshot', () => {
+  it('restores the AI profile identity for resume and respawn, preserving an explicit no-profile selection', () => {
+    const persistedMetadata = { profileId: 'saved-profile' };
+    expect(resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions(), persistedMetadata,
+    }).spawnOptions.profileId).toBe('saved-profile');
+    expect(resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({ profileId: '' }), persistedMetadata,
+    }).spawnOptions.profileId).toBe('');
+    expect(resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions(),
+      trackedSpawnOptions: baseIncomingOptions({ profileId: 'tracked-profile' }),
+    }).spawnOptions.profileId).toBe('tracked-profile');
+  });
+
+  it('restores native account directories through the runtime snapshot while preserving explicit overrides', () => {
+    const metadata = { nativeAgentEnvironmentV1: {
+      CLAUDE_CONFIG_DIR: '/accounts/original', CODEX_HOME: '/accounts/codex',
+      ANTHROPIC_API_KEY: 'must-not-be-restored', CODEX_SQLITE_HOME: 42,
+    } };
+    const restored = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions(), persistedMetadata: metadata,
+    });
+    expect(restored.spawnOptions.environmentVariables).toEqual({
+      CLAUDE_CONFIG_DIR: '/accounts/original', CODEX_HOME: '/accounts/codex',
+    });
+    const overridden = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({ environmentVariables: { CLAUDE_CONFIG_DIR: '/accounts/selected' } }),
+      persistedMetadata: metadata,
+    });
+    expect(overridden.spawnOptions.environmentVariables).toEqual({
+      CLAUDE_CONFIG_DIR: '/accounts/selected', CODEX_HOME: '/accounts/codex',
+    });
+  });
+
   it('restores the persisted per-session MCP overlay into resume and respawn options', () => {
     const mcpSelection = {
       v: 1 as const,

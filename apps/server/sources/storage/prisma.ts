@@ -6,6 +6,7 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readPrismaSqliteConnectionParams } from "@happier-dev/cli-common/firstPartyRuntime";
 import { resolveLightDataDir, resolveLightDatabaseDir } from "@/flavors/light/env";
 import { resolveLightSqliteBusyTimeoutMsFromEnv } from "@/flavors/light/sqliteConnectionConfig";
 import { log, warn } from "@/utils/logging/log";
@@ -48,8 +49,11 @@ function loadDefaultPrismaClientModule(): typeof import("@prisma/client") {
  * Runtime callers must use this sidecar-aware CommonJS loader instead of a
  * named ESM import from `@prisma/client`; packaged server builds externalize
  * Prisma and cannot rely on named-import interop from its generated module.
+ * Generated providers own their null sentinels, so initialization updates this
+ * live binding together with the active client.
  */
-export const prismaRuntime: typeof import("@prisma/client").Prisma = loadDefaultPrismaClientModule().Prisma;
+const defaultPrismaRuntime = loadDefaultPrismaClientModule().Prisma;
+export let prismaRuntime: typeof import("@prisma/client").Prisma = defaultPrismaRuntime;
 
 function createDefaultPrismaClient(): PrismaClientType {
     const { PrismaClient } = loadDefaultPrismaClientModule();
@@ -188,10 +192,13 @@ async function initDbFromGeneratedClient(provider: "mysql" | "sqlite"): Promise<
         throw new Error("Database client is already initialized.");
     }
     _provider = provider;
-    _db = await createGeneratedPrismaClient(provider);
+    const mod = await loadGeneratedPrismaClientModule(provider);
+    const client = new mod.PrismaClient();
+    prismaRuntime = mod.Prisma;
+    _db = client;
 }
 
-async function createGeneratedPrismaClient(provider: "mysql" | "sqlite"): Promise<PrismaClientType> {
+async function loadGeneratedPrismaClientModule(provider: "mysql" | "sqlite"): Promise<Pick<typeof import("@prisma/client"), "Prisma" | "PrismaClient">> {
     const entrypoint =
         provider === "mysql"
             ? resolveGeneratedClientEntrypoint("../../generated/mysql-client")
@@ -210,14 +217,15 @@ async function createGeneratedPrismaClient(provider: "mysql" | "sqlite"): Promis
         }
         throw err;
     }
-    if (!mod?.PrismaClient) {
+    if (!mod?.PrismaClient || !mod?.Prisma) {
         throw new Error(`Invalid generated Prisma client module: ${entrypoint}`);
     }
-    return new mod.PrismaClient() as PrismaClientType;
+    return mod;
 }
 
 export async function createDbSqliteMaintenanceClient(): Promise<PrismaClientType> {
-    return createGeneratedPrismaClient("sqlite");
+    const mod = await loadGeneratedPrismaClientModule("sqlite");
+    return new mod.PrismaClient();
 }
 
 export async function initDbMysql(): Promise<void> {
@@ -424,11 +432,7 @@ function parsePositiveInteger(value: string | null): number | null {
 function readSqliteDatabaseUrlSearchParam(env: NodeJS.ProcessEnv, key: string): string | null {
     const rawUrl = String(env.DATABASE_URL ?? "").trim();
     if (!rawUrl) return null;
-    try {
-        return new URL(rawUrl).searchParams.get(key);
-    } catch {
-        return null;
-    }
+    return readPrismaSqliteConnectionParams(rawUrl).get(key);
 }
 
 export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): SqliteStartupDiagnostics {
@@ -472,6 +476,7 @@ export async function shutdownDbClient(): Promise<void> {
     const client = _db;
     _db = null;
     _provider = null;
+    prismaRuntime = defaultPrismaRuntime;
     if (client) {
         await client.$disconnect();
     }
@@ -484,6 +489,7 @@ export async function shutdownDbPglite(): Promise<void> {
     const client = _db;
     _db = null;
     _provider = null;
+    prismaRuntime = defaultPrismaRuntime;
     if (client) {
         await client.$disconnect();
     }

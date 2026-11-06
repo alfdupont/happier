@@ -4,7 +4,8 @@ import { getReleaseRingCatalogEntry, type PublicReleaseRingId } from '@happier-d
 import { isServerIdFilesystemSafe } from '@/server/serverId';
 
 import { buildLaunchAgentPlistXml, buildLaunchdPath } from './darwin';
-import { buildServicePath, planServiceAction, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
+import { resolveDaemonWindowsServiceLauncherInstallSpec } from './windowsServiceLauncher';
+import { buildServicePath, planServiceAction, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1, type PlannedCopy } from '@happier-dev/cli-common/service';
 
 export type DaemonServicePlatform = 'darwin' | 'linux' | 'win32';
 export type DaemonServiceMode = 'user' | 'system';
@@ -14,7 +15,7 @@ export type DaemonServiceTargetMode = 'pinned' | 'default-following';
  * Whether the installed background service starts itself at login.
  *
  * - `at-login` (default, unchanged behaviour): launchd `RunAtLoad`, a systemd
- *   `enable`d unit, a Windows `ONLOGON` trigger.
+ *   `enable`d unit, a Windows current-user logon trigger.
  * - `on-demand`: the service stays installed and startable, but nothing starts
  *   it at login — the daemon runs only while something asks for it (the desktop
  *   app, or `happier service start`).
@@ -75,6 +76,7 @@ export type DaemonServicePlannedCommand = Readonly<{
 export type DaemonServiceInstallPlan = Readonly<{
   platform: DaemonServicePlatform;
   files: DaemonServicePlannedFile[];
+  copies?: PlannedCopy[];
   commands: DaemonServicePlannedCommand[];
 }>;
 
@@ -465,9 +467,9 @@ export function planDaemonServiceInstall(params: Readonly<{
       definitionPath: wrapperPath,
       definitionContents: wrapper,
       taskName,
-      // `persistent: false` is cli-common's existing expression of "registered
-      // without a logon trigger": it creates the task with `/SC ONCE` instead
-      // of `/SC ONLOGON`, and the install still runs it once now.
+      windowsLauncher: resolveDaemonWindowsServiceLauncherInstallSpec(),
+      // cli-common registers the current user's interactive task, with a scoped logon
+      // trigger only at login. On-demand has no trigger; install still runs it now.
       persistent: autostart === 'at-login',
     });
 
@@ -483,6 +485,7 @@ export function planDaemonServiceInstall(params: Readonly<{
     return {
       platform: 'win32',
       files: [{ path: wrapperPath, content: wrapper, mode: 0o644 }],
+      copies: basePlan.copies,
       commands,
     };
   }

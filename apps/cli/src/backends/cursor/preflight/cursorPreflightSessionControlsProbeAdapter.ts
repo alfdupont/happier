@@ -5,6 +5,7 @@ import type { AgentBackend } from '@/agent/core';
 import type { PreflightSessionControlsProbeAdapter, PreflightSessionControlsProbeParams } from '@/capabilities/probes/preflightSessionControlsProbeAdapterTypes';
 import type { ProbedAgentMode } from '@/capabilities/probes/agentModesProbe';
 import { probeModelsFromAcpBackend, type ProbedAgentModel } from '@/capabilities/probes/agentModelsProbe';
+import { probeAcpCatalogs } from '@/capabilities/probes/probeAcpCatalogs';
 import {
   buildCursorSessionModesFromConfigOptions,
   buildCursorSessionModelsFromConfigOptions,
@@ -40,7 +41,6 @@ function createCursorProbeBackend(params: PreflightSessionControlsProbeParams): 
     },
     mcpServers: {},
     permissionMode: 'default',
-    parameterizedModelPicker: true,
     permissionHandler: {
       handleToolCall: async () => ({ decision: 'abort' }),
     },
@@ -122,6 +122,11 @@ async function probeCursorModesRaw(params: PreflightSessionControlsProbeParams):
 
 export const cursorPreflightSessionControlsProbeAdapter: PreflightSessionControlsProbeAdapter = {
   failureCacheStrategy: 'cooldown',
+  probeCatalogsRaw: (params) => probeAcpCatalogs({
+    ...params,
+    agentId: 'cursor',
+    processEnv: { ...(params.processEnv ?? process.env), ...buildCursorProbeEnv(params.accountSettings) },
+  }),
   probeModelsRaw: probeCursorModelsRaw,
   probeModesRaw: probeCursorModesRaw,
   probeConfigOptionsRaw: probeCursorConfigOptionsRaw,

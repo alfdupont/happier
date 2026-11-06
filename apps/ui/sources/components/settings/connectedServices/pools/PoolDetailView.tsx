@@ -41,6 +41,7 @@ import { useProfile, useSettings } from '@/sync/store/hooks';
 import { t } from '@/text';
 import {
     ConnectedServiceAuthGroupIdSchema,
+    ConnectedServiceAuthGroupStrategyV1Schema,
     ConnectedServiceIdSchema,
     isConnectedServiceCredentialHealthStatusUsable,
     normalizeConnectedServiceCredentialHealthStatus,
@@ -62,6 +63,7 @@ import {
     resolveConnectedServiceGroupProbeIfSnapshotOlderThanMs,
     resolveConnectedServiceGroupMemberIdentity,
     resolveConnectedServiceGroupProfileTitle,
+    resolveConnectedServiceGroupStrategyLabel,
     resolveConnectedServiceGroupRecoveryMode,
     resolveConnectedServiceGroupSoftSwitchRemainingPercent,
     resolveConnectedServiceGroupSwitchBudget,
@@ -70,6 +72,7 @@ import {
 import { resolveConnectedServiceRuntimeGroupCapability } from '../model/connectedServiceRuntimeFallbackCapability';
 import { resolveConnectedServiceDisplayName } from '../model/resolveConnectedServiceDisplayName';
 import { commitPoolMemberReorder, computePoolMemberPriorities, type ReorderableGroup } from './commitPoolMemberReorder';
+import type { DragHapticsOutcome } from '@/components/ui/treeDragDrop/createDragHapticsSession';
 import { commitPoolMembershipBatch } from './commitPoolMembershipBatch';
 import { PoolMembersDropOverlay } from './PoolMembersDropOverlay';
 import { Icon } from '@/components/ui/icons/Icon';
@@ -109,9 +112,7 @@ function parsePromptNumber(raw: string): number | null {
 }
 
 function resolveStrategyTitle(strategy: GroupStrategy): string {
-    if (strategy === 'least_limited') return t('connectedServices.detail.groupDetail.strategyLeastLimitedTitle');
-    if (strategy === 'manual') return t('connectedServices.detail.groupDetail.strategyManualTitle');
-    return t('connectedServices.detail.groupDetail.strategyPriorityTitle');
+    return resolveConnectedServiceGroupStrategyLabel(strategy);
 }
 
 function resolveRecoveryModeSubtitle(mode: GroupRecoveryMode): string {
@@ -133,8 +134,15 @@ function StrategyCheckmark() {
     return <Icon name="check" size={16} color={theme.colors.accent.blue} />;
 }
 
-function buildStrategyItems(currentStrategy: GroupStrategy): DropdownMenuItem[] {
+function buildStrategyItems(currentStrategy: GroupStrategy, expiryFirstSupported: boolean): DropdownMenuItem[] {
     return [
+        ...(expiryFirstSupported || currentStrategy === 'expiry_first' ? [{
+            id: 'expiry_first',
+            title: resolveStrategyTitle('expiry_first'),
+            subtitle: t('connectedServices.detail.groupDetail.strategyExpiryFirstSubtitle'),
+            rightElement: currentStrategy === 'expiry_first' ? <StrategyCheckmark /> : null,
+            disabled: !expiryFirstSupported,
+        }] : []),
         {
             id: 'priority',
             title: t('connectedServices.detail.groupDetail.strategyPriorityTitle'),
@@ -166,7 +174,7 @@ function buildRecoveryModeItems(currentMode: GroupRecoveryMode): DropdownMenuIte
 }
 
 function isGroupStrategy(value: string): value is GroupStrategy {
-    return value === 'priority' || value === 'least_limited' || value === 'manual';
+    return ConnectedServiceAuthGroupStrategyV1Schema.safeParse(value).success;
 }
 
 function isGroupRecoveryMode(value: string): value is GroupRecoveryMode {
@@ -214,6 +222,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
     const autoQuotaResetEnabled = useFeatureEnabled('connectedServices.autoQuotaReset');
     const autoDisablePlanInvalidEnabled = useFeatureEnabled('connectedServices.autoDisablePlanInvalid');
     const poolQuotaLimitSelectionEnabled = useFeatureEnabled('connectedServices.poolQuotaLimitSelection');
+    const poolExpiryFirstEnabled = useFeatureEnabled('connectedServices.poolExpiryFirst');
     const [strategyOpen, setStrategyOpen] = React.useState(false);
     const [recoveryModeOpen, setRecoveryModeOpen] = React.useState(false);
     const [advancedExpanded, setAdvancedExpanded] = React.useState(false);
@@ -371,6 +380,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
 
     const handleSetStrategy = (strategy: string) => {
         if (!isGroupStrategy(strategy)) return;
+        if (strategy === 'expiry_first' && !poolExpiryFirstEnabled) return;
         void patchPolicy({ strategy });
     };
 
@@ -607,9 +617,11 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
      * through each sequential priority patch and refetches on a generation
      * conflict — the single owner is `commitPoolMemberReorder`.
      */
-    const commitOrder = React.useCallback(async (orderedProfileIds: ReadonlyArray<string>) => {
-        if (!serviceId || !group) return;
+    const commitOrder = React.useCallback(async (orderedProfileIds: ReadonlyArray<string>): Promise<DragHapticsOutcome> => {
+        if (!serviceId || !group) return 'refused';
         const startGroup = group;
+        const currentOrder = sortMembersByPriority(startGroup.members).map((member) => member.profileId);
+        if (currentOrder.length === orderedProfileIds.length && currentOrder.every((id, index) => id === orderedProfileIds[index])) return 'unchanged';
         const reorderable: ReorderableGroup = {
             generation: startGroup.generation,
             members: startGroup.members.map((member) => ({ profileId: member.profileId, priority: member.priority })),
@@ -634,7 +646,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
             })),
         });
         try {
-            await commitPoolMemberReorder({
+            const committed = await commitPoolMemberReorder({
                 group: reorderable,
                 orderedProfileIds,
                 patchMember: async ({ profileId, priority, expectedGeneration }) => {
@@ -663,10 +675,12 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
             });
             await sync.refreshProfile().catch(() => undefined);
             await loadGroups().catch(() => undefined);
+            return committed.patchedProfileIds.length > 0 ? 'applied' : 'unchanged';
         } catch (e: unknown) {
             // Revert the optimistic order to authoritative server truth, then surface.
             await loadGroups().catch(() => undefined);
             await Modal.alert(t('common.error'), resolveConnectedServiceSettingsErrorMessage(e));
+            return 'unknown';
         }
     }, [group, loadGroups, serviceId, upsertGroup]);
 
@@ -1013,7 +1027,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                 <DropdownMenu
                     open={strategyOpen}
                     onOpenChange={setStrategyOpen}
-                    items={buildStrategyItems(group.policy.strategy)}
+                    items={buildStrategyItems(group.policy.strategy, poolExpiryFirstEnabled)}
                     selectedId={group.policy.strategy}
                     onSelect={handleSetStrategy}
                     itemTrigger={{

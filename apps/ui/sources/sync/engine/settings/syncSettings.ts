@@ -1,3 +1,7 @@
+import { DEFAULT_THEME_PROFILES_LOCAL_STATE, ThemeProfileLibrarySchema, mergeThemeProfileLibraries, resolveThemeProfileSelection } from '@/theme/profiles/themeProfilePersistence';
+import { AccountThemeSelectionV1Schema, buildAccountThemeSelection, isUnsetDeviceThemeSelection } from '@/theme/profiles/themeAccountSelection';
+import { isBuiltInThemeProfilePresetId } from '@/theme/profiles/builtInThemeProfiles';
+import { canUseLegacyThemeProfiles, rememberThemeProfileMigration } from '@/sync/domains/settings/themeProfiles';
 import { tracking } from '@/track';
 import { HappyError } from '@/utils/errors/errors';
 import { applySettings, settingsDefaults, settingsParse, type Settings } from '@/sync/domains/settings/settings';
@@ -14,11 +18,15 @@ import {
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { getServerProfileLegacyServerIds } from '@/sync/domains/server/serverProfiles';
 import { storage } from '@/sync/domains/state/storage';
-import { loadPendingSettings } from '@/sync/domains/state/persistence';
+import { loadLocalSettings, loadPendingSettings, savePendingSettings } from '@/sync/domains/state/persistence';
 import {
     loadAccountSettings,
     loadPendingAccountSettings,
+    loadPendingAccountSettingsState,
+    savePendingAccountSettings,
 } from '@/sync/domains/state/accountSettingsPersistence';
+import { applyThemeProfileMigrationEdits, mergeThemeProfileMigrationEdits, rebaseThemeProfileMigrationEdits, removeCommittedThemeProfileMigrationEdits } from '@/theme/profiles/themeProfileMigrationEdits';
+import type { ThemeProfileMigrationIntent, ThemeProfileSelectionByMode, ThemeProfileV1, ThemeProfilesLocalStateV1 } from '@/theme/profiles/themeProfileTypes';
 import { areAccountSettingsJsonValuesEqual } from '@/sync/domains/settings/accountSettingsStructuralEquality';
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import type { Encryption } from '@/sync/encryption/encryption';
@@ -64,6 +72,8 @@ export type SyncSettingsParams = {
     encryption: Encryption;
     settingsScope?: AccountSettingsScope | null;
     pendingSettings: Partial<Settings>;
+    /** Current intents from the captured Sync scope, including its quiet disk flush window. */
+    getLatestPendingSettings?: () => Partial<Settings> | null;
     clearPendingSettings: (nextPendingSettings: Partial<Settings>) => void;
     settingsSecretsKey?: Uint8Array | null;
     settingsSecretsReadKeys?: ReadonlyArray<Uint8Array | null | undefined>;
@@ -88,6 +98,65 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
     const pendingServerSettings = stripMigratedSessionOrganizationSettings(
         stripLocalOnlyAccountSettings(pendingSettings) as Record<string, unknown>,
     ) as Partial<Settings>;
+    const submittedThemeIntent = settingsScope
+        ? loadPendingAccountSettingsState(settingsScope).themeProfileMigration : null;
+    const submittedThemeEdits = submittedThemeIntent?.edits ?? [];
+
+    function mergeThemeProfileMigrationInputs(
+        remembered: ThemeProfilesLocalStateV1 | null,
+        local: ThemeProfilesLocalStateV1 | null,
+    ): ThemeProfilesLocalStateV1 | null {
+        if (!remembered) return local;
+        if (!local) return remembered;
+        const byId = new Map(remembered.profiles.map(profile => [profile.id, profile]));
+        // A live device library is newer than the historical V1 snapshot when an ID overlaps.
+        for (const profile of local.profiles) byId.set(profile.id, profile);
+        return { profiles: [...byId.values()], activeProfileIds: local.activeProfileIds };
+    }
+
+    function resolveRememberedProfileSelection(
+        remembered: NonNullable<ReturnType<typeof AccountThemeSelectionV1Schema.parse>>,
+        profiles: readonly ThemeProfileV1[],
+        legacyProfileIds: ReadonlyMap<string, string>,
+    ): ThemeProfileSelectionByMode {
+        const selected = remembered.themeProfiles.profiles.length > 0
+            ? resolveThemeProfileSelection(null, remembered.themeProfiles, legacyProfileIds)
+            : remembered.themeProfiles.activeProfileIds;
+        const availableProfileIds = new Set(profiles.map(profile => profile.id));
+        const retainAvailableId = (id: string | null): string | null => (
+            id && (isBuiltInThemeProfilePresetId(id) || availableProfileIds.has(id)) ? id : null
+        );
+        return {
+            light: retainAvailableId(selected.light),
+            dark: retainAvailableId(selected.dark),
+        };
+    }
+
+    const migrationLocalSettings = loadLocalSettings();
+    const legacyThemeProfiles = settingsScope
+        && areAccountSettingsScopesEqual(storage.getState().settingsScope, settingsScope)
+        && canUseLegacyThemeProfiles(migrationLocalSettings.themeProfileLegacyAccountScope, settingsScope)
+        && migrationLocalSettings.themeProfiles.profiles.length > 0
+        ? migrationLocalSettings.themeProfiles : null;
+    if (legacyThemeProfiles && !migrationLocalSettings.themeProfileLegacyAccountScope) {
+        // Bind before awaiting network work: an account switch must not import this library twice.
+        storage.getState().applyLocalSettings({ themeProfileLegacyAccountScope: settingsScope });
+    }
+
+    function finishThemeProfileMigration(legacyProfileIds: ReadonlyMap<string, string>): void {
+        if (!legacyThemeProfiles) return;
+        const latest = loadLocalSettings();
+        if (!areAccountSettingsJsonValuesEqual(latest.themeProfiles, legacyThemeProfiles)) return;
+        if (settingsScope) rememberThemeProfileMigration(settingsScope, legacyProfileIds);
+        storage.getState().applyLocalSettings({
+            themeProfiles: DEFAULT_THEME_PROFILES_LOCAL_STATE,
+            themeProfileLegacyAccountScope: null,
+            ...(isSettingsScopeActive() || areAccountSettingsJsonValuesEqual(
+                latest.themeProfileSelection, migrationLocalSettings.themeProfileSelection,
+            ) ? { themeProfileSelection: resolveThemeProfileSelection(latest.themeProfileSelection,
+                legacyThemeProfiles, legacyProfileIds) } : {}),
+        });
+    }
 
     // `/v1/account/encryption` and the account-settings GET are independent reads. The mode decides
     // how the fetched document is *opened* and written — `openSettingsContent` branches on the
@@ -130,7 +199,8 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
     function loadPendingSettingsForCapturedScope(): Partial<Settings> {
         // Pre-auth/bootstrap calls may not have a captured account scope yet. Authenticated
         // sync paths always pass a scope and therefore use scoped pending settings.
-        return settingsScope ? loadPendingAccountSettings(settingsScope) : loadPendingSettings();
+        const persisted = settingsScope ? loadPendingAccountSettings(settingsScope) : loadPendingSettings();
+        return { ...persisted, ...params.getLatestPendingSettings?.() };
     }
 
     function applySettingsForCapturedScope(nextSettings: Settings, nextVersion: number): void {
@@ -466,13 +536,65 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         applyActiveSettingsSideEffects(nextSettings);
     }
 
-    function clearCommittedPendingSettings(submittedPendingSettings: Partial<Settings>): Partial<Settings> {
+    function clearCommittedPendingSettings(submittedPendingSettings: Partial<Settings>, theme?: Readonly<{
+        profiles: readonly ThemeProfileV1[]; legacyProfileIds: ReadonlyMap<string, string>;
+    }>): Partial<Settings> {
         const currentPendingSettings = loadPendingSettingsForCapturedScope();
-        const nextPendingSettings = stripMigratedSessionOrganizationSettings(
+        let nextPendingSettings = stripMigratedSessionOrganizationSettings(
             removeCommittedPendingSettings(currentPendingSettings, submittedPendingSettings) as Record<string, unknown>,
         ) as Partial<Settings>;
+        if (settingsScope && theme) {
+            const currentIntent = loadPendingAccountSettingsState(settingsScope).themeProfileMigration;
+            if (currentIntent || submittedThemeIntent) {
+                const remaining = rebaseThemeProfileMigrationEdits(
+                    removeCommittedThemeProfileMigrationEdits(currentIntent?.edits ?? [], submittedThemeEdits), theme.legacyProfileIds,
+                );
+                const { themeProfiles: _committedProfiles, ...otherPendingSettings } = nextPendingSettings;
+                nextPendingSettings = remaining.length > 0 ? { ...otherPendingSettings,
+                    themeProfiles: applyThemeProfileMigrationEdits(theme.profiles, remaining, new Map()),
+                } : otherPendingSettings;
+                // One atomic pending record bridges server acknowledgement, cache projection and
+                // local backup cleanup. A restart must never re-import the pre-edit backup.
+                savePendingAccountSettings(settingsScope, {
+                    ...nextPendingSettings, themeProfiles: nextPendingSettings.themeProfiles ?? theme.profiles,
+                }, { edits: remaining, legacyProfileIds: Object.fromEntries(theme.legacyProfileIds), acknowledged: true });
+            }
+            else if (legacyThemeProfiles) savePendingAccountSettings(settingsScope, {
+                ...nextPendingSettings, themeProfiles: theme.profiles,
+            }, { edits: [], legacyProfileIds: Object.fromEntries(theme.legacyProfileIds), acknowledged: true });
+            return nextPendingSettings;
+        }
         clearPendingSettings(nextPendingSettings);
         return nextPendingSettings;
+    }
+
+    function completeThemeProfileMigration(theme: Readonly<{ legacyProfileIds: ReadonlyMap<string, string> }> | undefined,
+        remainingPendingSettings: Partial<Settings>): void {
+        if (!theme) return;
+        finishThemeProfileMigration(theme.legacyProfileIds);
+        if (settingsScope) savePendingAccountSettings(settingsScope, remainingPendingSettings, null);
+        clearPendingSettings(remainingPendingSettings);
+    }
+
+    function applyRememberedThemeSelection(raw: Record<string, unknown> | null,
+        previousLegacyProfileIds: ReadonlyMap<string, string>): void {
+        if (!settingsScope || !raw || !isSettingsScopeActive()) return;
+        const latestPendingSettings = loadPendingSettingsForCapturedScope();
+        if (Object.prototype.hasOwnProperty.call(latestPendingSettings, 'appearanceThemeSelectionV1')) return;
+        const remembered = AccountThemeSelectionV1Schema.parse(raw.appearanceThemeSelectionV1 ?? null);
+        if (!remembered) return;
+        const local = loadLocalSettings();
+        if (!isUnsetDeviceThemeSelection(local)) return;
+
+        const canonicalProfiles = ThemeProfileLibrarySchema.parse(raw.themeProfiles);
+        const migrated = mergeThemeProfileLibraries(canonicalProfiles, remembered.themeProfiles, previousLegacyProfileIds);
+        if (migrated.profiles.length !== canonicalProfiles.length) return;
+
+        const profileSelection = resolveRememberedProfileSelection(remembered, canonicalProfiles, migrated.legacyProfileIds);
+        storage.getState().applyLocalSettings({
+            themePreference: remembered.themePreference,
+            themeProfileSelection: profileSelection,
+        });
     }
 
     async function maybeImportLegacySessionOrganization(rawSettings: Record<string, unknown> | null): Promise<void> {
@@ -524,8 +646,26 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         }
     }
 
+    const hasDeviceThemeSelectionToRemember = Boolean(settingsScope)
+        && areAccountSettingsScopesEqual(storage.getState().settingsScope, settingsScope)
+        && canUseLegacyThemeProfiles(migrationLocalSettings.themeProfileLegacyAccountScope, settingsScope)
+        && !isUnsetDeviceThemeSelection(migrationLocalSettings);
+    const initialBaseline = await fetchAccountSettingsBaseline({
+        requireReadable: Object.keys(pendingServerSettings).length > 0 || Boolean(legacyThemeProfiles) || hasDeviceThemeSelectionToRemember,
+    });
+    const initialRememberedTheme = initialBaseline.raw
+        ? AccountThemeSelectionV1Schema.parse(initialBaseline.raw.appearanceThemeSelectionV1 ?? null) : null;
+    const hasRememberedThemeProfiles = (initialRememberedTheme?.themeProfiles.profiles.length ?? 0) > 0;
+    const shouldBackfillThemeSelection = Boolean(settingsScope)
+        && !initialRememberedTheme
+        && !Object.prototype.hasOwnProperty.call(pendingServerSettings, 'appearanceThemeSelectionV1')
+        && hasDeviceThemeSelectionToRemember;
+    if (Object.keys(pendingServerSettings).length === 0 && !legacyThemeProfiles) {
+        await maybeImportLegacySessionOrganization(initialBaseline.raw);
+    }
+
     // Apply pending settings
-    if (Object.keys(pendingServerSettings).length > 0) {
+    if (Object.keys(pendingServerSettings).length > 0 || legacyThemeProfiles || hasRememberedThemeProfiles || shouldBackfillThemeSelection) {
         dbgSettings('syncSettings: pending detected; will POST', {
             endpoint: activeServerUrl,
             pendingKeys: Object.keys(pendingServerSettings).sort(),
@@ -533,17 +673,122 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
             base: summarizeSettings(storage.getState().settings, { version: storage.getState().settingsVersion }),
         });
 
-        let baseline = await fetchAccountSettingsBaseline({ requireReadable: true });
+        let baseline = initialBaseline;
         while (retryCount < maxRetries) {
             const version = baseline.version;
+            const rememberedTheme = baseline.raw
+                ? AccountThemeSelectionV1Schema.parse(baseline.raw.appearanceThemeSelectionV1 ?? null) : null;
+            const accountThemeLegacyProfiles = rememberedTheme?.themeProfiles.profiles.length
+                ? rememberedTheme.themeProfiles : null;
+            const usesAccountThemeLegacyProfiles = accountThemeLegacyProfiles !== null;
+            const localThemeProfilesForMerge = submittedThemeIntent?.acknowledged ? null : legacyThemeProfiles;
+            const legacyInput = mergeThemeProfileMigrationInputs(accountThemeLegacyProfiles, localThemeProfilesForMerge);
+            const themeUpdate = legacyInput || submittedThemeIntent;
+            // Merge the definition being imported, not its pre-edit backup. If a successful
+            // POST response was lost, the canonical merger recognizes the already saved copy.
+            const activeThemeEdits = localThemeProfilesForMerge ? submittedThemeEdits : [];
+            const legacyUpserts = new Map(activeThemeEdits.filter(edit => edit.target.kind === 'legacy' && edit.profile)
+                .map(edit => [edit.target.id, edit.profile!]));
+            const previouslyMappedLegacyIds = new Set([
+                ...Object.keys(submittedThemeIntent?.representedLegacyProfileIds ?? {}),
+                ...(submittedThemeIntent?.acknowledged ? Object.keys(submittedThemeIntent.legacyProfileIds) : []),
+            ]);
+            const legacyForMerge = legacyInput ? { ...legacyInput,
+                profiles: legacyInput.profiles.filter(profile => !previouslyMappedLegacyIds.has(profile.id)).map(profile => {
+                    const edited = legacyUpserts.get(profile.id);
+                    return edited ? { ...edited, id: profile.id } : profile;
+                }),
+            } : DEFAULT_THEME_PROFILES_LOCAL_STATE;
+            const latestThemeIntent = settingsScope ? loadPendingAccountSettingsState(settingsScope).themeProfileMigration : null;
+            const migration = themeUpdate ? mergeThemeProfileLibraries(
+                submittedThemeIntent ? ThemeProfileLibrarySchema.parse(baseline.raw?.themeProfiles)
+                    : pendingServerSettings.themeProfiles ?? ThemeProfileLibrarySchema.parse(baseline.raw?.themeProfiles),
+                submittedThemeIntent?.acknowledged && !usesAccountThemeLegacyProfiles
+                    ? DEFAULT_THEME_PROFILES_LOCAL_STATE : legacyForMerge,
+                new Map(Object.entries({ ...submittedThemeIntent?.legacyProfileIds, ...latestThemeIntent?.attemptedLegacyProfileIds })),
+            ) : null;
+            const legacyProfileIds = new Map(migration?.legacyProfileIds);
+            if (localThemeProfilesForMerge) {
+                for (const [id, mapped] of Object.entries(submittedThemeIntent?.representedLegacyProfileIds ?? {})) legacyProfileIds.set(id, mapped);
+            }
+            if (submittedThemeIntent?.acknowledged) {
+                for (const [id, mapped] of Object.entries(submittedThemeIntent.legacyProfileIds)) legacyProfileIds.set(id, mapped);
+            }
+            const theme = migration ? {
+                profiles: applyThemeProfileMigrationEdits(migration.profiles, activeThemeEdits, legacyProfileIds),
+                legacyProfileIds,
+            } : undefined;
+            const rememberedSelectionAfterMigration = usesAccountThemeLegacyProfiles && rememberedTheme && theme
+                ? {
+                    themePreference: rememberedTheme.themePreference,
+                    themeProfiles: {
+                        profiles: [],
+                        activeProfileIds: resolveRememberedProfileSelection(
+                            rememberedTheme,
+                            theme.profiles,
+                            theme.legacyProfileIds,
+                        ),
+                    },
+                }
+                : null;
+            const latestPendingSettings = loadPendingSettingsForCapturedScope();
+            const hasPendingThemeSelection = Object.prototype.hasOwnProperty.call(
+                pendingServerSettings, 'appearanceThemeSelectionV1',
+            ) || Object.prototype.hasOwnProperty.call(latestPendingSettings, 'appearanceThemeSelectionV1');
+            const pendingThemeSelection = Object.prototype.hasOwnProperty.call(
+                latestPendingSettings, 'appearanceThemeSelectionV1',
+            ) ? latestPendingSettings.appearanceThemeSelectionV1 : pendingServerSettings.appearanceThemeSelectionV1;
+            const localSelectionToBackfill = shouldBackfillThemeSelection && !rememberedTheme && !hasPendingThemeSelection
+                ? (() => {
+                    const local = loadLocalSettings();
+                    if (isUnsetDeviceThemeSelection(local)) return null;
+                    const localSelection = {
+                        themePreference: local.themePreference,
+                        themeProfiles: {
+                            profiles: [],
+                            activeProfileIds: resolveThemeProfileSelection(
+                                local.themeProfileSelection,
+                                local.themeProfiles,
+                                theme?.legacyProfileIds ?? new Map(),
+                            ),
+                        },
+                    };
+                    const profileLibrary = theme?.profiles
+                        ?? pendingServerSettings.themeProfiles
+                        ?? ThemeProfileLibrarySchema.parse(baseline.raw?.themeProfiles);
+                    return buildAccountThemeSelection({
+                        themePreference: local.themePreference,
+                        themeProfiles: {
+                            profiles: [],
+                            activeProfileIds: resolveRememberedProfileSelection(
+                                localSelection,
+                                profileLibrary,
+                                new Map(),
+                            ),
+                        },
+                    });
+                })()
+                : null;
+            const themeSelectionToWrite = hasPendingThemeSelection
+                ? pendingThemeSelection
+                : rememberedSelectionAfterMigration ?? localSelectionToBackfill;
+            const hasThemeSelectionToWrite = hasPendingThemeSelection
+                || rememberedSelectionAfterMigration !== null
+                || localSelectionToBackfill !== null;
+            const pendingWithMigration: Partial<Settings> = {
+                ...pendingServerSettings,
+                ...(theme ? { themeProfiles: theme.profiles } : {}),
+                ...(hasThemeSelectionToWrite && themeSelectionToWrite !== undefined
+                    ? { appearanceThemeSelectionV1: themeSelectionToWrite } : {}),
+            };
             const merged = mergePendingSettingsIntoRawBaseline({
                 rawBaseline: baseline.raw,
-                pendingSettings: pendingServerSettings,
+                pendingSettings: pendingWithMigration,
                 normalizeForPersistedStorage: (raw) => normalizeSettingsForServerStorageResult({ raw, mode: accountMode }),
             });
 
             if (!baseline.serverIdentityKeysChanged && !merged.comparisonChanged && areAccountSettingsRawObjectsEqual(merged.comparisonRaw, merged.outgoingRaw)) {
-                const remainingPendingSettings = clearCommittedPendingSettings(pendingServerSettings);
+                const remainingPendingSettings = clearCommittedPendingSettings(pendingServerSettings, theme);
                 dbgSettings('syncSettings: pending merge produced no server change; skipped POST', {
                     endpoint: activeServerUrl,
                     serverVersion: version,
@@ -554,10 +799,28 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
                     version,
                     remainingPendingSettings,
                 });
+                completeThemeProfileMigration(theme, remainingPendingSettings);
+                applyRememberedThemeSelection(baseline.raw, theme?.legacyProfileIds ?? new Map());
                 return;
             }
 
             const { content, v1Settings } = createSettingsContentForWrite(merged.outgoingRaw);
+            if (theme && settingsScope) {
+                const current = loadPendingAccountSettingsState(settingsScope);
+                const latestPending = loadPendingSettingsForCapturedScope();
+                const queued = { ...latestPending, themeProfiles: latestPending.themeProfiles ?? theme.profiles };
+                const accountIds = new Set(ThemeProfileLibrarySchema.parse(baseline.raw?.themeProfiles).map(profile => profile.id));
+                const represented = new Map([...theme.legacyProfileIds].filter(([, id]) => accountIds.has(id)));
+                const migrationIntent = current.themeProfileMigration;
+                savePendingAccountSettings(settingsScope, queued, {
+                    ...(migrationIntent ?? { edits: activeThemeEdits,
+                        legacyProfileIds: Object.fromEntries([...theme.legacyProfileIds].filter(([id]) => !represented.has(id))),
+                        representedLegacyProfileIds: Object.fromEntries(represented) }),
+                    attemptedLegacyProfileIds: Object.fromEntries(theme.legacyProfileIds),
+                });
+                // Ordinary pending flushes must retain this same record while the POST is in flight.
+                clearPendingSettings(queued);
+            }
             dbgSettings('syncSettings: POST attempt', {
                 endpoint: activeServerUrl,
                 attempt: retryCount + 1,
@@ -573,7 +836,7 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
             }
 
             if (data.success) {
-                const remainingPendingSettings = clearCommittedPendingSettings(pendingServerSettings);
+                const remainingPendingSettings = clearCommittedPendingSettings(pendingServerSettings, theme);
                 dbgSettings('syncSettings: POST success; pending cleared', {
                     endpoint: activeServerUrl,
                     expectedVersion: version,
@@ -584,6 +847,8 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
                     version: data.version,
                     remainingPendingSettings,
                 });
+                completeThemeProfileMigration(theme, remainingPendingSettings);
+                applyRememberedThemeSelection(merged.outgoingRaw, theme?.legacyProfileIds ?? new Map());
                 return;
             }
 
@@ -626,9 +891,8 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         throw new Error(`Settings sync failed after ${maxRetries} retries due to version conflicts${mismatchHint}`);
     }
 
-    const fetched = await fetchAccountSettingsBaseline();
+    const fetched = initialBaseline;
     const decryptedSettings = fetched.raw;
-    await maybeImportLegacySessionOrganization(decryptedSettings);
 
     const parsedSettings = decryptedSettings
         ? normalizeSettingsForLocalStorage({ raw: decryptedSettings, mode: accountMode })
@@ -665,16 +929,16 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         version: fetched.version,
         remainingPendingSettings: pendingLatest,
     });
+    applyRememberedThemeSelection(decryptedSettings, new Map());
 
     // Best-effort migration: if settings were readable but not in canonical `account_scoped_v1` format,
     // rewrite them so other clients can decrypt them reliably.
     if (decryptedSettings && fetched.api === 'v2') {
         const ciphertext = fetched.content?.t === 'encrypted' ? String(fetched.content.c ?? '') : '';
-        const machineKey = encryption.getContentPrivateKey();
         const opened = accountMode === 'e2ee' && fetched.content?.t === 'encrypted' && ciphertext
             ? openAccountScopedBlobCiphertext({
                   kind: 'account_settings',
-                  material: { type: 'dataKey', machineKey },
+                  material: { type: 'dataKey', machineKey: encryption.getContentPrivateKey() },
                   ciphertext,
               })
             : null;
@@ -771,6 +1035,8 @@ export function applySettingsLocalDelta(params: {
     setPendingSettings: (next: Partial<Settings>) => void;
     schedulePendingSettingsFlush: () => void;
     source?: SettingsAnalyticsSource;
+    durability?: 'immediate';
+    themeProfileMigration?: ThemeProfileMigrationIntent;
 }): void {
     const { settingsSecretsKey, getPendingSettings, setPendingSettings, schedulePendingSettingsFlush } = params;
     let { delta } = params;
@@ -797,7 +1063,7 @@ export function applySettingsLocalDelta(params: {
         }
         return true;
     });
-    if (!hasRealChange) {
+    if (!hasRealChange && params.durability !== 'immediate') {
         dbgSettings('applySettings skipped (no-op delta)', {
             delta: summarizeSettingsDelta(delta),
             base: summarizeSettings(currentSettings, { version: storage.getState().settingsVersion }),
@@ -822,6 +1088,28 @@ export function applySettingsLocalDelta(params: {
         });
     }
 
+    const deltaForServer = stripMigratedSessionOrganizationSettings(
+        stripLocalOnlyAccountSettings(delta) as Record<string, unknown>,
+    ) as Partial<Settings>;
+    const nextPending = { ...getPendingSettings(), ...deltaForServer };
+    if (Object.keys(deltaForServer).length > 0 && (params.durability === 'immediate' || params.themeProfileMigration)) {
+        const scope = storage.getState().settingsScope;
+        if (scope) {
+            const previous = loadPendingAccountSettingsState(scope).themeProfileMigration;
+            const intent = params.themeProfileMigration ? {
+                edits: mergeThemeProfileMigrationEdits(previous?.edits ?? [], params.themeProfileMigration.edits),
+                legacyProfileIds: previous?.acknowledged ? previous.legacyProfileIds : params.themeProfileMigration.legacyProfileIds,
+                representedLegacyProfileIds: params.themeProfileMigration.representedLegacyProfileIds ?? previous?.representedLegacyProfileIds,
+                attemptedLegacyProfileIds: previous?.attemptedLegacyProfileIds,
+                ...(previous?.acknowledged ? { acknowledged: true as const } : {}),
+            } : 'themeProfiles' in deltaForServer ? null : previous;
+            savePendingAccountSettings(scope, nextPending, intent);
+        } else {
+            if (params.themeProfileMigration) throw new Error('Theme migration requires an account settings scope');
+            savePendingSettings(nextPending);
+        }
+    }
+
     const nextSettings = applySettings(currentSettings, delta);
     emitAccountSettingChangedEvents({
         previousSettings: currentSettings,
@@ -830,9 +1118,6 @@ export function applySettingsLocalDelta(params: {
     });
     storage.getState().applySettingsLocal(delta);
 
-    const deltaForServer = stripMigratedSessionOrganizationSettings(
-        stripLocalOnlyAccountSettings(delta) as Record<string, unknown>,
-    ) as Partial<Settings>;
     if (Object.keys(deltaForServer).length === 0) {
         dbgSettings('applySettings: local-only delta (no pending sync)', {
             delta: summarizeSettingsDelta(delta),
@@ -841,7 +1126,6 @@ export function applySettingsLocalDelta(params: {
     }
 
     // Save pending settings
-    const nextPending = { ...getPendingSettings(), ...deltaForServer };
     setPendingSettings(nextPending);
     dbgSettings('applySettings: pendingSettings updated', {
         pendingKeys: Object.keys(nextPending).sort(),

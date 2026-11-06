@@ -1,7 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Happier",
-  "version": "0.2.15",
+  "mainBinaryName": "happier-desktop",
+  "version": "0.2.21",
   "identifier": "dev.happier.app",
   "build": {
     "frontendDist": "../dist",
@@ -37,6 +38,10 @@
     ]
   },
   "bundle": {
+    "category": "DeveloperTool",
+    "publisher": "Happier",
+    "shortDescription": "A cross-device companion for coding agents",
+    "longDescription": "Monitor, steer, approve, review, and continue coding agent sessions across your computers, phone, and browser.",
     "active": true,
     "createUpdaterArtifacts": false,
     "targets": "all",
@@ -53,6 +58,7 @@
     ],
     "macOS": {
       "minimumSystemVersion": "13.0",
+      "entitlements": "../../../scripts/pipeline/release/bun-standalone.entitlements.plist",
       "dmg": {
         "background": "./dmg/dmg-background.png",
         "windowSize": {
@@ -71,6 +77,13 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "happier"
+        ]
+      }
+    },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFCRTk2MjE4RjNCMEYxRUYKUldUdjhiRHpHR0xwcTFIUjMvb1FBbW5HOUFYSkd5aGlHa204MWZuRk50ekF5WVZQdU1mVkRWWnkK",
       "endpoints": [

@@ -295,6 +295,7 @@ const acpCatalogTranslationExtension = {
     acpCatalogAuthParser: 'Parser dello stato',
     acpCatalogCapabilities: 'Funzionalità',
     acpCatalogTransportProfile: 'Profilo di trasporto',
+    acpCatalogSupportsLoadSession: 'Supporta la ripresa delle sessioni',
     acpCatalogSupportsModes: 'Supporta modalità',
     acpCatalogSupportsModels: 'Supporta modelli',
     acpCatalogSupportsConfigOptions: 'Supporta opzioni di configurazione',
@@ -479,6 +480,15 @@ const promptLibraryUxRefinementTranslationExtension = {
 
 const sessionHandoffTranslationExtensions = {
   it: {
+    transferSessionData: {
+      title: "Trasferisci i dati della sessione",
+      subtitle: "Copia la cronologia della conversazione di questa sessione sull’altro computer. Disattiva se è già presente.",
+      checking: "Verifica del supporto su entrambi i computer…",
+      agentRequiresTransfer: "Questo Agente richiede il trasferimento dei dati della sessione tra computer.",
+      updateRequired: "Aggiorna Happier su entrambi i computer per disattivare questa opzione.",
+      sessionMissing: "La cronologia di questa sessione non è sul computer di destinazione. Attiva «Trasferisci i dati della sessione» e riprova.",
+      workspaceRequiresTransfer: "Attiva «Trasferisci i dati della sessione» per copiare o sincronizzare i file dell’area di lavoro.",
+    },
     activeWarning: {
       title: 'Questa sessione è ancora in esecuzione qui',
       message: 'Il trasferimento fermerà questa sessione su questa macchina prima di trasferirla alla macchina selezionata.',
@@ -615,7 +625,8 @@ export const it: TranslationStructure = {
         commands: {
             composerAbortConfirm: 'Conferma interruzione',
             composerFocus: 'Metti a fuoco il compositore',
-            composerSendImmediate: 'Invia subito',
+            composerSendImmediate: 'Invio alternativo (coda / indirizza)',
+            composerSendInterrupt: 'Interrompi e invia',
             composerSendPending: 'Invia alla coda in sospeso',
             commandPaletteOpen: 'Apri palette comandi',
             modeCycle: 'Cambia modalità',
@@ -651,6 +662,14 @@ export const it: TranslationStructure = {
   },
 
   transcript: {
+
+    quote: {
+
+      action: 'Cita',
+
+      actionA11y: 'Cita il testo selezionato nel tuo messaggio',
+
+    },
 
     selection: {
 
@@ -1151,6 +1170,15 @@ export const it: TranslationStructure = {
   },
 
   appCrash: {
+      saveDiagnostics: "Salva diagnostica",
+      diagnosticsSaveFailed: "Impossibile salvare la diagnostica. I dettagli dell’errore sono ancora disponibili. Riprova o copiali.",
+    copyFailed: "Impossibile copiare i dettagli del crash. Riprova.",
+    discardFailed: "Impossibile eliminare il crash salvato. Riprova.",
+    restartWithoutReport: "Riavvia senza salvare",
+    reportSaveFailed: "Impossibile salvare i dettagli del crash. Copiali prima di riavviare oppure riprova la segnalazione.",
+    savedReportNotice: "Il crash salvato è mostrato qui sotto. Controllalo e modificalo prima di inviarlo. Resta su questo dispositivo fino all’invio o all’eliminazione.",
+    discardSavedReport: "Elimina il crash salvato",
+    stackTruncated: "Stack abbreviato per questo campo. Il crash completo resta salvato su questo dispositivo.",
     title: "Qualcosa è andato storto",
     subtitle:
       "Happier ha riscontrato un errore imprevisto. Puoi riavviare l'interfaccia dell'app o copiare i dettagli per l'assistenza.",
@@ -1185,6 +1213,10 @@ export const it: TranslationStructure = {
     moreActionsHint: "Apre un menu con altre azioni",
     cancel: "Annulla",
     close: "Chiudi",
+    minimizeWindow: "Riduci a icona la finestra",
+    maximizeWindow: "Ingrandisci la finestra",
+    restoreWindow: "Ripristina la finestra",
+    closeWindow: "Chiudi la finestra",
     dismissKeyboard: 'Nascondi tastiera',
       open: "Apri",
       done: "Fatto",
@@ -1328,8 +1360,8 @@ export const it: TranslationStructure = {
       anthropic: "Anthropic (Predefinito)",
       deepseek: "DeepSeek (Ragionamento)",
       zai: "Z.AI (GLM-4.6)",
-      minimax: "MiniMax (M3)",
-      minimaxCn: "MiniMax (M3, CN)",
+      minimax: "MiniMax (M3.1 Flash)",
+      minimaxCn: "MiniMax (M3.1 Flash, CN)",
       codex: "Codex (Predefinito)",
       openai: "OpenAI (GPT-5)",
       azureOpenai: "Azure OpenAI",
@@ -1470,6 +1502,13 @@ export const it: TranslationStructure = {
         bypassPermissions: "Salta tutti i permessi",
       },
     },
+    defaultBackend: {
+        title: 'Backend IA predefinito',
+        footer: 'Avvia le nuove sessioni su questo backend quando il profilo è selezionato e non viene scelto un altro backend.',
+        noneTitle: 'Nessun predefinito',
+        noneSubtitle: 'Happier sceglie il backend come di consueto.',
+        selectedSubtitle: 'Usato all\'avvio di una sessione con questo profilo.',
+    },
     defaultPermissions: {
       title: "Permessi predefiniti",
       footer:
@@ -1504,6 +1543,7 @@ export const it: TranslationStructure = {
       agySubtitleExperimental: "CLI Antigravity (sperimentale)",
       fxSubtitleExperimental: "FX CLI (sperimentale)",
       droidSubtitleExperimental: "Factory Droid CLI (sperimentale)",
+      codebuddySubtitleExperimental: "CodeBuddy Code CLI (sperimentale)",
       customAcpSubtitleExperimental: "CLI ACP personalizzata (sperimentale)",
       grokSubtitleExperimental: "Grok Build CLI (sperimentale)",
       piSubtitleExperimental: "Pi CLI (sperimentale)",
@@ -1638,6 +1678,7 @@ export const it: TranslationStructure = {
     working: "al lavoro...",
     workingRetained: "al lavoro, in attesa di aggiornamenti…",
     keptInAttention: "mantenuta in attenzione",
+    archiving: "archiviazione…",
     backgroundActive: ({ count }: { count: number }) => `${count} in esecuzione in background`,
     activityUnknown: "stato dell'attività non disponibile",
     readyForReview: "pronto per la revisione",
@@ -1744,6 +1785,8 @@ export const it: TranslationStructure = {
     secretKeyPlaceholder: "XXXXX-XXXXX-XXXXX...",
     linkNewDeviceTitle: "Collega nuovo dispositivo",
     linkNewDeviceSubtitle: "Scansiona il codice QR mostrato sul nuovo dispositivo per collegarlo a questo account",
+    pairingConnectionWarningTitle: "Server disconnesso",
+    pairingConnectionWarningBody: "Per associare un dispositivo, il server deve essere raggiungibile. Controlla la connessione o scansiona un codice per un altro server.",
     linkNewDeviceQrInstructions: "Apri Happier sul nuovo dispositivo e mostra il codice QR",
     scanQrCodeOnDevice: "Scansiona codice QR",
     unsupported: {
@@ -1756,7 +1799,39 @@ export const it: TranslationStructure = {
   },
 
   bugReports: {
+    reportSession: "Segnala un problema con questa sessione",
+    sessionPickerTitle: "Sessione correlata",
+    sessionPickerSubtitle: "Scegli la sessione a cui si riferisce questa segnalazione.",
+    sessionPickerSearchPlaceholder: "Cerca sessioni",
+    sessionPickerNoResults: "Nessuna sessione corrispondente",
+    noRelatedSession: "Nessuna sessione correlata",
     composer: {
+      scopeChanged: "L’account selezionato è cambiato. Scegli di nuovo la sessione prima di allegare i dati diagnostici.",
+      addMoreDetails: "Aggiungi altri dettagli (facoltativo)",
+      technicalInformation: "Informazioni tecniche",
+      relatedSession: "Sessione correlata (facoltativa)",
+      chooseSession: "Scegli una sessione",
+      changeSession: "Cambia sessione",
+      removeSession: "Rimuovi sessione",
+      selectedSession: "Sessione selezionata",
+      logOptions: {
+        daemonTitle: "Log dell’app e del daemon",
+        daemonDetail: "Attività dell’app e log di connessione dal computer e dal server selezionati.",
+        sessionTitle: "Log della sessione Happier",
+        sessionDetail: "Attività della sessione che ci aiuta a indagare sul problema.",
+        providerTitle: "Trascrizione del provider",
+        providerDetail: "Trascrizione della sessione del provider, quando serve.",
+        technicalOnly: "Solo informazioni tecniche",
+        technicalOnlyDetail: "Escludi tutti i log grezzi da questa segnalazione.",
+      },
+      collection: {
+        collected: "Allegati",
+        unavailable: "Non disponibili",
+        disabled: "Non inclusi",
+        unsupported: "Aggiorna la CLI per allegare questi log",
+        skipped: "Ignorati",
+        error: "Impossibile raccogliere",
+      },
       alerts: {
         previewUnavailableTitle: "Anteprima non disponibile",
         previewUnavailableBody: "Impossibile creare l’anteprima della diagnostica.",
@@ -1819,15 +1894,14 @@ export const it: TranslationStructure = {
       },
       issueDetails: {
         title: "Descrivi il problema",
-        subtitle:
-          "Fornisci abbastanza dettagli per consentirci di riprodurre e diagnosticare rapidamente.",
+        subtitle: "Per iniziare bastano un titolo e una breve descrizione.",
         titleLabel: "Titolo (obbligatorio)",
         titlePlaceholder: "Titolo breve",
         githubUsernameLabel: "Username GitHub (opzionale)",
         githubUsernamePlaceholder:
           "Usato come contatto nel corpo dell’issue",
-        summaryLabel: "Riepilogo conciso (obbligatorio)",
-        summaryPlaceholder: "Riepilogo in un paragrafo",
+        summaryLabel: "Cos’è successo? (obbligatorio)",
+        summaryPlaceholder: "Raccontaci cosa è andato storto.",
         currentBehaviorLabel: "Comportamento attuale (opzionale)",
         currentBehaviorPlaceholder: "Cosa succede davvero?",
         expectedBehaviorLabel: "Comportamento previsto (opzionale)",
@@ -1886,11 +1960,9 @@ export const it: TranslationStructure = {
         },
       },
       consent: {
-        title: "Consenso",
-        understandTitle:
-          "Capisco che la diagnostica può includere metadati tecnici",
-        understandSubtitle:
-          "Non includere password, token di accesso o chiavi private.",
+        title: "Prima di inviare",
+        understandTitle: "Condividi questa segnalazione e i dati diagnostici selezionati",
+        understandSubtitle: "Il testo della segnalazione è pubblico. Gli allegati diagnostici vengono inviati privatamente ai manutentori di Happier. I log della sessione possono includere estratti delle conversazioni.",
       },
       submit: {
         requiredFieldsHint:
@@ -2819,6 +2891,19 @@ export const it: TranslationStructure = {
   },
 
   connectedServices: {
+    importAccounts: {
+        unknownResult: "Il risultato dell’importazione è sconosciuto. Aggiorna l’elenco degli account e verifica questo profilo prima di riprovare.",
+        title: "Importa un accesso esistente",
+        failed: "Impossibile importare l’accesso. Verifica di aver effettuato l’accesso sul computer selezionato, poi riprova.",
+        actionDescription: "Copia un accesso da una delle tue macchine",
+        description: "Copia l’accesso nel profilo crittografato. I token di rinnovo condivisi possono cambiare e l’app locale potrebbe richiedere un nuovo accesso.",
+        unsupported: "Importazione non disponibile. Scegli un’altra macchina o aggiorna la sua CLI.",
+        credentialsUnavailable: "Nessun accesso utilizzabile. Accedi nell’app locale e riprova.",
+        profileConflict: "Il profilo appartiene a un altro account o è cambiato durante l’importazione. Scegli un nuovo nome.",
+        reauthorizationRequired: "Accedi di nuovo nell’app locale e riprova.",
+        imported: "Accesso importato",
+        refreshFailed: "L’accesso è stato importato, ma l’elenco degli account non si è aggiornato. Riapri i servizi connessi.",
+    },
       subscription: {
           title: "Abbonamento",
           currentPeriod: "Periodo attuale",
@@ -2848,6 +2933,7 @@ export const it: TranslationStructure = {
       openai: "Chiave API OpenAI",
       anthropic: "Chiave API Anthropic",
       gemini: "Gemini di Google",
+      antigravity: 'Google Antigravity',
       github: "GitHub",
     },
     title: "Servizi connessi",
@@ -2870,6 +2956,7 @@ export const it: TranslationStructure = {
                 profileMissing: 'L’account connesso selezionato non è più disponibile. Aggiorna l’elenco degli account e scegline un altro.',
                 groupMissing: 'Il Pool di account selezionato non è più disponibile. Aggiorna l’elenco degli account e scegli un altro Pool.',
                 metadataUpdateFailed: 'La sessione non ha potuto salvare la nuova selezione di autenticazione. Riprova dopo il completamento della sincronizzazione.',
+                restartDisallowedByExecutionPolicy: 'Questa modifica dell’autenticazione richiede un riavvio non consentito mentre la sessione è in esecuzione. Arresta la sessione prima di modificarne l’autenticazione.',
                 restartFailed: 'Non è stato possibile riavviare la sessione con la nuova selezione di autenticazione. Arresta la sessione e riprova.',
                 hotApplyFailed: 'La sessione in esecuzione ha rifiutato la nuova selezione di autenticazione. Riavvia la sessione e riprova.',
                 agentMismatch: 'Questa selezione di autenticazione non corrisponde al backend della sessione.',
@@ -3051,6 +3138,7 @@ export const it: TranslationStructure = {
       },
     },
     quota: {
+      refreshing: "Aggiornamento dell’utilizzo…",
       loading: "Caricamento…",
       error: ({ message }: { message: string }) => `Errore: ${message}`,
       lastUpdated: ({ time }: { time: string }) =>
@@ -3098,6 +3186,21 @@ export const it: TranslationStructure = {
       resets: {
         use: "Usa",
         available: "Ripristino disponibile",
+        remainingCount: ({ count }: { count: number }) => `Ripristini salvati: ${count}`,
+        appliesTo: ({ limits }: { limits: string }) => `Si applica a: ${limits}`,
+        fiveHourLimit: "Limite di 5 ore",
+        weeklyLimit: "Limite settimanale",
+        unavailableReasons: {
+          paused: "In pausa",
+          cooldown: "In attesa del periodo di recupero",
+          ineligible: "Non idoneo",
+          not_selected: "Non selezionato",
+          provider_unavailable: "Provider non disponibile",
+          not_started: "Non ancora iniziato",
+          expired: "Scaduto",
+          consumed: "Già usato",
+          unknown: "Al momento non disponibile",
+        },
         rowLabel: ({ date, countdown }: { date: string; countdown: string }) => `Scade ${date} · ${countdown}`,
         now: "ora",
         inDays: ({ days }: { days: number }) => `tra ${days}g`,
@@ -3119,6 +3222,12 @@ export const it: TranslationStructure = {
       pasteRedirectUrlPromptBody:
         "Dopo aver completato OAuth, copia l’URL finale reindirizzato dalla barra degli indirizzi del browser e incollalo qui.",
       providerOverrides: {
+        antigravity: {
+          connectWebDescription: "Passaggio successivo: accedi con Google. Antigravity mostra un codice di autorizzazione da copiare.",
+          pasteRedirectUrlPromptBody: "1) Accedi con Google. 2) Copia il codice di autorizzazione mostrato su antigravity.google. 3) Incollalo qui sotto mantenendo aperto questo accesso.",
+          pasteRedirectUrlPlaceholder: "Incolla il codice di autorizzazione Antigravity",
+          pasteRedirectUrlTitle: "Incolla codice di autorizzazione",
+        },
         claudeSubscription: {
           connectWebDescription:
             "Passaggio successivo: accedi nella pagina che si apre. Claude potrebbe mostrare una stringa di codice invece di reindirizzare automaticamente.",
@@ -3204,6 +3313,7 @@ export const it: TranslationStructure = {
       addOauthProfileDeviceTitle: "Aggiungi con auth dispositivo",
       addOauthProfileDeviceSubtitle: "Consigliato per web/ambienti remoti",
       addOauthProfilePasteTitle: "Aggiungi con incolla reindirizzamento",
+      signInWithGoogle: 'Accedi con Google',
       addOauthProfilePasteSubtitle: "Flusso manuale di copia/incolla URL di reindirizzamento",
       addOauthProfileBrowserTitle: "Aggiungi con browser in-app",
       addOauthProfileBrowserSubtitle: "Usa un browser incorporato dove supportato",
@@ -3248,6 +3358,7 @@ export const it: TranslationStructure = {
       errors: {
         credentialReferencedByGroup: "Questo account è ancora usato da un Pool di account. Rimuovilo dal Pool e riprova.",
         credentialNotFound: "Questo account connesso è già stato rimosso.",
+        serviceUnsupportedServer: 'Questo relay non supporta questo servizio connesso. Aggiorna il relay per collegarlo.',
         credentialRequestFailed: "La richiesta dell'account connesso non è riuscita. Aggiorna i servizi connessi e riprova.",
         groupRequestFailed: "La richiesta del Pool di account non è riuscita. Aggiorna i servizi connessi e riprova.",
         generationConflict: "Questo Pool di account è cambiato prima del completamento dell'azione. Aggiorna i servizi connessi e riprova.",
@@ -3287,6 +3398,7 @@ export const it: TranslationStructure = {
         autoFallbackDisabled: "Fallback automatico disattivato",
         strategyPriority: "Ordine di priorità",
         strategyLeastLimited: "Meno limitato per primo",
+        strategyExpiryFirst: "Prima la quota in scadenza",
         strategyManual: "Cambio manuale",
         priority: ({ priority }: { priority: string }) => `Priorità ${priority}`,
         statusReady: "Pronto",
@@ -3375,6 +3487,7 @@ export const it: TranslationStructure = {
         strategyPrioritySubtitle: "Prova prima i numeri di priorità più bassi.",
         strategyLeastLimitedTitle: "Meno limitato prima",
         strategyLeastLimitedSubtitle: "Preferisci il membro con più quota utilizzabile.",
+        strategyExpiryFirstSubtitle: "Preferisci la quota utilizzabile che si ripristina o scade prima, mantenendo un margine sufficiente.",
         strategyManualTitle: "Cambio manuale",
         strategyManualSubtitle: "Usa solo il membro attivo finché non viene cambiato manualmente.",
         softSwitchThresholdTitle: "Soglia di cambio leggero",
@@ -3815,6 +3928,10 @@ export const it: TranslationStructure = {
   },
 
   settingsDesktop: {
+    nativeTitleBarTitle: 'Usa la barra del titolo di Windows',
+    nativeTitleBarSubtitle: 'Mostra la cornice e i controlli della finestra standard di Windows.',
+    nativeTitleBarChangeFailed: 'Impossibile modificare la barra del titolo. Riprova.',
+    nativeTitleBarPersistenceFailed: 'Impossibile caricare o salvare la preferenza della barra del titolo. Modificala di nuovo per riprovare.',
     title: 'Scrivania',
     footer: 'Controlla come si comporta Happier su questo computer.',
     backgroundServiceTitle: 'Restare raggiungibile in background',
@@ -3839,9 +3956,9 @@ export const it: TranslationStructure = {
     trayIncomplete: 'Alcuni servizi in background non sono stati letti',
     trayNoServices: 'Questo computer non è ancora configurato',
     trayWorking: 'In corso…',
-    trayStopConfirmTitle: ({ relay }: { relay: string }) => `Arrestare il servizio in background per ${relay}?`,
+    trayStopConfirmTitle: ({ relay }: { relay: string }) => `Arrestare il servizio in background di Happier per ${relay}?`,
     trayStopConfirmBody: ({ relay }: { relay: string }) => `Le sessioni degli agenti in esecuzione su questo computer per ${relay} termineranno, e telefono e browser non potranno raggiungerlo lì finché non si riavvia.`,
-    trayStopAllConfirmTitle: 'Arrestare i servizi in background e uscire?',
+    trayStopAllConfirmTitle: 'Arrestare i servizi in background di Happier e uscire?',
     trayStopAllConfirmBody: 'Le sessioni degli agenti in esecuzione su questo computer termineranno, e telefono e browser non potranno raggiungerlo finché non riapri Happier.',
     trayStopConfirmAction: 'Arresta',
     trayActionFailedTitle: 'Non è andato a buon fine',
@@ -3937,6 +4054,8 @@ export const it: TranslationStructure = {
   },
 
   settingsNotifications: {
+        mutePhoneWhenComputerFocusedTitle: "Silenzia il telefono quando il computer è attivo",
+        mutePhoneWhenComputerFocusedSubtitle: "Silenzia le notifiche Pronto e le richieste mentre una finestra di Happier su un computer ha il focus. Riprendono quando nessuna finestra su computer ha il focus.",
     badges: {
       title: "Badge su questo dispositivo",
       footer:
@@ -4030,6 +4149,17 @@ export const it: TranslationStructure = {
         openSettingsFailed: 'Impossibile aprire le impostazioni di sistema.',
     },
     pushTroubleshooting: {
+            remoteTest: {
+                title: "Invia un test remoto",
+                subtitle: "Invia una vera notifica push a questo telefono tramite una macchina connessa a questa Home.",
+                notRegistered: "Registra il token di questo telefono, poi riprova.",
+                noMachine: "Connetti una macchina a questa Home per inviare un test remoto.",
+                accepted: "Il servizio push ha accettato il test. Questo non conferma che il telefono l’abbia ricevuto o mostrato. Controlla le notifiche.",
+                rejected: "Il servizio push non ha confermato l’accettazione. Controlla le notifiche e la registrazione prima di riprovare.",
+                invalidCredentials: "Il provider push ha rifiutato le credenziali di questa app. Controlla la configurazione APNs o FCM.",
+                unsupported: "Aggiorna la CLI Happier della macchina connessa per inviare test remoti.",
+                unconfirmed: "Non è stato possibile confermare il risultato. La richiesta potrebbe ancora completarsi; controlla le notifiche prima di riprovare.",
+            },
       status: {
         title: "Stato",
         footer: "Controlla l’impostazione dell’account, il permesso del sistema e la registrazione sul server.",
@@ -4173,7 +4303,12 @@ export const it: TranslationStructure = {
   },
 
     notifications: {
+        permissionActionNeedsReview: "Non è stato possibile confermare la risposta inviata dalla notifica. Controlla le richieste in sospeso prima di rispondere di nuovo.",
+        permissionActionReviewUnavailable: "Impossibile aprire l’Home e l’account di questa risposta. Controlla la connessione e l’accesso nelle impostazioni, poi le richieste in sospeso.",
       actions: {
+            reviewPendingRequests: "Controlla le richieste in sospeso",
+            questionReply: "Rispondi",
+            questionPlaceholder: "La tua risposta",
         allow: 'Consenti',
         deny: 'Nega',
         answer: 'Rispondi',
@@ -4370,6 +4505,11 @@ export const it: TranslationStructure = {
       plugins: {
             claude: {
                 title: "Claude Code",
+                responseLocationOptions: {
+                    app_and_terminal: { title: "App e terminale", subtitle: "Rispondi nell’app Happier o nel terminale Claude Code." },
+                    app_only: { title: "Richieste nell’app", subtitle: "Usa il flusso di richieste esistente nell’app. Claude potrebbe continuare ad accettare risposte nel suo terminale." },
+                    terminal_only: { title: "Solo terminale", subtitle: "Rispondi nel terminale Claude Code." },
+                },
                 sections: {
                     claudeModelDiscovery: {
                         title: "Rilevamento dei modelli",
@@ -4382,6 +4522,10 @@ export const it: TranslationStructure = {
                     claudeCodeExperiments: {
                         title: "Esperimenti di Claude Code",
                         footer: "Queste impostazioni si applicano sia alle sessioni Claude locali (terminale) sia a quelle remote (Agent SDK) avviate da Happier."
+                    },
+                    claudeIdleReclaim: {
+                        title: "Sessioni inattive",
+                        footer: "Il prossimo prompt riprende la stessa sessione Claude e potrebbe richiedere un po’ più di tempo. Lo stato in memoria viene liberato. Attività in background, lavoro pianificato e checkpoint dei file la mantengono attiva. Le sessioni del terminale unificato restano attive."
                     },
                     claudeRemoteSdk: {
                         title: "Runtime classico (fallback Agent SDK)",
@@ -4414,6 +4558,14 @@ export const it: TranslationStructure = {
                                 subtitle: "Usa l'host zellij incluso con Happier."
                             }
                         }
+                    },
+                    claudeUnifiedTerminalQuestionResponseLocation: {
+                        title: "Rispondi alle domande",
+                        subtitle: "Scegli dove rispondere alle domande durante le sessioni del terminale unificato."
+                    },
+                    claudeUnifiedTerminalPermissionResponseLocation: {
+                        title: "Approva le richieste di autorizzazione",
+                        subtitle: "Scegli dove approvare le richieste di autorizzazione durante le sessioni del terminale unificato."
                     },
                     claudeUnifiedTerminalResumeChoice: {
                         title: "Ripresa di sessioni grandi",
@@ -4451,9 +4603,21 @@ export const it: TranslationStructure = {
                             }
                         }
                     },
+                    claudeCodeIncludeInNativeHistory: {
+                        title: "Mostra le sessioni in Claude Code",
+                        subtitle: "Usa l’attribuzione Happier per le nuove sessioni Claude, incluse quelle Agent SDK. Disattivato mantiene le impostazioni predefinite."
+                    },
                     claudeCodeExperimentalAgentTeamsEnabled: {
                         title: "Forza l’attivazione di Agent Teams",
                         subtitle: "Abilita Agent Teams sperimentale di Claude Code (sciame di agenti) in tutte le sessioni Claude avviate da Happier."
+                    },
+                    claudeRemoteIdleReclaimEnabled: {
+                        title: "Libera i processi Claude inattivi",
+                        subtitle: "Libera memoria dopo un periodo di inattività. Disattivato per impostazione predefinita."
+                    },
+                    claudeRemoteIdleReclaimTimeoutMinutes: {
+                        title: "Durata dell’inattività (minuti)",
+                        subtitle: "Scegli per quanto tempo una sessione Claude remota con questa opzione attiva resta pronta."
                     },
                     claudeRemoteAgentSdkEnabled: {
                         title: "Usa fallback Agent SDK",
@@ -4513,7 +4677,7 @@ export const it: TranslationStructure = {
                     },
                     claudeLocalPermissionBridgeEnabled: {
                         title: "Sperimentale: bridge permessi locale",
-                        subtitle: "Inoltra le richieste di permesso della modalita locale di Claude a Happier per approvarle o rifiutarle dall’interfaccia."
+                        subtitle: "Inoltra a Happier le richieste di autorizzazione delle sessioni Claude locali classiche. Le sessioni del terminale unificato usano le opzioni di risposta sopra."
                     },
                     claudeLocalPermissionBridgeWaitIndefinitely: {
                         title: "Mantieni aperte le richieste finche non rispondi",
@@ -4639,6 +4803,7 @@ export const it: TranslationStructure = {
             agy: { title: 'Antigravity' },
             fx: { title: "FX" },
             droid: { title: "Factory Droid" },
+            codebuddy: { title: "CodeBuddy" },
             grok: {
                 title: "Grok Build"
             },
@@ -4663,6 +4828,16 @@ export const it: TranslationStructure = {
             },
           },
           fields: {
+            codexReasoningSummaries: {
+                title: "Riepiloghi del ragionamento",
+                footer: "Controlla se Codex genera riepiloghi, indipendentemente dalla visualizzazione nella conversazione. Si applica all’avvio o alla ripresa di una sessione. La disponibilità dipende dal modello.",
+                generation: "Generazione",
+                options: {
+                    default: "Usa la configurazione di Codex o il valore predefinito del modello.",
+                    enabled: "Richiedi riepiloghi quando il modello li supporta.",
+                    disabled: "Non generare riepiloghi del ragionamento.",
+                },
+            },
             codexBackendMode: {
               title: "Modalità di instradamento di Codex",
               subtitle: "Seleziona App Server, ACP o MCP.",
@@ -4698,6 +4873,8 @@ export const it: TranslationStructure = {
 
   settingsAppearance: {
     tabBarAppearance: {
+      sideRailTitle: "Schede nella barra laterale",
+      sideRailSubtitle: "Disattiva questa opzione per usare la barra delle schede di Happier e i suoi gesti di scorrimento.",
       title: 'Barra schede',
       footer: 'Personalizza la barra delle schede in basso.',
       showLabels: 'Mostra etichette schede',
@@ -4752,6 +4929,9 @@ export const it: TranslationStructure = {
       full: "Larghezza completa",
       fullDescription: "Usa la larghezza disponibile della finestra",
     },
+    feedback: "Risposta al tocco",
+    haptics: "Feedback aptico",
+    hapticsDescription: "Usa il feedback tattile per le azioni e il riordino su questo dispositivo.",
     backdropBlur: "Sfocatura sfondo",
     backdropBlurDescription:
       "Usa la sfocatura dello sfondo dietro modali e menu. Disattivala per migliorare le prestazioni del browser.",
@@ -4781,6 +4961,13 @@ export const it: TranslationStructure = {
     showLineNumbersInToolViews: "Mostra numeri di riga nelle viste strumenti",
     showLineNumbersInToolViewsDescription:
       "Mostra i numeri di riga nei diff delle viste strumenti",
+    chatCodeBlocks: {
+        title: 'Blocchi di codice della chat',
+        showWrapControls: 'Mostra i controlli di a capo',
+        showWrapControlsDescription: 'Mostra un pulsante di a capo su ogni blocco di codice della chat',
+        wrapByDefault: 'A capo automatico predefinito',
+        wrapByDefaultDescription: 'Manda a capo le righe lunghe nei blocchi di codice della chat, salvo scelta diversa per un blocco',
+    },
     wrapLinesInDiffs: "A capo nelle viste del codice",
     wrapLinesInDiffsDescription:
       "Manda a capo le righe lunghe nelle anteprime del codice e negli editor invece di scorrere orizzontalmente",
@@ -4804,6 +4991,51 @@ export const it: TranslationStructure = {
       labels: "Etichette",
       icons: "Solo icone",
     },
+    loadingIndicator: "Indicatore di caricamento",
+    loadingIndicatorStyle: "Stile",
+    loadingIndicatorDescription: "Come appaiono gli indicatori mentre il lavoro è in corso",
+    loadingIndicatorFooter: "Con Riduci movimento attivo, gli stili a punti restano fermi e sfumano dolcemente, e l'Anello classico smette di girare.",
+    loadingIndicatorOptions: {
+      wave: "Onda",
+      handwritten: "Scritto a mano",
+      buildAndRelease: "Costruisci e rilascia",
+      relay: "Staffetta",
+      twinStems: "Steli gemelli",
+      slowBreath: "Respiro lento",
+      starfield: "Campo stellare",
+      sweep: "Scansione",
+      radar: "Radar",
+      ripple: "Increspatura",
+      aurora: "Aurora",
+      hWave: "H · Onda",
+      hHandwritten: "H · Scritto a mano",
+      hBuildAndRelease: "H · Costruisci e rilascia",
+      hRelay: "H · Staffetta",
+      hTwinStems: "H · Steli gemelli",
+      hSlowBreath: "H · Respiro lento",
+      hStarfield: "H · Campo stellare",
+      hSweep: "H · Scansione",
+      hRadar: "H · Radar",
+      hRipple: "H · Increspatura",
+      hAurora: "H · Aurora",
+      classicRing: "Anello classico",
+    },
+    loadingIndicatorSpeed: "Velocità",
+    loadingIndicatorSpeedDescription: "Quanto velocemente la luce attraversa i punti",
+    loadingIndicatorSpeedOptions: {
+      slow: "Lenta",
+      normal: "Normale",
+      fast: "Veloce",
+    },
+    loadingIndicatorPause: "Pausa",
+    loadingIndicatorPauseDescription: "Quanto riposano i punti prima di ogni ciclo",
+    loadingIndicatorPauseOptions: {
+      none: "Nessuna",
+      short: "Breve",
+      long: "Lunga",
+    },
+    loadingIndicatorPauseUnavailable: "Questo stile si ripete senza pause.",
+    loadingIndicatorSpeedUnavailable: "L'anello classico gira al proprio ritmo fisso.",
     avatarStyle: "Stile avatar",
     avatarStyleDescription: "Scegli l'aspetto dell'avatar di sessione",
     avatarOptions: {
@@ -5025,6 +5257,10 @@ export const it: TranslationStructure = {
   },
 
   errors: {
+    quotaRefreshFailed: "Impossibile aggiornare l’utilizzo. Riprova.",
+    quotaRefreshRetryAt: ({ time }: { time: string }) => `Impossibile aggiornare l’utilizzo. Riprova dopo ${time}.`,
+    machineRpcDecryptionFailed: "Impossibile decifrare i dati di questa macchina. Accedi con la chiave dell’account corrispondente e riprova.",
+    machineRpcContextUnavailable: "La connessione a questa macchina non è disponibile. Aggiorna le macchine e riprova.",
     networkError: "Si è verificato un errore di rete",
     serverError: "Si è verificato un errore del server",
     unknownError: "Si è verificato un errore sconosciuto",
@@ -5182,6 +5418,8 @@ export const it: TranslationStructure = {
   },
 
   newSession: {
+    terminalHostUnavailableTitle: "Host del terminale non disponibile",
+    terminalHostUnavailableBody: ({ host }: { host: string }) => `Installa o aggiorna ${host} e riavvia il suo server su questa macchina, oppure scegli un altro host del terminale. La bozza viene conservata.`,
     ...newSessionMcpTranslationExtension,
     ...acpCatalogTranslationExtension.newSession,
     // Used by new-session screen and launch flows
@@ -5800,6 +6038,11 @@ export const it: TranslationStructure = {
             showBannerAction: 'Mostra banner',
             hideBannerAction: 'Nascondi banner',
 	    },
+	    runnerRestartBackgroundWork: {
+	        title: 'Lavoro in background in corso',
+	        body: ({ count }: { count: number }) => `È in corso del lavoro in background (${count}). Il riavvio lo interromperà.`,
+	        confirmAction: 'Interrompi e riavvia',
+	    },
 	    staleRunner: {
 	      title: "La sessione è ancora in esecuzione su una CLI precedente",
 	      body: "Riavvia il runner di questa sessione per continuare con la CLI del daemon aggiornata. La sessione Happier resta la stessa.",
@@ -6201,7 +6444,7 @@ export const it: TranslationStructure = {
         discarded: {
           title: "Messaggi scartati",
           subtitle:
-            "Questi messaggi non sono stati inviati all’agente (ad esempio passando da remoto a locale).",
+            "Questi messaggi non sono più in coda. La consegna potrebbe essere incerta; controlla la trascrizione prima di inviarli di nuovo.",
           label: "Scartato",
           removeConfirm: {
             title: "Rimuovere il messaggio scartato?",
@@ -6407,6 +6650,28 @@ export const it: TranslationStructure = {
     targetSession: "Sessione target",
     noTarget: "Nessuna sessione selezionata",
     clearTarget: "Cancella target",
+    errors: {
+        sendFailed: "Impossibile inviare il tuo messaggio alla sessione.",
+        sttFailed: "Impossibile trascrivere quello che hai detto. Riprova.",
+        sttTimeout: "Il riconoscimento vocale è scaduto. Controlla la connessione e riprova.",
+        sttAuthFailed: "Il riconoscimento vocale ha rifiutato la chiave API. Controlla la chiave e le sue restrizioni in Impostazioni → Voce.",
+        sttRateLimited: "Il riconoscimento vocale ha raggiunto il limite di richieste. Attendi un momento e riprova.",
+        missingSttBaseUrl: "Imposta l'URL del server di riconoscimento vocale in Impostazioni → Voce.",
+        missingSttApiKey: "Aggiungi una chiave API per il riconoscimento vocale in Impostazioni → Voce.",
+        recordingStartFailed: "Impossibile avviare il microfono. Verifica che nessun'altra app lo stia usando.",
+        recordingStopFailed: "Impossibile completare la registrazione. Riprova.",
+        deviceSttUnavailable: "Il riconoscimento vocale non è disponibile su questo dispositivo. Scegli un altro provider di riconoscimento vocale in Impostazioni → Voce.",
+        speechPermissionDenied: "L'accesso al microfono o al riconoscimento vocale è stato negato. Consentilo nelle impostazioni del dispositivo.",
+        deviceSttStartFailed: "Impossibile avviare il riconoscimento vocale. Riprova.",
+        localNeuralSttUnavailable: "Il riconoscimento vocale sul dispositivo non è disponibile in questa build. Scegli un altro provider di riconoscimento vocale in Impostazioni → Voce.",
+        localNeuralPackNotInstalled: "Scarica il modello vocale in Impostazioni → Voce.",
+        localNeuralSttStartFailed: "Impossibile avviare il riconoscimento vocale sul dispositivo. Riprova.",
+        localNeuralAudioCaptureFailed: "Il microfono si è interrotto inaspettatamente. Riprova.",
+        ttsFailed: "Impossibile riprodurre la risposta vocale. Controlla la sintesi vocale in Impostazioni → Voce.",
+        voiceAgentRequiresFeature: ({ feature }: { feature: string }) => `La modalità agente richiede di attivare «${feature}» in Impostazioni → Funzionalità.`,
+        voiceAgentUnavailable: "L'agente vocale non è disponibile su questo server.",
+        generic: "La voce ha riscontrato un problema.",
+    },
     a11y: {
       teleport: "Teletrasporta l’agente vocale",
       toggleActivity: "Mostra/nascondi attività vocale",
@@ -6742,6 +7007,17 @@ export const it: TranslationStructure = {
       presetName: 'Nome del preset', movePresetUp: 'Sposta in alto', movePresetDown: 'Sposta in basso',
       noPresets: 'Nessun preset salvato', noPresetsMessage: 'Salvane uno quando scegli un promemoria personalizzato.',
     },
+    appearance: {
+      setColor: 'Imposta colore',
+      customColor: 'Colore personalizzato…',
+      customColorTitle: 'Colore personalizzato',
+      customColorMessage: 'Scegli una tonalità o inserisci un valore esadecimale.',
+      invalidColor: 'Usa un valore esadecimale come #3A7BD5.',
+      removeColor: 'Rimuovi colore',
+      inheritedFromProject: 'Dal progetto',
+      customColorLabel: ({ hex }: { hex: string }) => `Colore personalizzato ${hex}`,
+      colors: { blue: 'Blu', green: 'Verde', orange: 'Arancione', yellow: 'Giallo', red: 'Rosso', indigo: 'Indaco', purple: 'Viola' },
+    },
     workingSectionTitle: 'In lavorazione',
     hideInactiveSessions: 'Nascondi sessioni inattive',
     showInactiveSessions: 'Mostra sessioni inattive',
@@ -6848,7 +7124,9 @@ export const it: TranslationStructure = {
     fxSessionId: "ID sessione FX",
     fxSessionIdCopied: "ID sessione FX copiato negli appunti",
     droidSessionId: "ID sessione Factory Droid",
+    codebuddySessionId: "ID sessione CodeBuddy",
     droidSessionIdCopied: "ID sessione Factory Droid copiato negli appunti",
+    codebuddySessionIdCopied: "ID sessione CodeBuddy copiato negli appunti",
     customAcpSessionId: "ID sessione ACP personalizzata",
     grokSessionId: "ID sessione Grok",
     grokSessionIdCopied: "ID sessione Grok copiato negli appunti",
@@ -6909,6 +7187,9 @@ export const it: TranslationStructure = {
     tmuxFallback: "Fallback tmux",
     copyMetadata: "Copia metadati",
     copyDebugInformation: "Copia informazioni",
+    sessionInformation: "Informazioni sulla sessione",
+    happierSessionId: "ID sessione Happier",
+    providerSessionId: ({ provider }: { provider: string }) => `ID sessione ${provider}`,
     debugInformationCopyLabel: "Informazioni",
     providerSessionLogs: ({ provider }: { provider: string }) => `Log sessione ${provider}`,
     agentState: "Stato agente",
@@ -6921,6 +7202,9 @@ export const it: TranslationStructure = {
     thinking: "Pensando",
     thinkingSince: "Pensando da",
     thinkingLevel: "Livello di pensiero",
+    peerReportFrom: ({ name }: { name: string }) => `Report di ${name}`,
+    peerMessageFrom: ({ name }: { name: string }) => `Messaggio di ${name}`,
+    peerUnnamedSender: "un altro agente",
     cliVersion: "Versione CLI",
     cliVersionOutdated: "Aggiornamento CLI richiesto",
     cliVersionOutdatedMessage: ({
@@ -6937,6 +7221,8 @@ export const it: TranslationStructure = {
     deleteSessionConfirm: "Eliminare definitivamente la sessione?",
     deleteSessionWarning:
       "Questa azione non può essere annullata. Tutti i messaggi e i dati associati a questa sessione verranno eliminati definitivamente.",
+    stopAndDeleteSession: "Interrompi ed elimina",
+    stopAndDeleteSessionWarning: "Questa azione interromperà la sessione ed eliminerà definitivamente tutti i suoi messaggi e dati. Questa azione non può essere annullata.",
     failedToDeleteSession: "Impossibile eliminare la sessione",
     sessionDeleted: "Sessione eliminata con successo",
     manageSharing: "Gestisci condivisione",
@@ -6997,6 +7283,11 @@ export const it: TranslationStructure = {
   },
 
   agentInput: {
+      sendOptions: {
+          title: "Opzioni di invio",
+          queue: "Accoda",
+          hint: "Tieni premuto per scegliere come inviare",
+      },
       chipPicker: {
           selectedOptionAccessibilityLabel: ({ option }: { option: string }) => `${option}. Selezionato.`,
       },
@@ -7064,6 +7355,8 @@ export const it: TranslationStructure = {
     permissionMode: {
       title: "MODALITÀ PERMESSI",
       effectiveLabel: ({ label }: { label: string }) => `Effettivo: ${label}`,
+      nativeModeOverrides: ({ mode }: { mode: string }) => `La modalità agente ${mode} ha priorità su questa impostazione dei permessi. Cancella la selezione di Modalità per usare i permessi.`,
+            usePermissionSetting: 'Usa l’impostazione dei permessi',
       default: "Predefinito",
       readOnly: "Sola lettura",
       acceptEdits: "Accetta modifiche",
@@ -7094,6 +7387,7 @@ export const it: TranslationStructure = {
       agy: 'Antigravity',
       fx: "FX",
       droid: "Factory Droid",
+      codebuddy: "CodeBuddy",
       customAcp: "ACP personalizzato",
       pi: "Pi",
       copilot: "Copilot",
@@ -7170,6 +7464,7 @@ export const it: TranslationStructure = {
     },
     context: {
       remaining: ({ percent }: { percent: number }) => `${percent}% restante`,
+      badgeLabel: "Contesto",
       windowTitle: "Finestra di contesto",
       usedDetail: ({
         percent,
@@ -7523,6 +7818,8 @@ export const it: TranslationStructure = {
 	        copyPath: "Copia percorso",
 	        download: "Scarica",
 	        downloadAsZip: "Scarica come ZIP",
+	        openWith: 'Apri con',
+	        share: 'Condividi',
 	      },
 	      dropToUpload: "Trascina i file per caricare",
 	      rename: {
@@ -7789,6 +8086,9 @@ export const it: TranslationStructure = {
         `Modifiche non in stage (${count})`,
       // File viewer strings
       fileReadFailed: "Impossibile leggere il file",
+      androidFileActionsUnavailable: "Le azioni sui file Android non sono disponibili in questa versione dell’app. Aggiorna Happier e riprova.",
+      fileSharingUnavailable: "La condivisione dei file non è disponibile su questo dispositivo.",
+      fileCleanupFailed: "Impossibile rimuovere il file temporaneo",
       fileTooLargeToPreview: "Il file è troppo grande per l'anteprima",
       fileWriteFailed: "Impossibile scrivere il file",
     fileEditor: {
@@ -7867,6 +8167,7 @@ export const it: TranslationStructure = {
       loadingFile: ({ fileName }: { fileName: string }) =>
         `Caricamento ${fileName}...`,
         binaryFile: "File binario",
+        videoPreview: 'Anteprima video',
         imagePreviewTooLarge: "L'anteprima dell'immagine è troppo grande per essere visualizzata",
         sessionMedia: {
           generatedImageA11y: ({ name }: { name: string }) => `Apri immagine generata ${name}`,
@@ -8200,7 +8501,7 @@ export const it: TranslationStructure = {
         invalidActionSubtitle: "Questa azione non è più disponibile in questa build.",
         configureActionAccessibilityLabel: "Configura azione",
         approvalHelpTitle: "Modalità di approvazione",
-        approvalHelpBody: "“Chiedi prima” crea una richiesta di approvazione prima che questa azione venga eseguita da quella superficie. Per le sessioni AI, la richiesta resta nella superficie di approvazioni esistente e non attende in un modale. “Consentito” permette l’esecuzione da quella superficie senza una richiesta di approvazione.",
+        approvalHelpBody: "“Chiedi prima” richiede l’approvazione prima di eseguire questa azione da quella superficie. I controlli dell’app possono mostrare una finestra di conferma. Per le sessioni AI, la richiesta resta nella superficie di approvazioni esistente e non attende in un modale. “Consentito” permette l’esecuzione senza una richiesta di approvazione.",
         toolExposure: {
             title: "Esposizione strumento",
             footer: "Controlla se le azioni idonee compaiono come strumenti diretti o restano disponibili solo tramite individuazione delle azioni.",
@@ -8373,6 +8674,14 @@ settingsSession: {
 	          workingStatusAnimatedTextTitle: 'Testo di lavoro animato',
 	          workingStatusAnimatedTextEnabledSubtitle: 'Alterna verbi di lavoro mentre una sessione è in esecuzione',
 	          workingStatusAnimatedTextDisabledSubtitle: 'Mostra un’etichetta fissa al lavoro... mentre una sessione è in esecuzione',
+	          backgroundWorkAttentionModeTitle: "Risposte non lette durante il lavoro in background",
+	          backgroundWorkAttentionModeSubtitle: "Scegli dove mostrare le risposte non lette mentre il lavoro in background continua. Le richieste rivolte a te richiedono comunque attenzione.",
+	          backgroundWorkAttentionKeepWorkingTitle: "Mantieni lo stato di lavorazione",
+	          backgroundWorkAttentionKeepWorkingSubtitle: "Mantieni lo stato di lavorazione e mostra un punto centrale blu per le risposte non lette",
+	          backgroundWorkAttentionKeepWorkingUnreadTitle: "Mostra lo stato non letto in In lavorazione",
+	          backgroundWorkAttentionKeepWorkingUnreadSubtitle: "Mantieni le sessioni in “In lavorazione” e mostra lo stato non letto finché non leggi la risposta",
+	          backgroundWorkAttentionShowUnreadTitle: "Sposta le sessioni non lette in Richiede attenzione",
+	          backgroundWorkAttentionShowUnreadSubtitle: "Sposta le sessioni con risposte non lette in Richiede attenzione mentre il lavoro in background continua",
 	          attentionPromotionModeTitle: 'Sessioni che richiedono attenzione',
 	          attentionPromotionModeSubtitle: 'Scegli dove appaiono le sessioni in attesa di te o pronte per la revisione',
 	          attentionPromotionModeOffTitle: 'Lascia nella posizione normale',
@@ -8381,6 +8690,8 @@ settingsSession: {
 	          attentionPromotionModeGlobalSubtitle: 'Mostra una sezione di attenzione sopra il resto',
 	          attentionPromotionModeWithinGroupsTitle: 'Sposta in cima al gruppo attuale',
 	          attentionPromotionModeWithinGroupsSubtitle: 'Mantieni le sessioni nella loro cartella o area di lavoro',
+	          reminderAutoClearOnOpenTitle: "Cancella i promemoria all’apertura",
+	          reminderAutoClearOnOpenSubtitle: "Disattiva per rimuovere manualmente i promemoria scaduti. Quelli futuri restano programmati.",
 	          attentionStandingDefaultTitle: 'Mantieni le sessioni in Richiede attenzione',
 	          attentionStandingDefaultEnabledSubtitle: 'Ogni sessione resta finché non la rimuovi',
 	          attentionStandingDefaultDisabledSubtitle: 'Mantieni le sessioni una alla volta',
@@ -8630,12 +8941,14 @@ settingsSession: {
       providerUsageGauge: {
         title: "Uso del provider",
         footer:
-          "Controlla l'indicatore di quota mostrato accanto al compositore quando è disponibile un uso affidabile del provider.",
+          "Scegli gli indicatori del compositore per tutti gli account. Rispettano i limiti selezionati in ogni pool. I preferiti aggiungono indicatori per l’account attivo.",
         visibilityTitle: "Mostra l'indicatore di uso del provider",
         visibilityEnabledSubtitle:
           "Mostra la quota restante del provider accanto al compositore quando disponibile.",
         visibilityHiddenSubtitle: "Nascondi la quota del provider dal compositore.",
-        windowTitle: "Finestra dell'indicatore",
+        windowTitle: "Finestre degli indicatori",
+        labelsTitle: 'Mostra le etichette di utilizzo',
+        labelsSubtitle: 'Etichetta gli indicatori di contesto e del provider.',
         windowMostConstrainedTitle: "Più vincolata",
         windowMostConstrainedSubtitle:
           "Mostra la finestra di quota affidabile con meno quota restante.",
@@ -8643,8 +8956,8 @@ settingsSession: {
         windowDailySubtitle: "Preferisci la finestra di quota giornaliera.",
         windowWeeklyTitle: "Settimanale",
         windowWeeklySubtitle: "Preferisci la finestra di quota settimanale.",
-        windowSessionTitle: "Sessione",
-        windowSessionSubtitle: "Preferisci la finestra di quota della sessione corrente.",
+        windowSessionTitle: "Finestra breve",
+        windowSessionSubtitle: "Mostra finestre brevi di quota, come un limite di cinque ore.",
         windowPrimaryTitle: "Primaria",
         windowPrimarySubtitle: "Preferisci la finestra di quota primaria del provider.",
         windowSecondaryTitle: "Secondaria",
@@ -9532,6 +9845,26 @@ settingsSession: {
           },
         },
       },
+      modelPackDownload: {
+        progress: ({ loaded, total }: { loaded: string; total: string }) => `${loaded} di ${total}`,
+        progressWithFiles: ({ loaded, total, filesDone, filesTotal }: { loaded: string; total: string; filesDone: number; filesTotal: number }) =>
+          `${loaded} di ${total} · ${filesDone} di ${filesTotal} file`,
+        progressAccessibilityLabel: "Avanzamento del download",
+        verifyingDetail: "Verifica in corso",
+        verifyingProgress: ({ verified, total, filesDone, filesTotal }: { verified: string; total: string; filesDone: number; filesTotal: number }) =>
+          `Verificati ${verified} di ${total} · ${filesDone} di ${filesTotal} file`,
+        verifyingAccessibilityLabel: "Avanzamento della verifica",
+        failedDetail: "Non riuscito",
+        failedSubtitle: "Impossibile preparare il modello. Tocca per riprovare.",
+        failedResumableSubtitle: ({ size }: { size: string }) => `Il download non è stato completato. ${size} sono stati conservati: tocca per riprendere.`,
+        incompleteDetail: "Incompleto",
+        incompleteSubtitle: ({ size }: { size: string }) => `${size} scaricati finora. Tocca per continuare.`,
+        discardSubtitle: "Elimina il download incompleto per liberare spazio.",
+        discardConfirmTitle: "Scartare il download incompleto?",
+        discardConfirmBody: ({ size }: { size: string }) => `Verranno eliminati i ${size} scaricati finora. Potrai scaricare di nuovo il modello in seguito.`,
+        insufficientStorage: ({ required, available }: { required: string; available: string }) =>
+            `Spazio libero insufficiente. Questo download richiede ${required}, ma ne sono liberi solo ${available}.`,
+      },
       localNeuralStt: {
         modelPack: {
           title: "Pacchetto modello",
@@ -9554,12 +9887,6 @@ settingsSession: {
           installedWithBuild: ({ build }: { build: string }) =>
             `Installato • ${build}`,
           notInstalled: "Non installato",
-        },
-        language: {
-          title: "Lingua",
-          subtitle: "Tag lingua BCP-47 opzionale.",
-          promptTitle: "Lingua",
-          promptBody: "Inserisci un tag lingua BCP-47 (es. en, en-US).",
         },
         alerts: {
           downloadFailedTitle: "Download non riuscito",
@@ -9594,6 +9921,8 @@ settingsSession: {
           enableTitle: "Abilita mani libere",
           silenceTitle: "Timeout silenzio (ms)",
           minSpeechTitle: "Parlato minimo (ms)",
+          pushToTalkTitle: "Premi per parlare",
+          pushToTalkSubtitle: "Questo provider trascrive una registrazione completata: tocca di nuovo il microfono per inviare. Per il vivavoce scegli il riconoscimento vocale del dispositivo o quello neurale locale.",
         },
         customBackendIdSubtitle: "Inserisci un id backend personalizzato.",
         searchBackendsPlaceholder: "Cerca backend",
@@ -9851,8 +10180,7 @@ settingsSession: {
       sttProvider: "Provider STT",
       neuralStt: {
         title: "STT sul dispositivo",
-        webNotAvailableSubtitle:
-          "Non disponibile sul web. Usa STT del dispositivo, compatibile OpenAI o Gemini STT.",
+        webFallbackSubtitle: "Funziona solo nell’app mobile. Nel browser, la voce usa il riconoscimento vocale del browser.",
       },
       ttsBaseUrl: "URL base TTS",
       ttsBaseUrlTitle: "URL base TTS",
@@ -10068,7 +10396,7 @@ settingsSession: {
       offline: "Alcune macchine sono offline",
       checkedAt: ({ time }: { time: string }) => `Ultimo controllo: ${time}`,
       upToDateDescription: "Happier, la sua riga di comando e i tuoi agenti sono aggiornati.",
-      unknownDescription: "Tutto ciò che è stato possibile controllare è aggiornato. Il resto verrà ricontrollato appena sarà raggiungibile.",
+      unknownDescription: "Alcune informazioni sugli aggiornamenti non sono disponibili o sono in cache. Consulta le righe interessate.",
       offlineDescription: "Tutto ciò che è raggiungibile è aggiornato. Le macchine offline verranno controllate quando torneranno disponibili.",
     },
     settingsSubtitle: {
@@ -10114,6 +10442,9 @@ settingsSession: {
       appCheckFailed: "Non è stato possibile cercare una versione più recente.",
       appDownloadFailed: "Il download non è stato completato.",
       appInstallFailed: "Non è stato possibile installare l’aggiornamento.",
+      cachedRelease: "Informazioni sulla versione in cache; non aggiornate qui",
+      cachedReleaseChannel: ({ channel }: { channel: string }) => `Informazioni sulla versione ${channel} in cache; non aggiornate qui`,
+      manualUpdateInterruptsSessions: "Aggiorna su questa macchina. I servizi potrebbero arrestarsi e le sessioni attive potrebbero terminare.",
       latestUnknown: "Non è stato possibile cercare una versione più recente",
       rolledBack: ({ kept, target }: { kept: string; target: string }) => `${target} non si è avviata su questa macchina, quindi resta alla ${kept}.`,
       installedByYou: "Installato da te",
@@ -10123,6 +10454,7 @@ settingsSession: {
       checking: "Controllo…",
       failedGeneric: "L’aggiornamento non è stato completato. Riprova.",
       remoteUnsupported: "Questa macchina non può aggiornare la riga di comando da remoto. Aggiornala direttamente sulla macchina.",
+      archiveExpandedByteLimit: "Il runtime scaricato supera il limite di dimensione per l’estrazione. Aggiorna Happier prima di riprovare.",
       updateNotVerified: "L’aggiornamento è stato eseguito, ma la versione non è cambiata.",
       rolledBackLocal: "L’aggiornamento non è partito, quindi questo computer è tornato alla versione precedente.",
       smokeFailed: "La nuova versione non ha funzionato su questo computer, quindi non è cambiato nulla.",
@@ -10374,6 +10706,7 @@ settingsSession: {
     cameraPermissionsRequiredToConnectTerminal:
       "Sono necessarie le autorizzazioni della fotocamera per connettere il terminale",
     failedToLinkDevice: "Impossibile collegare il dispositivo",
+    deviceLinkRequestNotFound: "Non è stata trovata alcuna richiesta di collegamento in attesa su questo relay. Verifica che entrambi i dispositivi usino lo stesso relay, poi genera un nuovo codice QR.",
     cameraPermissionsRequiredToScanQr:
       "Sono necessarie le autorizzazioni della fotocamera per scansionare i codici QR",
     qrScannerUnavailable:
@@ -10663,6 +10996,7 @@ settingsSession: {
     blockedTitle: 'Configurazione interrotta',
     blockedStatusFallback: 'La configurazione non è riuscita a completarsi. Il tuo account e le tue sessioni sono intatti.',
     blockedServiceConflictStatus: 'Prima bisogna risolvere un altro servizio in background su questo computer. È rimasto com’era: apri Dettagli per vedere quale.',
+    blockedServiceManagerUnavailableStatus: 'Happier non può configurare il servizio in background su questo computer. Apri Dettagli per ricevere aiuto o continua con le altre macchine.',
     blockedConsentDeclinedStatus: 'La configurazione si è fermata. Il servizio in background già presente è rimasto esattamente com’era.',
     blockedAccountKeptStatus: 'La configurazione si è interrotta. Questo computer resta collegato all’account con cui ha effettuato l’accesso.',
     blockedAccountChangedStatus: 'Questo computer ha effettuato l’accesso a un altro account durante la configurazione, che si è quindi interrotta prima dell’abbinamento. Riprova.',
@@ -10674,6 +11008,7 @@ settingsSession: {
     blockedCliUnresponsiveStatus: 'La riga di comando di Happier ha smesso di rispondere.',
         blockedCliUnavailableStatus: "Happier non ha potuto avviare la sua riga di comando su questo computer.",
     blockedCliFailedStatus: 'Happier non è riuscito a finire di leggere la configurazione di questo computer.',
+    blockedStepStatus: ({ step }: { step: string }) => `Impossibile completare: ${step}`,
     unreachableStatus: ({ relay }: { relay: string }) => `Questo computer non risponde ancora su ${relay}.`,
     notConvergedStatus: ({ relay }: { relay: string }) => `Il servizio in background di questo computer non ha ancora finito di avviarsi per ${relay}.`,
     canceledTitle: 'Configurazione annullata',
@@ -10909,11 +11244,9 @@ settingsSession: {
     unknownPath: "percorso sconosciuto",
     previousSessionsTitle: "Sessioni precedenti (fino alle 5 più recenti)",
     tmux: {
-      overrideTitle: "Sovrascrivi le impostazioni tmux globali",
-      overrideEnabledSubtitle:
-        "Le impostazioni tmux personalizzate si applicano alle nuove sessioni su questa macchina.",
-      overrideDisabledSubtitle:
-        "Le nuove sessioni usano le impostazioni tmux globali.",
+      overrideTitle: "Sovrascrivi il valore dell’account",
+      overrideEnabledSubtitle: "Questa macchina usa un proprio host del terminale per le nuove sessioni.",
+      overrideDisabledSubtitle: "Le nuove sessioni ereditano l’host del terminale dell’account.",
       notDetectedSubtitle: "tmux non è rilevato su questa macchina.",
       notDetectedMessage:
         "tmux non è rilevato su questa macchina. Installa tmux e aggiorna il rilevamento.",
@@ -10967,6 +11300,7 @@ settingsSession: {
     providerStateSharingDegraded: "Condivisione stato provider applicata parzialmente",
     connectedServiceRuntimeAuthRecoveryRecovered: "Autenticazione provider recuperata",
     connectedServiceRuntimeAuthRecoveryCancelled: "Recupero autenticazione provider annullato",
+        connectedServiceRuntimeAuthRecoveryStopped: "Ripristino del provider interrotto; nessun nuovo tentativo automatico",
     runtimeConfigOutcomeAppliesBeforeNextMessage: "Verrà applicato prima del tuo prossimo messaggio",
     runtimeConfigOutcomeQueuedUntilReady: "In coda finché non è pronto",
     runtimeConfigOutcomeAlreadySet: "Già impostato",
@@ -11002,6 +11336,19 @@ settingsSession: {
     switchingToPersistedTakeover: "Presa in carico e importazione di questa sessione…",
     takeOverDirect: "Prendi in carico",
     takeOverPersist: "Prendi in carico + importa",
+    directImportPreparing: "Preparazione dell’importazione…",
+    directImportReading: "Lettura della cronologia…",
+    directImportImporting: "Importazione della cronologia…",
+    directImportStarting: "Avvio della sessione…",
+    directImportConverting: "Completamento della presa in carico…",
+    directImportCancelling: "Arresto dell’importazione…",
+    directImportCancelled: "Importazione fermata. La cronologia è conservata; puoi riprovare.",
+    directImportFailed: "Importazione non riuscita. La cronologia è conservata; puoi riprovare.",
+    directImportStatusUnavailable: "Avanzamento non disponibile. Riconnettiti o controlla di nuovo.",
+    directImportRequiresDaemonUpgrade: "Aggiorna Happier su questa macchina per importare sessioni con avanzamento e arresto.",
+    directImportStop: "Ferma importazione",
+    directImportCount: ({ count }: { count: number }) => `${count} messaggi importati`,
+    directImportCountWithTotal: ({ count, total }: { count: number; total: number }) => `${count} di ${total} messaggi importati`,
     directTakeoverDialogTitle: "Continuare questa sessione diretta in Happier?",
     directTakeoverDialogBody: "Scegli come vuoi che Happier prenda il controllo. Diretto continua a usare la trascrizione del provider. Importa porta la trascrizione in Happier.",
     directTakeoverDialogDirectTitle: "Prendi in carico",

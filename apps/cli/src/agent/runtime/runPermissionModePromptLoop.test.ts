@@ -17,6 +17,12 @@ import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHa
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
 import { createSessionProviderInputConsumer } from './sessionInput/SessionProviderInputConsumer';
+import { createPermissionModeQueueState } from './createPermissionModeQueueState';
+import { createProviderEnforcedPermissionHandler } from '@/agent/permissions/createProviderEnforcedPermissionHandler';
+import { createTurnAssistantPreviewTracker } from './turnAssistantPreviewTracker';
+import { resolveReadyNotificationAssistantText } from './readyNotificationAssistantText';
+import { createTurnAssistantTextSnapshotStore } from '@/api/session/turnAssistantTextSnapshot';
+import { configuration } from '@/configuration';
 
 type PromptLoopMetadata = Metadata & {
   replaySeedV1?: any;
@@ -62,6 +68,97 @@ async function waitForPromptLoopTick(): Promise<void> {
 }
 
 describe('runPermissionModePromptLoop', () => {
+  it.each(['host answer', ''])('keeps host ready text scoped when a successor is already active (host text: %s)', async (hostText) => {
+    const tracker = createTurnAssistantPreviewTracker();
+    const snapshots = createTurnAssistantTextSnapshotStore({ maxTextChars: configuration.readyNotificationAssistantTextMaxChars });
+    const session = createMutableApiSessionClientFixture({ overrides: {
+      beginTurnAssistantTextSnapshot: (params) => snapshots.beginTurn(params),
+      getTurnAssistantTextSnapshot: (params) => snapshots.getForTurn(params),
+      sendAgentMessageEphemeral: (_provider, body) => {
+        if (body.type === 'message') snapshots.observe({ text: body.message, source: 'ephemeral' });
+        return { accepted: true, epoch: 0 };
+      },
+    } });
+    const backend = createFakeAcpRuntimeBackend({ sendPrompt: async () => {
+      backend.emit({ type: 'status', status: 'running' });
+      if (hostText) backend.emit({ type: 'model-output', fullText: hostText, fullTextScope: 'segment' });
+      backend.emit({ type: 'status', status: 'idle', turnFinished: true });
+      backend.emit({ type: 'status', status: 'running' });
+      backend.emit({ type: 'model-output', fullText: 'successor answer', fullTextScope: 'segment' });
+      await expect.poll(() => tracker.getPreview()).toBe('successor answer');
+    } });
+    const permissionHandler = createProviderEnforcedPermissionHandler({ session, logPrefix: '[ready-test]' });
+    const runtime = createAcpRuntime({
+      provider: 'pi', directory: '/tmp', session, messageBuffer: new MessageBuffer(), mcpServers: {},
+      permissionHandler, turnAssistantPreviewTracker: tracker, onThinkingChange: () => {}, ensureBackend: async () => backend,
+    });
+    const queue = createModeQueue();
+    queue.push({ text: 'host prompt', localId: 'ready-host' }, { permissionMode: 'default' });
+    let shouldExit = false;
+    let readyText: string | null = null;
+    try {
+      await runPermissionModePromptLoop({
+        providerName: 'Pi', agentMessageType: 'pi', explicitPermissionMode: undefined,
+        session, messageQueue: queue, permissionHandler, runtime,
+        createOverrideSynchronizer: (isStarted) => createRuntimeOverrideSynchronizers({ session, runtime, isStarted }),
+        messageBuffer: new MessageBuffer(), shouldExit: () => shouldExit,
+        getAbortSignal: () => new AbortController().signal, keepAlive: () => {}, setThinking: () => {},
+        sendReady: (context) => {
+          readyText = resolveReadyNotificationAssistantText({
+            turnResult: context?.turnResult,
+            explicitAssistantText: tracker.getPreview(), session,
+            turnToken: context?.turnToken, startSeqExclusive: context?.startSeqExclusive,
+          });
+          shouldExit = true;
+        },
+        currentPermissionModeUpdatedAt: 0, setCurrentPermissionMode: () => {}, setCurrentPermissionModeUpdatedAt: () => {},
+        formatPromptErrorMessage: formatProviderPromptErrorMessage,
+      });
+      expect(readyText).toBe(hostText || null);
+    } finally {
+      backend.emit({ type: 'status', status: 'idle' });
+      await runtime.flushTurn();
+    }
+  });
+
+  it('restores saved permission intent before eager native attachment even when its timestamp was already read', async () => {
+    const session = createMutableApiSessionClientFixture<PromptLoopMetadata>({ overrides: { onUserMessage: () => undefined } });
+    session.__setMetadata(createPromptLoopMetadata({ permissionMode: 'read-only', permissionModeUpdatedAt: 77 }));
+    const state = createPermissionModeQueueState({ session, initialPermissionMode: 'yolo' });
+    const observedPermissions: Array<string | undefined> = [];
+    let shouldExit = false;
+    const permissionHandler = createProviderEnforcedPermissionHandler({ session, logPrefix: '[PermissionStartupTest]' });
+    permissionHandler.setPermissionMode('yolo');
+    expect(permissionHandler.getImmediateDecision('before-start', 'Edit', {})).toEqual({ decision: 'approved' });
+    const runtime = {
+      ...createRuntime(),
+      getSessionId: () => 'existing-native-session',
+      startOrLoad: async () => {
+        observedPermissions.push(state.getCurrentPermissionMode());
+        expect(permissionHandler.getImmediateDecision('after-start', 'Edit', {})).toBeNull();
+      },
+      setSessionMode: async () => undefined,
+      setSessionModel: async () => undefined,
+      setSessionConfigOption: async () => undefined,
+    };
+    await runPermissionModePromptLoop({
+      providerName: 'Test Provider', agentMessageType: 'qwen', explicitPermissionMode: undefined,
+      session, messageQueue: state.messageQueue, permissionHandler, runtime,
+      createOverrideSynchronizer: (isStarted) => createRuntimeOverrideSynchronizers({ session, runtime, isStarted }),
+      messageBuffer: new MessageBuffer(), shouldExit: () => shouldExit,
+      getAbortSignal: () => new AbortController().signal,
+      keepAlive: () => undefined, setThinking: () => undefined, sendReady: () => undefined,
+      currentPermissionModeUpdatedAt: state.getCurrentPermissionModeUpdatedAt(),
+      setCurrentPermissionMode: state.setCurrentPermissionMode,
+      setCurrentPermissionModeUpdatedAt: state.setCurrentPermissionModeUpdatedAt,
+      initialResumeId: 'existing-native-session', strictInitialResume: true, startRuntimeBeforeFirstPrompt: true,
+      onAfterStart: () => { shouldExit = true; },
+      formatPromptErrorMessage: String,
+    });
+    expect(observedPermissions).toEqual(['read-only']);
+    expect(state.getCurrentPermissionModeUpdatedAt()).toBe(77);
+  });
+
   it('applies replay seed exactly once to the first real user prompt', async () => {
     const session = createPromptLoopSession();
     session.__setMetadata({
@@ -1979,5 +2076,70 @@ describe('runPermissionModePromptLoop', () => {
     expect(runtime.startOrLoad).toHaveBeenCalledWith({ resumeId: 'resume-id', importHistory: false });
     expect(runtime.reset).not.toHaveBeenCalled();
     expect(runtime.sendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not wait before exiting when shutdown aborted the input wait', async () => {
+    // Only the timers are faked, so a retry delay that is started here can never finish on its own.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const session = createPromptLoopSession();
+      session.waitForPendingEligibilityUpdate = vi.fn(
+        (signal?: AbortSignal) =>
+          new Promise<boolean>((resolve) => {
+            signal?.addEventListener('abort', () => resolve(false), { once: true });
+          }),
+      );
+      const queue = createModeQueue();
+      const runtime = createRuntime();
+      const messageBuffer = new MessageBuffer();
+      const permissionHandler = {
+        setPermissionMode: vi.fn(),
+        reset: vi.fn(),
+      } as any;
+
+      const abortController = new AbortController();
+      let shouldExit = false;
+      let exited = false;
+      const loopPromise = (runPermissionModePromptLoop as unknown as (params: any) => Promise<void>)({
+        providerName: 'Test Provider',
+        agentMessageType: 'cursor',
+        explicitPermissionMode: undefined,
+        session,
+        messageQueue: queue,
+        permissionHandler,
+        runtime,
+        createOverrideSynchronizer: () => ({ syncFromMetadata: () => {}, flushPendingAfterStart: async () => {} }),
+        messageBuffer,
+        shouldExit: () => shouldExit,
+        getAbortSignal: () => abortController.signal,
+        keepAlive: () => {},
+        setThinking: () => {},
+        sendReady: () => {},
+        currentPermissionModeUpdatedAt: 0,
+        setCurrentPermissionMode: () => {},
+        setCurrentPermissionModeUpdatedAt: () => {},
+        formatPromptErrorMessage: (caught: unknown) => `Error: ${String(caught)}`,
+      }).then(() => {
+        exited = true;
+      });
+
+      // The loop parks in its input wait with nothing queued.
+      for (let index = 0; index < 10; index += 1) {
+        await waitForPromptLoopTick();
+      }
+      expect(exited).toBe(false);
+
+      // Shutdown: exit is requested first, then the wait is aborted, so the wait answers `null` while exiting.
+      shouldExit = true;
+      abortController.abort();
+      for (let index = 0; index < 10 && !exited; index += 1) {
+        await waitForPromptLoopTick();
+      }
+
+      expect(exited).toBe(true);
+      await loopPromise;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

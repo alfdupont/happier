@@ -7,6 +7,8 @@ import { storage, useLocalSetting } from '@/sync/domains/state/storage';
 import { getActiveViewingSessionId } from '@/sync/domains/session/activeViewingSession';
 import { getActiveServerUrl } from '@/sync/domains/server/serverProfiles';
 import { navigateToSessionRoute } from '@/hooks/session/navigateToSessionRoute';
+import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
+import { isTauriMainWindowActivelyViewed } from '@/desktop/window/isTauriMainWindowActivelyViewed';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 import { isWebDocumentActivelyViewed } from '@/utils/runtime/isWebDocumentActivelyViewed';
 import { fireAndForget } from '@/utils/system/fireAndForget';
@@ -17,6 +19,7 @@ import { sendTauriLocalNotification } from '../channels/sendTauriLocalNotificati
 import { sendWebLocalNotification } from '../channels/sendWebLocalNotification';
 import { resolveForegroundNotificationBehavior } from '../resolveForegroundNotificationBehavior';
 import { subscribeActivityLocalNotifications, type ActivityLocalNotificationEvent } from './activityLocalNotificationBus';
+import { usePresentedAgentRequestSettlement } from './usePresentedAgentRequestSettlement';
 
 type ActivityLocalNotificationSettings = Readonly<{
     localNotificationsEnabled: boolean;
@@ -114,6 +117,7 @@ function sendBrowserNotification(
 
 export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
     const localSettings = useActivityLocalNotificationSettings();
+    const reconcilePresentedRequests = usePresentedAgentRequestSettlement();
 
     React.useEffect(() => {
         return subscribeActivityLocalNotifications((event) => {
@@ -136,6 +140,7 @@ export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
                 event,
                 session,
                 serverUrl: getActiveServerUrl(),
+                accountId: event.kind === 'agent-request' ? getActiveServerAccountScope()?.accountId : undefined,
                 includeReadyMessageText: localSettings.localNotificationsShowReadyMessageText !== false,
                 includeRequestMessageText: localSettings.localNotificationsShowRequestMessageText !== false,
             });
@@ -158,9 +163,10 @@ export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
                 body: notification.body,
                 data: notification.data,
                 categoryIdentifier: notification.expo.categoryIdentifier,
-            }), { tag: 'ActivityLocalNotificationRuntime.sendExpoLocalNotification' });
+                channelId: notification.expo.channelId,
+            }).then(reconcilePresentedRequests), { tag: 'ActivityLocalNotificationRuntime.sendExpoLocalNotification' });
         });
-    }, [localSettings]);
+    }, [localSettings, reconcilePresentedRequests]);
 
     return null;
 }

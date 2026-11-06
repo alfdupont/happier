@@ -114,7 +114,7 @@
  * - Updated internal state for future processing
  */
 
-import { Message, ToolCall } from "../domains/messages/messageTypes";
+import { Message, ToolCall, type PeerMessageSender } from "../domains/messages/messageTypes";
 import { AgentEvent, NormalizedMessage, UsageData } from "../typesRaw";
 import { createTracer, traceMessages, TracerState } from "./reducerTracer";
 import { AgentState } from "../domains/state/storageTypes";
@@ -189,6 +189,7 @@ export type ReducerMessage = {
     role: 'user' | 'agent';
     text: string | null;
     isThinking?: boolean;
+    peer?: PeerMessageSender;
     event: AgentEvent | null;
     tool: ToolCall | null;
     meta?: MessageMeta;
@@ -301,7 +302,9 @@ export type ReducerResult = {
     reducerStateChanged?: boolean;
 };
 
-export type ReducerSessionRuntimeOwnership = Readonly<{
+export type ReducerSessionContext = Readonly<{
+    /** Paging has reached the beginning, including a final page with no renderable rows. */
+    mainHistoryStartLoaded?: boolean;
     /**
      * Instant at which the CLI session process that owns this transcript was last observed
      * attached, when it is no longer attached. `null` while the process is attached (or while the
@@ -318,7 +321,7 @@ export function reducer(
     state: ReducerState,
     messages: NormalizedMessage[],
     agentState?: AgentState | null,
-    ownership?: ReducerSessionRuntimeOwnership,
+    context?: ReducerSessionContext,
 ): ReducerResult {
 	    const DEBUG_SIDECHAINS = isDebugFlagEnabled({
 	        // Enable in browser devtools via: `window.__HAPPIER_DEBUG_SIDECHAINS__ = true`
@@ -359,10 +362,14 @@ export function reducer(
     let lastMainMessageId: string | null = null;
     let lastMainMessageSeq: number | null = null;
     let lastMainMessageCreatedAt: number | null = null;
+    let completedRequestHistoryStartAt: number | null = null;
     for (const [mid, m] of state.messages) {
         if (sidechainMessageIds.has(mid)) continue;
 
         const nextSeq = normalizeTranscriptSeq(m.seq);
+        if ((nextSeq !== null || m.realID !== null) && Number.isFinite(m.createdAt)) {
+            completedRequestHistoryStartAt = Math.min(completedRequestHistoryStartAt ?? m.createdAt, m.createdAt);
+        }
 
         if (lastMainMessageId === null) {
             lastMainMessageId = mid;
@@ -452,6 +459,11 @@ export function reducer(
     // isn't resolved yet (otherwise subagent tool execution leaks into the main timeline).
     let nonSidechainMessages = tracedMessages.filter(msg => !msg.sidechainId && !msg.isSidechain);
     const sidechainMessages = tracedMessages.filter(msg => msg.sidechainId);
+    for (const message of nonSidechainMessages) {
+        if (Number.isFinite(message.createdAt)) {
+            completedRequestHistoryStartAt = Math.min(completedRequestHistoryStartAt ?? message.createdAt, message.createdAt);
+        }
+    }
 
     if (DEBUG_MESSAGE_DECRYPT) {
         const isSidechainCount = tracedMessages.filter((m) => m.isSidechain).length;
@@ -485,6 +497,9 @@ export function reducer(
 	        state,
 	        agentState,
 	        incomingToolIds,
+	        incomingToolResultIds: conversion.incomingToolResultIds,
+	        completedRequestHistoryStartAt,
+	        mainHistoryStartLoaded: context?.mainHistoryStartLoaded,
 	        changed,
 	        allocateId,
 	        enableLogging: ENABLE_LOGGING,
@@ -566,7 +581,7 @@ export function reducer(
     // The process that hosted every one of these tool calls is gone. Subagent sidechains have no
     // other closing path — nothing can ever write their result — so this is the sweep that stops
     // them presenting as work in progress. It changes presentation only; no record is written.
-    const ownerProcessGoneSinceMs = ownership?.ownerProcessGoneSinceMs;
+    const ownerProcessGoneSinceMs = context?.ownerProcessGoneSinceMs;
     if (typeof ownerProcessGoneSinceMs === 'number' && Number.isFinite(ownerProcessGoneSinceMs)) {
         markRunningToolsUnavailable({
             state,
@@ -759,6 +774,7 @@ function convertReducerMessageToMessage(
             kind: 'agent-text',
             text: reducerMsg.text,
             ...(reducerMsg.isThinking && { isThinking: true }),
+            ...(reducerMsg.peer && { peer: reducerMsg.peer }),
             meta: reducerMsg.meta,
             ...observationMetadata,
         };

@@ -31,6 +31,7 @@ import type { ConnectedServiceRuntimeAuthSelectionMaterializer } from '@/daemon/
 import type { ConnectedServicesProviderMaterializer } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { ConnectedServiceQuotaFetcherDescriptor } from '@/daemon/connectedServices/quotas/types';
+import type { ImportedSessionHandoffBundle } from '@/session/handoff/types';
 import type {
   VerifyResumeReachableInput,
   VerifyResumeReachableResult,
@@ -139,6 +140,7 @@ export type ProviderAttachOps = Readonly<{
     sessionId: string;
     metadata: Record<string, unknown>;
     prepareProviderCliAttach?: (request: Readonly<SessionProviderCliAttachPrepareRequestV1>) => Promise<SessionProviderCliAttachPrepareResultV1>;
+    terminalClient?: NonNullable<SessionProviderCliAttachPrepareRequestV1['terminalClient']>['herdr'];
   }>) => Promise<number | false>;
 }>;
 
@@ -249,6 +251,14 @@ export type ConnectedServicePersistedSessionCandidateParams = Readonly<{
   metadata: unknown;
 }>;
 
+export type ExistingSessionHandoffStateResolver = (params: Readonly<{
+  metadata: Record<string, unknown>;
+  vendorResumeId: string;
+  targetPath: string;
+  env: NodeJS.ProcessEnv;
+  sessionStorageMode: 'direct' | 'persisted';
+}>) => Promise<ImportedSessionHandoffBundle>;
+
 export type AgentChecklistContributions = Partial<
   Record<ChecklistId, ReadonlyArray<Readonly<{ id: string; params?: Record<string, unknown> }>>>
 >;
@@ -273,6 +283,8 @@ export type AgentCatalogEntry = Readonly<{
    * Optional CLI subcommand handler for this agent.
    */
   getCliCommandHandler?: () => Promise<CommandHandler>;
+  /** Default daemon autostart policy for a direct interactive terminal invocation. */
+  autostartDaemonInInteractiveTerminal?: boolean;
   getCliCapabilityOverride?: () => Promise<Capability>;
   /**
    * Optional extra capabilities contributed by this agent.
@@ -295,6 +307,8 @@ export type AgentCatalogEntry = Readonly<{
    * These are evaluated by the daemon before spawning a child process.
    */
   getDaemonSpawnHooks?: () => Promise<DaemonSpawnHooks>;
+  /** Reconcile provider-owned resources during the daemon's serialized heartbeat. */
+  reconcileDaemonResources?: () => Promise<void>;
   /**
    * Optional direct-session provider operations for browse/tail/takeover flows.
    *
@@ -407,7 +421,7 @@ export type AgentCatalogEntry = Readonly<{
    * owns only the "where would that id's log be" step.
    */
   resolveAgentNativeSessionLogPath?: (
-    input: Readonly<{ vendorResumeId: string }>,
+    input: Readonly<{ vendorResumeId: string; metadata?: Record<string, unknown> }>,
   ) => Promise<string | null> | string | null;
   /**
    * Optional provider-owned goal control adapter for inactive/offline local sessions.
@@ -465,6 +479,8 @@ export type AgentCatalogEntry = Readonly<{
   getAcpRuntimeBackendOptionsResolver?: () => Promise<CatalogAcpRuntimeBackendOptionsResolver>;
   /** Provider-owned projection for ACP model identifiers encoded in config options. */
   getAcpRuntimeSessionModelAdapter?: () => Promise<CatalogAcpRuntimeSessionModelAdapter>;
+  /** Provider diagnostics delivered as ordinary assistant chunks use the shared turn owner. */
+  getAcpRuntimeTurnHooks?: () => Promise<NonNullable<Parameters<typeof createAcpRuntime>[0]['hooks']>>;
   /**
    * Optional ACP fork-continuation shaper.
    *
@@ -486,6 +502,8 @@ export type AgentCatalogEntry = Readonly<{
    * provider-specific resume ids and direct-session source metadata.
    */
   buildRuntimeLocalHandoffMetadata?: ProviderRuntimeLocalHandoffMetadataBuilder;
+  /** Verifies native target resume state without exporting, importing, or repairing it. */
+  resolveExistingSessionHandoffState?: ExistingSessionHandoffStateResolver;
   /**
    * Whether probe RPC handlers should load account settings before invoking probe methods.
    *
@@ -519,8 +537,8 @@ export type AgentCatalogEntry = Readonly<{
     processEnv?: NodeJS.ProcessEnv;
   }>) => Readonly<Record<string, unknown>> | null;
   /**
-   * Optional provider-owned adapter for probing dynamic session controls (models/modes/config options)
-   * without starting a full ACP session.
+   * Optional provider-owned adapter for probing dynamic controls and native command/skill catalogs
+   * before starting a Happier session or submitting a user turn.
    *
    * Keep provider-specific implementations in the backend folder and expose them via this catalog hook.
    */

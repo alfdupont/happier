@@ -1,6 +1,21 @@
+import { readHostWindowFocus } from '@/utils/runtime/readHostWindowFocus';
 import { isTauriDesktop } from '@/utils/platform/tauri';
-import { isWebDocumentActivelyViewed } from '@/utils/runtime/isWebDocumentActivelyViewed';
 
 export function isTauriMainWindowActivelyViewed(): boolean {
-    return isTauriDesktop() && isWebDocumentActivelyViewed();
+    if (!isTauriDesktop()) {
+        return false;
+    }
+
+    const doc = (globalThis as unknown as {
+        document?: {
+            visibilityState?: string;
+            hasFocus?: () => boolean;
+        };
+    }).document;
+
+    if (doc?.visibilityState === 'hidden') {
+        return false;
+    }
+
+    return readHostWindowFocus() ?? true;
 }

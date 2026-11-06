@@ -5,14 +5,19 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildLaunchdPlistXml, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
+import {
+  buildLaunchdPlistXml,
+  buildWindowsScheduledTaskLauncherAction,
+  renderSystemdServiceUnit,
+  renderWindowsScheduledTaskWrapperPs1,
+} from '@happier-dev/cli-common/service';
 import { withConfiguredDaemonTestHome, writeDaemonSettingsFixture } from '@/daemon/testkit/fakeDaemonLifecycle.testkit';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { withTempDir } from '@/testkit/fs/tempDir';
 import { captureStderr, captureStdout, captureStdoutJsonOutput } from '@/testkit/logger/captureOutput';
 import type { DaemonLocallyPersistedState } from '@/persistence';
 import { planDaemonServiceInstall, planDaemonServiceLifecycle } from './plan';
-const stopDaemonMock = vi.fn(async () => undefined);
+const stopDaemonMock = vi.fn(async () => ({ status: 'stopped' as const, method: 'graceful' as const }));
 const restartDaemonAndWaitMock = vi.fn(async () => true);
 
 vi.mock('@/daemon/doctor', async (importOriginal) => {
@@ -24,17 +29,56 @@ vi.mock('@/daemon/doctor', async (importOriginal) => {
 });
 
 function doMockChildProcessSpawnSync(
-  spawnSyncImpl: (command: string, args?: readonly string[]) => unknown,
+  spawnSyncImpl: (command: string, args?: readonly string[], options?: { encoding?: BufferEncoding | 'buffer'; timeout?: number }) => unknown,
 ): void {
   vi.doMock('node:child_process', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:child_process')>();
     return {
       ...actual,
-      spawnSync: vi.fn(spawnSyncImpl),
+      // Like the real spawnSync, return strings when the caller requests an encoding.
+      spawnSync: vi.fn((command: string, args?: readonly string[], options?: { encoding?: BufferEncoding | 'buffer'; timeout?: number }) => {
+        const result = spawnSyncImpl(command, args, options) as { stdout?: unknown; stderr?: unknown } | null;
+        const encoding = options?.encoding;
+        if (!encoding || encoding === 'buffer' || !result || typeof result !== 'object') return result;
+        const decode = (value: unknown) => (Buffer.isBuffer(value) ? value.toString(encoding) : value);
+        return { ...result, stdout: decode(result.stdout), stderr: decode(result.stderr) };
+      }),
     };
   });
 }
 
+function isHappierTaskFolderListing(command: string, args: readonly string[]): boolean {
+  return command === 'powershell.exe' && args.some((arg) => arg.includes('.GetFolder("\\Happier")'));
+}
+
+function isWindowsScheduledTaskStatusRead(command: string, args: readonly string[]): boolean {
+  return command === 'powershell.exe' && args.some((arg) => arg.includes('Get-ScheduledTaskInfo'));
+}
+
+type WindowsNativeTaskPaths = Readonly<{
+  installedPath: string;
+  launcherPath: string;
+  launcherDiagnosticLogPath: string;
+}>;
+
+/** What the ScheduledTasks status read reports for a task registered with the native launcher action. */
+function windowsNativeLauncherTaskStatusStdout(paths: WindowsNativeTaskPaths): Buffer {
+  const action = buildWindowsScheduledTaskLauncherAction({
+    launcherPath: paths.launcherPath,
+    definitionPath: paths.installedPath,
+    diagnosticLogPath: paths.launcherDiagnosticLogPath,
+  });
+  return Buffer.from(JSON.stringify({
+    exists: true,
+    enabled: true,
+    active: true,
+    stateLabel: 'running',
+    stateValue: 4,
+    lastRunTime: '',
+    lastTaskResult: 0,
+    taskToRun: `${action.executable} ${action.arguments}`,
+  }));
+}
 const SCOPED_ENV_KEYS = [
   'HAPPIER_DAEMON_SERVICE_PLATFORM',
   'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
@@ -47,6 +91,7 @@ const SCOPED_ENV_KEYS = [
   'HAPPIER_DAEMON_SERVICE_CHANNEL',
   'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
   'HAPPIER_DAEMON_SERVICE_AUTOSTART',
+  'HAPPIER_WINDOWS_SCHTASKS_TIMEOUT_MS',
   'HAPPIER_PUBLIC_RELEASE_CHANNEL',
   'HAPPIER_SERVER_URL',
   'HAPPIER_PUBLIC_SERVER_URL',
@@ -81,6 +126,7 @@ function writeValidInstalledDaemonServiceFile(
       description: 'Happier Daemon',
       execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
       env: {
+        HAPPIER_HOME_DIR: process.env.HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR ?? process.env.HAPPIER_HOME_DIR ?? '',
         HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
         HAPPIER_DAEMON_SERVICE_TARGET_MODE: options.targetMode ?? 'default-following',
         HAPPIER_ACTIVE_SERVER_ID: options.activeServerId ?? 'cloud',
@@ -822,8 +868,16 @@ describe('runDaemonServiceCliCommand', () => {
       installedPath = paths.installedPath;
       mkdirSync(dirname(installedPath), { recursive: true });
 
-      await expect(runDaemonServiceCliCommand({ argv: ['install', '--yes'] })).resolves.toBeUndefined();
+      const stdout = captureStdout();
+      try {
+        await expect(runDaemonServiceCliCommand({ argv: ['install', '--yes'] })).resolves.toBeUndefined();
+      } finally {
+        stdout.restore();
+      }
       expect(restartObserved).toBe(true);
+      // The install (including the ownership wait) renders as one timed step.
+      expect(stdout.text()).toContain('- [..] Installing background service\n');
+      expect(stdout.text()).toContain('- [✓] Installed background service\n');
     });
   });
 
@@ -1235,6 +1289,7 @@ describe('runDaemonServiceCliCommand', () => {
           description: 'Happier Daemon',
           execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
           env: {
+            HAPPIER_HOME_DIR: happierHomeDir,
             HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
             HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             HAPPIER_ACTIVE_SERVER_ID: 'cloud',
@@ -1397,6 +1452,58 @@ describe('runDaemonServiceCliCommand', () => {
       } finally {
         output.restore();
       }
+    });
+  });
+
+  it('renders background service start and stop as timed steps', async () => {
+    await withTempDir('happier-service-start-stop-steps-', async (homeDir) => {
+      const happierHomeDir = `${homeDir}/.happier`;
+      envScope.patch({
+        HAPPIER_HOME_DIR: happierHomeDir,
+        HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
+        HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
+        HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_TIMEOUT_MS: '120',
+        HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_POLL_MS: '10',
+        HAPPIER_DAEMON_SERVICE_OWNERSHIP_STABLE_MS: '20',
+      });
+      vi.resetModules();
+      doMockChildProcessSpawnSync((command, args = []) => (
+        command === 'systemctl' && args.includes('is-active')
+          ? { status: 0, stdout: Buffer.from('active'), stderr: Buffer.from('') }
+          : { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }
+      ));
+      vi.doMock('./commandExistsInPath', () => ({
+        commandExistsInPath: vi.fn(() => true),
+      }));
+
+      const [{ runDaemonServiceCliCommand, resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths }, { clearDaemonStateForTests }] = await Promise.all([
+        loadCliModule(),
+        import('@/persistence'),
+      ]);
+      const runtime = resolveDaemonServiceCliRuntimeFromEnv({ targetMode: 'default-following' });
+      const paths = resolveDaemonServicePaths(runtime);
+      mkdirSync(dirname(paths.installedPath), { recursive: true });
+      writeValidInstalledDaemonServiceFile(paths.installedPath);
+      await clearDaemonStateForTests();
+
+      const startOutput = captureStdout();
+      try {
+        await runDaemonServiceCliCommand({ argv: ['start'] });
+      } finally {
+        startOutput.restore();
+      }
+      expect(startOutput.text()).toContain('- [..] Starting background service\n');
+      expect(startOutput.text()).toContain('- [✓] Started background service\n');
+
+      const stopOutput = captureStdout();
+      try {
+        await runDaemonServiceCliCommand({ argv: ['stop'] });
+      } finally {
+        stopOutput.restore();
+      }
+      expect(stopOutput.text()).toContain('- [..] Stopping background service\n');
+      expect(stopOutput.text()).toContain('- [✓] Stopped background service\n');
     });
   });
 
@@ -1865,7 +1972,11 @@ describe('runDaemonServiceCliCommand', () => {
         HAPPIER_DAEMON_SERVICE_OWNERSHIP_STABLE_MS: '20',
       });
       vi.resetModules();
-      doMockChildProcessSpawnSync(() => ({ status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }));
+      doMockChildProcessSpawnSync((command, args = []) => ({
+        status: 0,
+        stdout: Buffer.from(isHappierTaskFolderListing(command, args) ? '[]' : ''),
+        stderr: Buffer.from(''),
+      }));
       vi.doMock('./commandExistsInPath', () => ({
         commandExistsInPath: vi.fn(() => true),
       }));
@@ -1953,10 +2064,13 @@ describe('runDaemonServiceCliCommand', () => {
     });
   });
 
-  it('preserves a running Windows service across install and retry', async () => {
+  it.each([false, true])('honors configured Windows action verification deadlines across install and retry (query timeout: %s)', async (queryTimesOut) => {
     await withTempDir('happier-service-install-win32-same-owner-', async (homeDir) => {
       const happierHomeDir = `${homeDir}/.happier`;
       const lifecycleEvents: string[] = [];
+      const observedQueryTimeouts: Array<number | undefined> = [];
+      const observedTaskStatusTimeouts: Array<number | undefined> = [];
+      const expectedQueryTimeout = queryTimesOut ? 7_300 : undefined;
       let writeDaemonStateImpl: ((state: DaemonLocallyPersistedState) => void) | null = null;
       envScope.patch({
         HAPPIER_HOME_DIR: happierHomeDir,
@@ -1964,43 +2078,56 @@ describe('runDaemonServiceCliCommand', () => {
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
+        HAPPIER_WINDOWS_SCHTASKS_TIMEOUT_MS: queryTimesOut ? String(expectedQueryTimeout) : undefined,
         HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_TIMEOUT_MS: '120',
         HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_POLL_MS: '10',
         HAPPIER_DAEMON_SERVICE_OWNERSHIP_STABLE_MS: '20',
       });
       vi.resetModules();
-      vi.doMock('node:child_process', async (importOriginal) => {
-        const actual = await importOriginal<typeof import('node:child_process')>();
-        return {
-          ...actual,
-          spawnSync: vi.fn((command: string, args: readonly string[] = []) => {
-            if (command !== 'schtasks') {
-              return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
-            }
-            const action = String(args[0] ?? '');
-            lifecycleEvents.push(action);
-            if (action === '/Run' && writeDaemonStateImpl) {
-              writeDaemonStateImpl({
-                pid: process.pid,
-                httpPort: 43141,
-                startedAt: Date.now(),
-                startedWithCliVersion: configuration.currentCliVersion,
-                startedWithPublicReleaseChannel: currentPublicReleaseChannel,
-                startupSource: 'background-service',
-                serviceLabel: paths.label,
-                runtimeId: 'runtime-win32-install',
-              });
-            }
-            if (action === '/Query') {
-              return {
-                status: 0,
-                stdout: Buffer.from('Status: Running\nScheduled Task State: Enabled\n'),
-                stderr: Buffer.from(''),
-              };
-            }
-            return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
-          }),
-        };
+      doMockChildProcessSpawnSync((command: string, args: readonly string[] = [], options?: { timeout?: number }) => {
+        if (isHappierTaskFolderListing(command, args)) {
+          return { status: 0, stdout: Buffer.from('[]'), stderr: Buffer.from('') };
+        }
+        if (command === 'powershell.exe' && args.some((arg) => arg.includes('.RegisterTask('))) {
+          lifecycleEvents.push('registerTask');
+        }
+        if (isWindowsScheduledTaskStatusRead(command, args)) {
+          observedQueryTimeouts.push(options?.timeout);
+          if (queryTimesOut && options?.timeout) {
+            return {
+              status: null,
+              error: Object.assign(new Error('query timed out'), { code: 'ETIMEDOUT' }),
+              stdout: Buffer.from(''), stderr: Buffer.from(''),
+            };
+          }
+          return { status: 0, stdout: windowsNativeLauncherTaskStatusStdout(paths), stderr: Buffer.from('') };
+        }
+        if (command !== 'schtasks') {
+          return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
+        }
+        const action = String(args[0] ?? '');
+        lifecycleEvents.push(action);
+        if (action === '/Run' && writeDaemonStateImpl) {
+          writeDaemonStateImpl({
+            pid: process.pid,
+            httpPort: 43141,
+            startedAt: Date.now(),
+            startedWithCliVersion: configuration.currentCliVersion,
+            startedWithPublicReleaseChannel: currentPublicReleaseChannel,
+            startupSource: 'background-service',
+            serviceLabel: paths.label,
+            runtimeId: 'runtime-win32-install',
+          });
+        }
+        if (action === '/Query') {
+          observedTaskStatusTimeouts.push(options?.timeout);
+          return {
+            status: 0,
+            stdout: Buffer.from('Status: Running\nScheduled Task State: Enabled\n'),
+            stderr: Buffer.from(''),
+          };
+        }
+        return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
       });
       vi.doMock('./commandExistsInPath', () => ({
         commandExistsInPath: vi.fn(() => true),
@@ -2014,6 +2141,7 @@ describe('runDaemonServiceCliCommand', () => {
       vi.spyOn(controlClient, 'stopDaemon').mockImplementation(async () => {
         lifecycleEvents.push('stopDaemon');
         await clearDaemonState();
+        return { status: 'stopped', method: 'graceful' };
       });
 
       const [{ runDaemonServiceCliCommand, resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths }] = await Promise.all([
@@ -2039,6 +2167,14 @@ describe('runDaemonServiceCliCommand', () => {
 
       const output = captureStdoutJsonOutput<{ ok: boolean; platform: string }>();
       try {
+        if (queryTimesOut) {
+          await expect(runDaemonServiceCliCommand({ argv: ['install', '--yes', '--json'] }))
+            .rejects.toThrow(/did not become the active daemon/i);
+          expect(observedQueryTimeouts.length).toBeGreaterThan(0);
+          expect(new Set(observedQueryTimeouts)).toEqual(new Set([expectedQueryTimeout]));
+          expect(new Set(observedTaskStatusTimeouts)).toEqual(new Set([expectedQueryTimeout]));
+          return;
+        }
         await runDaemonServiceCliCommand({ argv: ['install', '--yes', '--json'] });
         const payload = output.json();
         expect(payload.ok).toBe(true);
@@ -2048,11 +2184,11 @@ describe('runDaemonServiceCliCommand', () => {
       }
 
       const stopIndex = lifecycleEvents.indexOf('stopDaemon');
-      const createIndex = lifecycleEvents.indexOf('/Create');
+      const registrationIndex = lifecycleEvents.indexOf('registerTask');
       const runIndex = lifecycleEvents.indexOf('/Run');
       expect(stopIndex).toBeGreaterThanOrEqual(0);
-      expect(createIndex).toBeGreaterThan(stopIndex);
-      expect(runIndex).toBeGreaterThan(createIndex);
+      expect(registrationIndex).toBeGreaterThan(stopIndex);
+      expect(runIndex).toBeGreaterThan(registrationIndex);
 
       const repeated = captureStdoutJsonOutput<{ ok: boolean }>();
       try {
@@ -2063,6 +2199,9 @@ describe('runDaemonServiceCliCommand', () => {
       } finally {
         repeated.restore();
       }
+      expect(observedQueryTimeouts.length).toBeGreaterThan(0);
+      expect(new Set(observedQueryTimeouts)).toEqual(new Set([expectedQueryTimeout]));
+      expect(new Set(observedTaskStatusTimeouts)).toEqual(new Set([expectedQueryTimeout]));
     });
   });
 
@@ -2089,6 +2228,9 @@ describe('runDaemonServiceCliCommand', () => {
         return {
           ...actual,
           spawnSync: vi.fn((command: string, args: readonly string[] = []) => {
+            if (isHappierTaskFolderListing(command, args)) {
+              return { status: 0, stdout: Buffer.from('[]'), stderr: Buffer.from('') };
+            }
             if (command !== 'schtasks') {
               lifecycleEvents.push(command);
               return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
@@ -2110,7 +2252,9 @@ describe('runDaemonServiceCliCommand', () => {
             if (action === '/Query') {
               return {
                 status: 0,
-                stdout: Buffer.from('Status: Running\nScheduled Task State: Enabled\n'),
+                stdout: Buffer.from(args.includes('/XML')
+                  ? `<Task><Actions><Exec><Arguments>-File &quot;${paths.installedPath}&quot;</Arguments></Exec></Actions></Task>`
+                  : 'Status: Running\nScheduled Task State: Enabled\n'),
                 stderr: Buffer.from(''),
               };
             }
@@ -2130,6 +2274,7 @@ describe('runDaemonServiceCliCommand', () => {
       vi.spyOn(controlClient, 'stopDaemon').mockImplementation(async () => {
         lifecycleEvents.push('stopDaemon');
         await clearDaemonState();
+        return { status: 'stopped', method: 'graceful' };
       });
 
       const [{ runDaemonServiceCliCommand, resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths }] = await Promise.all([
@@ -2163,7 +2308,7 @@ describe('runDaemonServiceCliCommand', () => {
         output.restore();
       }
 
-      expect(lifecycleEvents.slice(0, 3)).toEqual(['stopDaemon', 'powershell.exe', '/Run']);
+      expect(lifecycleEvents.filter((event) => event !== '/Query').slice(0, 3)).toEqual(['stopDaemon', 'powershell.exe', '/Run']);
     });
   });
 
@@ -2220,6 +2365,7 @@ describe('runDaemonServiceCliCommand', () => {
           description: 'Happier Daemon',
           execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
           env: {
+            HAPPIER_HOME_DIR: happierHomeDir,
             HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
             HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             HAPPIER_ACTIVE_SERVER_ID: 'cloud',
@@ -2308,6 +2454,7 @@ describe('runDaemonServiceCliCommand', () => {
           description: 'Happier Daemon',
           execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
           env: {
+            HAPPIER_HOME_DIR: happierHomeDir,
             HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
             HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             HAPPIER_ACTIVE_SERVER_ID: 'cloud',
@@ -2384,6 +2531,7 @@ describe('runDaemonServiceCliCommand', () => {
           description: 'Happier Daemon',
           execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
           env: {
+            HAPPIER_HOME_DIR: happierHomeDir,
             HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
             HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             HAPPIER_ACTIVE_SERVER_ID: 'cloud',
@@ -2747,6 +2895,7 @@ describe('runDaemonServiceCliCommand', () => {
           label: paths.label,
           programArgs: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
           env: {
+            HAPPIER_HOME_DIR: happierHomeDir,
             PATH: '/usr/bin:/bin',
             HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
             HAPPIER_DAEMON_SERVICE_LABEL: paths.label,

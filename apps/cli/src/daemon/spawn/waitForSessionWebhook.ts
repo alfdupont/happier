@@ -1,5 +1,5 @@
 import type { SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
-import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
+import { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
 
 import type { TrackedSession } from '../types';
 
@@ -21,7 +21,7 @@ type WaitForSessionWebhookParams = {
   onSuccess?: (session: TrackedSession) => void | Promise<void>;
 };
 
-function resolveTimeoutMs(explicitTimeoutMs: number | undefined): number {
+export function resolveSessionStartupTimeoutMs(explicitTimeoutMs?: number): number {
   if (typeof explicitTimeoutMs === 'number' && explicitTimeoutMs > 0) {
     return explicitTimeoutMs;
   }
@@ -42,7 +42,7 @@ function resolveTimeoutMs(explicitTimeoutMs: number | undefined): number {
 export function waitForSessionWebhook(
   params: WaitForSessionWebhookParams,
 ): SessionWebhookCompletion {
-  const timeoutMs = resolveTimeoutMs(params.timeoutMs);
+  const timeoutMs = resolveSessionStartupTimeoutMs(params.timeoutMs);
   let currentPid = params.pid;
 
   const completion = new Promise<SpawnSessionResult>((resolve) => {

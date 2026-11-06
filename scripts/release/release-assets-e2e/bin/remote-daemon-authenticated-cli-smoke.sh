@@ -263,15 +263,14 @@ ensure_remote_auth_credentials() {
 }
 
 remote_setup_output="$(mktemp -t remote-daemon-reuse-cli-setup-XXXXXX)"
+# Reuse the primary CLI's own server profile (exported HAPPIER_ACTIVE_SERVER_ID and URLs).
+# --server-url would select the URL-derived server id, whose credentials this home does not hold.
 run_remote_daemon_setup_with_public_flag() {
   hstack remote daemon setup \
     --ssh "$REMOTE_SSH_TARGET" \
     "${remote_channel_args[@]}" \
     --yes \
     --service none \
-    --server-url "$HAPPIER_SERVER_URL" \
-    --webapp-url "$HAPPIER_WEBAPP_URL" \
-    --public-server-url "$HAPPIER_PUBLIC_SERVER_URL" \
     --json
 }
 
@@ -279,6 +278,10 @@ if ! run_remote_daemon_setup_with_public_flag \
   >"$remote_setup_output" 2>&1; then
   echo "[remote-daemon-reuse-cli] remote daemon setup failed; tailing captured output..." >&2
   tail -n 200 "$remote_setup_output" >&2 || true
+  rm -f "$remote_setup_output"
+  exit 1
+fi
+if ! node "$(dirname "$0")/remote-setup-result.mjs" "$remote_setup_output"; then
   rm -f "$remote_setup_output"
   exit 1
 fi

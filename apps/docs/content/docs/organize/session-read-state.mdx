@@ -5,10 +5,7 @@ description: Understand unread session badges, Mark as unread, Mark as read, kee
 
 Happier tracks whether each session has transcript activity you have not viewed yet.
 
-<Callout type="info" title="Session reminders are in development">
-The reminder flow described below is present on the current development branch. It is not yet a
-stable-release availability claim.
-</Callout>
+Session reminders are available since Happier 0.2.13.
 
 Unread state is intentionally simple:
 
@@ -17,6 +14,28 @@ Unread state is intentionally simple:
 - empty sessions do not show manual read-state actions
 
 This state drives unread badges, unread session filtering, and the **Mark as unread** / **Mark as read** actions in the app.
+
+## Unread replies while work continues
+
+In development source, sessions with continuing background work stay **Working** by default, even
+when the foreground turn has ended with an unread reply. A blue dot at the center of the working
+loader signals unread replies while its normal color and animation continue. Reading the reply
+clears the blue dot without moving the session between Working and Needs attention.
+
+**Settings → Session → Unread replies during background work** offers three choices:
+
+- **Keep working status**: keep the working indicator and show a blue center dot for unread replies.
+- **Show unread status in Working**: keep the session in Working, with unread as its main indicator
+  until you read it.
+- **Move unread sessions to Needs attention**: temporarily promote the session until you read it,
+  then return it to Working if background work continues.
+
+None of these choices labels continuing background work Ready for review. This preference follows
+your account across devices.
+
+Permission requests, requests for your input, and failures retain their attention treatment in every
+mode. **Ready for review** becomes available after a completed turn has no remaining reported
+background work; it does not certify that the requested changes are correct or complete.
 
 ## Where to find the actions
 
@@ -88,7 +107,12 @@ the currently selected choice.
 Setting a reminder marks the session's current content read. With no stronger attention reason, a
 future reminder temporarily moves the session out of **Needs attention**. When the time arrives, the
 session returns there without becoming unread, even when no new message has arrived. Opening the
-session does not clear a due reminder; use **Remove reminder** or choose another time.
+session clears a due reminder by default; future reminders stay scheduled. The reminder icon clears,
+but the session stays in its current list position while you view it. When you leave, it moves out of
+**Needs attention** unless you kept it there or another attention reason remains.
+
+Turn off **Settings → Session → Clear reminders on open** to remove due reminders manually instead.
+You can still use **Remove reminder** or choose another time in either mode.
 
 A reminder and **Keep in Needs attention** are separate choices. If you set a reminder on a kept
 session, the future reminder temporarily hides it from **Needs attention** without forgetting the

@@ -12,12 +12,16 @@ import { loadClaudeJsonlReplayBaseline } from '../utils/loadClaudeJsonlReplayBas
 import type { SessionHookData } from '../utils/startHookServer';
 import type { ClaudeUnifiedSessionHookSubscription } from './createClaudeUnifiedHookLifecycleBridge';
 import type { ClaudeUnifiedStartableDisposable } from './_types';
+import type { ClaudeWorkflowActivityObservationContext } from '../workflows/claudeWorkflowActivitySource';
+import { readClaudeTaskLifecycleEnvelope } from '../taskNotifications/claudeTaskLifecycleEnvelope';
 import { readClaudeJsonlTimestampMs } from '../utils/claudeJsonlTimestamp';
+import { readClaudeMainChainAssistantModelId } from '../sessionModels/readClaudeMainChainAssistantModelId';
+import type { ClaudeEffectiveModelObservation } from '../sessionModels/effectiveModelUpdate';
 
 type ClaudeUnifiedTranscriptBridgeSessionFound = (sessionId: string, data: SessionHookData) => void;
 
 function readHookEventName(data: SessionHookData): string {
-  const raw = data.hook_event_name ?? data.hookEventName;
+  const raw = data.hook_event_name ?? data.hookEventName ?? data.eventName;
   return typeof raw === 'string' ? raw : '';
 }
 
@@ -160,11 +164,12 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
   workingDirectory: string;
   claudeConfigDir?: string | null | undefined;
   onMessage?: ((message: RawJSONLines) => void | Promise<void>) | undefined;
+  onEffectiveModel?: ((facts: ClaudeEffectiveModelObservation) => void) | undefined;
   onHistoricalMessage?: ((message: RawJSONLines) => void | Promise<void>) | undefined;
   onTranscriptMessage?: ((message: RawJSONLines) => void) | undefined;
   onRawTranscriptValue?: ((
     value: unknown,
-    observation: Readonly<{ historicalReplay: boolean }>,
+    observation: ClaudeWorkflowActivityObservationContext,
   ) => void) | undefined;
   onLiveProviderTaskJsonlValue?: ((input: Readonly<{
     sessionId: string;
@@ -199,6 +204,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
   onTranscriptMissing?: ((info: { sessionId: string; filePath: string }) => void) | undefined;
   transcriptMissingWarningMs?: number | undefined;
   subscribeClaudeSessionHooks?: ClaudeUnifiedSessionHookSubscription | undefined;
+  onStartupReplayComplete?: (() => void) | undefined;
   /**
    * Committed Claude JSONL dedupe baseline for resume replay (Lane N4). The baseline must be
    * loaded BEFORE the scanner replays initial rows; a load FAILURE fails closed (no
@@ -360,7 +366,18 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
           knownResumeTranscriptPath,
           knownResumeTranscriptPathSource: knownResumeTranscript?.source ?? 'none',
         });
-        unsubscribe = opts.subscribeClaudeSessionHooks((data) => {
+        unsubscribe = opts.subscribeClaudeSessionHooks((data, observation) => {
+          const trustedSessionId = activeTrustedSessionBinding?.sessionInfo.sessionId ?? knownResumeSessionId;
+          const hookSessionId = readHookString(data, 'session_id', 'sessionId');
+          const task = readClaudeTaskLifecycleEnvelope(data);
+          if ((task?.subtype === 'agent-resume' || task?.subtype === 'async-launch')
+            && trustedSessionId && hookSessionId === trustedSessionId) {
+            opts.onRawTranscriptValue?.(data, {
+              historicalReplay: false, authenticatedHook: true,
+              ...(observation?.observedAt !== undefined ? { observedAt: observation.observedAt } : {}),
+              ...(observation?.startupReplay ? { startupReplay: true } : {}),
+            });
+          }
           // A4-MED-2: a subagent (sidechain) SessionStart must never re-key the transcript /
           // resume identity — same shared gate the hook lifecycle bridge uses.
           if (isSidechainSessionHook(data)) {
@@ -447,6 +464,10 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
             message,
             resumeLiveTranscriptAfterMsBySessionId,
           );
+          if (lifecycleOwnedByCurrentRunner && observation?.historicalReplay !== true) {
+            const modelId = readClaudeMainChainAssistantModelId(message);
+            if (modelId) opts.onEffectiveModel?.({ modelId });
+          }
           if (
             shouldForwardFreshResumeTranscriptToMessage(message, freshResumeLiveMessageAfterMsBySessionId)
             && !shouldSuppressPriorEraFailedTurnVisibleReplay(message, lifecycleOwnedByCurrentRunner)
@@ -499,6 +520,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       scanner = nextScanner;
       opts.onSubagentFileCollectorChanged?.(nextScanner.subagentFileCollector);
       flushPendingSessionBindings();
+      opts.onStartupReplayComplete?.();
     },
     async dispose() {
       if (disposed) return;

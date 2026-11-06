@@ -32,6 +32,16 @@ on:
         required: false
         default: ""
         type: string
+      network_transfer:
+        description: "Also run the network transfer workload"
+        required: false
+        default: false
+        type: boolean
+      network_transfer_enforce:
+        description: "Enforce calibrated network ceilings in this run"
+        required: false
+        default: false
+        type: boolean
       installers_channel:
         description: "Installers — Channel for installer smoke tests"
         required: true
@@ -41,6 +51,14 @@ on:
           - stable
           - preview
           - dev
+      installers_source:
+        description: "Installers — Test the published channel or this run's shared CLI build"
+        required: true
+        default: published-channel
+        type: choice
+        options:
+          - published-channel
+          - local-build
       cli_update_to_source:
         description: "CLI update — Target source for explicit continuity checks"
         required: false
@@ -77,7 +95,7 @@ permissions:
 jobs:
   resolve:
     name: Resolve flags
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       run_ui_e2e: ${{ steps.flags.outputs.run_ui_e2e }}
@@ -120,7 +138,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .node-version
       - name: Compute flags
         id: flags
         env:
@@ -134,7 +152,7 @@ jobs:
     name: Release actor guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -151,7 +169,7 @@ jobs:
           private_key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 
   trusted_ref_guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Admit trusted workflow control ref
@@ -176,12 +194,15 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     uses: ./.github/workflows/tests.yml
     secrets: inherit
     with:
       select_jobs_explicitly: true
       runner_pool: ${{ inputs.runner_pool }}
       run_ui_e2e: ${{ needs.resolve.outputs.run_ui_e2e == 'true' }}
+      run_network_transfer: ${{ inputs.network_transfer || inputs.network_transfer_enforce }}
+      network_transfer_enforce: ${{ inputs.network_transfer_enforce }}
       ui_e2e_specs: ${{ needs.resolve.outputs.ui_e2e_specs }}
       run_mobile_e2e_android: ${{ needs.resolve.outputs.run_mobile_e2e_android == 'true' }}
       run_mobile_e2e_ios: ${{ needs.resolve.outputs.run_mobile_e2e_ios == 'true' }}
@@ -202,6 +223,8 @@ jobs:
       run_release_contracts: ${{ needs.resolve.outputs.run_release_contracts == 'true' }}
       run_installers_smoke: ${{ needs.resolve.outputs.run_installers_smoke == 'true' }}
       installers_channel: ${{ inputs.installers_channel }}
+      installers_source: ${{ inputs.installers_source }}
+      installers_ref: ${{ inputs.installers_source == 'local-build' && '.' || inputs.installers_channel }}
       run_binary_smoke: ${{ needs.resolve.outputs.run_binary_smoke == 'true' }}
       run_build_smoke: ${{ needs.resolve.outputs.run_build_smoke == 'true' }}
       run_cli_update_continuity: ${{ needs.resolve.outputs.run_cli_update_continuity == 'true' }}
@@ -242,9 +265,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
@@ -279,6 +300,8 @@ jobs:
     if: ${{ needs.resolve.outputs.run_extended_db == 'true' }}
     permissions:
       contents: read
+      pull-requests: read
+      actions: read
     uses: ./.github/workflows/extended-db-tests.yml
     with:
       select_jobs_explicitly: true

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { WINDOWS_REMOTE_SESSION_LAUNCH_MODES } from './windowsRemoteSessionLaunchMode.js';
+import { lazySchema } from '../lazySchema.js';
 
 /**
  * Session terminal attachment metadata (stored in encrypted `session.metadata`).
@@ -24,6 +25,15 @@ function normalizeTerminalWireSelectors(value: unknown): unknown {
       ? (terminal.requested === 'plain' ? { requested: 'herdr' } : {})
       : (requestedHostKind === undefined ? {} : { requestedHostKind })),
   };
+}
+
+export function createHerdrTerminalMetadataSchema(zod: typeof z) {
+  return zod.object({
+    sessionName: zod.string(),
+    socketPath: zod.string(),
+    terminalId: zod.string(),
+    paneId: zod.string().optional(),
+  });
 }
 
 export function createSessionTerminalMetadataSchema(zod: typeof z) {
@@ -58,14 +68,7 @@ export function createSessionTerminalMetadataSchema(zod: typeof z) {
           socketDirV1: zod.string().optional(),
         })
         .optional(),
-      herdr: zod
-        .object({
-          sessionName: zod.string(),
-          socketPath: zod.string(),
-          terminalId: zod.string(),
-          paneId: zod.string().optional(),
-        })
-        .optional(),
+      herdr: createHerdrTerminalMetadataSchema(zod).optional(),
       windows: zod
         .object({
           host: zod.enum(['windows_terminal', 'console']),
@@ -88,7 +91,7 @@ export function createSessionTerminalMetadataSchema(zod: typeof z) {
   return zod.preprocess(normalizeTerminalWireSelectors, schema);
 }
 
-export const SessionTerminalMetadataSchema = createSessionTerminalMetadataSchema(z);
+export const SessionTerminalMetadataSchema = lazySchema(() => createSessionTerminalMetadataSchema(z));
 export type SessionTerminalMetadata = z.infer<typeof SessionTerminalMetadataSchema>;
 
 /**

@@ -154,6 +154,7 @@ const idleResolvedDrop: UseSessionInlineDragResolvedDrop = Object.freeze({
         visual: Object.freeze({ kind: 'none' }),
     }),
     geometry: Object.freeze({ kind: 'none' }),
+    destinationKey: null,
 });
 
 function createBoundaryProps() {
@@ -165,6 +166,7 @@ function createBoundaryProps() {
         dragEnabled: true,
         draggingSessionKey: null,
         folderViewEnabled: false,
+        folderActionsEnabled: false,
         getRowMoveActionHandlers: vi.fn(() => ({})),
         getRowNativeContextMenuOpenChangeHandler: vi.fn(() => vi.fn()),
         getRowSetTagsHandler: vi.fn(() => vi.fn()),
@@ -237,6 +239,13 @@ describe('SessionListRowModelBoundary', () => {
 
     afterEach(() => {
         standardCleanup();
+    });
+
+    it('keeps folder actions available with the folder view disabled', async () => {
+        const { SessionListRowModelBoundary } = await import('./SessionListRowModelBoundary');
+        const onMoveToFolder = vi.fn();
+        await renderScreen(<SessionListRowModelBoundary {...createBoundaryProps()} folderActionsEnabled getRowMoveActionHandlers={() => ({ onMoveToFolder })} />);
+        expect(rowRenderProps.at(-1)?.onMoveToFolder).toBe(onMoveToFolder);
     });
 
     it('updates one row from its row-store subscription without a parent rerender', async () => {

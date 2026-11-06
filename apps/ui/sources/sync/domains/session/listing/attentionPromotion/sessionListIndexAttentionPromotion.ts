@@ -1,3 +1,4 @@
+import type { SessionListBackgroundWorkAttentionMode } from '../sessionListBackgroundWorkAttention';
 import { t } from '@/text';
 
 import type { SessionAttentionStandingPolicy } from '../../organization/attentionStanding';
@@ -61,6 +62,7 @@ type PlacementLane<Reason extends PlacementReason> = Readonly<{
         standingPolicy: SessionAttentionStandingPolicy | undefined;
         resolveSessionRow: ResolveSessionListIndexRow;
         nowMs: number;
+        backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
     }>) => PlacementCandidate<Reason> | null;
     compareCandidates: (left: PlacementCandidate<Reason>, right: PlacementCandidate<Reason>) => number;
     createGlobalSessionItem: (candidate: PlacementCandidate<Reason>) => SessionIndexItem;
@@ -76,6 +78,7 @@ const ATTENTION_REASON_PRIORITY: Readonly<Record<SessionListAttentionPromotionRe
     // Standing is the floor of the band: it only reaches sessions whose own
     // signals place them nowhere, so it always sorts behind every earned reason.
     standing: 5,
+    reminder: 5,
 };
 
 function normalizeRetainedKeys(retained: ReadonlySet<string> | ReadonlyArray<string> | null | undefined): ReadonlySet<string> {
@@ -149,12 +152,14 @@ function resolveAttentionCandidate(params: Readonly<{
     standingPolicy: SessionAttentionStandingPolicy | undefined;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): PlacementCandidate<SessionListAttentionPromotionReason> | null {
     const key = normalizeSessionListPlacementKey(params.item.serverId, params.item.sessionId);
     if (!key) return null;
     const row = resolveSessionRowForIndexItem(params.item, params.resolveSessionRow);
     if (!row || row.archivedAt != null) return null;
     const placement = projectSessionListPlacement({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         session: row,
         sessionKey: key,
         retainedWorkingSessionKeys: params.retainedWorkingKeys,
@@ -196,7 +201,7 @@ function createAttentionCandidate(params: Readonly<{
     // floor fires the moment `unread` clears and reason priority drops the row
     // to the bottom of the band under the reader. Every earned reason still
     // wins over a retained one — only the floor yields.
-    const resolvedReason = reason === 'standing' && retainedReason
+    const resolvedReason = (reason === 'standing' || reason === 'reminder') && retainedReason
         ? retainedReason
         : reason ?? retainedReason;
     if (!resolvedReason) return null;
@@ -222,12 +227,14 @@ function resolveWorkingCandidate(params: Readonly<{
     retainedAttentionReasons: ReadonlyMap<string, SessionListAttentionPromotionReason>;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): PlacementCandidate<WorkingPlacementCandidateReason> | null {
     const key = normalizeSessionListPlacementKey(params.item.serverId, params.item.sessionId);
     if (!key) return null;
     const row = resolveSessionRowForIndexItem(params.item, params.resolveSessionRow);
     if (!row || row.archivedAt != null) return null;
     const placement = projectSessionListPlacement({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         session: row,
         sessionKey: key,
         retainedWorkingSessionKeys: params.retainedKeys,
@@ -366,6 +373,7 @@ export function buildSessionListIndexGlobalPlacements(params: Readonly<{
     retainedWorkingKeys?: SessionListWorkingRetentionKeySource;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexGlobalPlacementsResult | null {
     if (params.source.length === 0) return null;
 
@@ -397,6 +405,7 @@ export function buildSessionListIndexGlobalPlacements(params: Readonly<{
         let attentionPlacement: SessionListPlacementProjection | null = null;
         if (attentionEnabled) {
             attentionPlacement = projectSessionListPlacement({
+                backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
                 session: row,
                 sessionKey: key,
                 standingPolicy: params.attentionOptions?.standingPolicy,
@@ -429,6 +438,7 @@ export function buildSessionListIndexGlobalPlacements(params: Readonly<{
                 nowMs: params.nowMs,
             })
             : projectSessionListPlacement({
+                backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
                 session: row,
                 sessionKey: key,
                 retainedWorkingSessionKeys: retainedWorkingKeys,
@@ -499,6 +509,7 @@ function reorderSessionRunWithinGroup<Reason extends PlacementReason>(params: Re
     resolveSessionRow: ResolveSessionListIndexRow;
     lane: PlacementLane<Reason>;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): Readonly<{
     items: SessionListIndexItem[];
     changed: boolean;
@@ -506,6 +517,7 @@ function reorderSessionRunWithinGroup<Reason extends PlacementReason>(params: Re
     const candidates = new Map<SessionIndexItem, PlacementCandidate<Reason>>();
     for (const entry of params.entries) {
         const candidate = params.lane.resolveCandidate({
+            backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
             item: entry.item,
             originalIndex: entry.originalIndex,
             retainedKeys: params.retainedKeys,
@@ -548,6 +560,7 @@ function applySessionListIndexPlacementWithinGroups<Reason extends PlacementReas
     resolveSessionRow: ResolveSessionListIndexRow;
     lane: PlacementLane<Reason>;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexItem[] {
     if (params.source.length === 0) {
         return params.source as SessionListIndexItem[];
@@ -563,6 +576,7 @@ function applySessionListIndexPlacementWithinGroups<Reason extends PlacementReas
     const flushRun = () => {
         if (run.length === 0) return;
         const reordered = reorderSessionRunWithinGroup({
+            backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
             entries: run,
             retainedKeys,
             retainedKeyRanks,
@@ -596,11 +610,13 @@ export function buildSessionListIndexAttentionPromotion(params: Readonly<{
     options: SessionListAttentionPromotionOptions | undefined;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexAttentionPromotionResult | null {
     if (normalizeSessionListAttentionPromotionMode(params.options?.mode) !== 'global' || !params.options) {
         return null;
     }
     const result = buildSessionListIndexGlobalPlacements({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         source: params.source,
         attentionOptions: params.options,
         workingOptions: undefined,
@@ -622,12 +638,14 @@ export function buildSessionListIndexWorkingPlacement(params: Readonly<{
     retainedKeys?: SessionListWorkingRetentionKeySource;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexWorkingPlacementResult | null {
     if (normalizeSessionListWorkingPlacementMode(params.options?.mode) !== 'global' || !params.options) {
         return null;
     }
 
     const result = buildSessionListIndexGlobalPlacements({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         source: params.source,
         attentionOptions: undefined,
         workingOptions: params.options,
@@ -649,6 +667,7 @@ export function applySessionListIndexAttentionPromotionWithinGroups(params: Read
     options: SessionListAttentionPromotionOptions | undefined;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexItem[] {
     if (normalizeSessionListAttentionPromotionMode(params.options?.mode) !== 'withinGroups' || !params.options) {
         return params.source as SessionListIndexItem[];
@@ -656,6 +675,7 @@ export function applySessionListIndexAttentionPromotionWithinGroups(params: Read
     const retained = normalizeRetainedAttentionPlacements(params.options.retainedPlacements);
 
     return applySessionListIndexPlacementWithinGroups({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         source: params.source,
         retainedKeys: retained.keys,
         retainedAttentionReasons: retained.reasons,
@@ -672,12 +692,14 @@ export function applySessionListIndexWorkingPlacementWithinGroups(params: Readon
     retainedKeys?: SessionListWorkingRetentionKeySource;
     resolveSessionRow: ResolveSessionListIndexRow;
     nowMs: number;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
 }>): SessionListIndexItem[] {
     if (normalizeSessionListWorkingPlacementMode(params.options?.mode) !== 'withinGroups' || !params.options) {
         return params.source as SessionListIndexItem[];
     }
 
     return applySessionListIndexPlacementWithinGroups({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         source: params.source,
         retainedKeys: params.retainedKeys,
         resolveSessionRow: params.resolveSessionRow,

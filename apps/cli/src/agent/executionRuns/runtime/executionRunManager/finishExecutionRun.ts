@@ -9,6 +9,7 @@ import { readBackendResumableChildSessionId } from '@/agent/executionRuns/contro
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
 import type { ExecutionBudgetRegistry } from '@/daemon/executionBudget/ExecutionBudgetRegistry';
 import { writeExecutionRunMarker } from '@/daemon/executionRunRegistry';
+import { buildExecutionRunConnectedServicesLaunchV1 } from '@/daemon/connectedServices/runsBridge/contract';
 import { projectExecutionRunRequestedConfiguration, type ExecutionRunResumeHandle } from '@happier-dev/protocol';
 
 type EnqueueMarkerWrite = (runId: string, write: () => Promise<void>) => Promise<void>;
@@ -68,7 +69,7 @@ export function finishExecutionRun(args: Readonly<{
     status: args.next.status,
     summary: args.next.summary ?? existing.summary,
     finishedAtMs: args.next.finishedAtMs,
-    ...(args.next.error ? { error: args.next.error } : {}),
+    error: args.next.error,
     ...(args.structuredMeta ? { structuredMeta: args.structuredMeta } : {}),
     latestToolResult: args.toolResult.output,
     ...(existing.retentionPolicy === 'resumable' ? { resumeHandle } : {}),
@@ -113,6 +114,11 @@ export function finishExecutionRun(args: Readonly<{
     startedAtMs: updated.startedAtMs,
     updatedAtMs: args.next.finishedAtMs,
     finishedAtMs: args.next.finishedAtMs,
+    ...(updated.launch?.connectedServicesRegistration ? {
+      executionRunConnectedServicesLaunchV1: buildExecutionRunConnectedServicesLaunchV1(
+        updated.launch.connectedServicesRegistration,
+      ),
+    } : {}),
     ...(typeof updated.summary === 'string' && updated.summary.trim().length > 0 ? { summary: updated.summary } : {}),
     ...(updated.error?.code ? { errorCode: updated.error.code } : {}),
     ...(diagnosticPayload ? { diagnostics: diagnosticPayload } : {}),

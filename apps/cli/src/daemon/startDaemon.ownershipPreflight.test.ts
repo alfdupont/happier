@@ -89,12 +89,14 @@ describe('startDaemon ownership preflight', () => {
         fetchMock.mockReset();
         fetchMock.mockImplementation(async (input: string | URL | Request) => {
             const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+            if (url.pathname === '/ping' && !currentProcessDaemonFixtureAlive) {
+                throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('Control closed'), { code: 'ECONNREFUSED' }) });
+            }
             if (url.pathname === '/stop') currentProcessDaemonFixtureAlive = false;
-            return {
-                ok: true,
+            return new Response(JSON.stringify(url.pathname === '/ping' ? { status: 'ok' } : { success: true }), {
                 status: 200,
-                text: async () => JSON.stringify({ success: true }),
-            } as Response;
+                headers: { 'Content-Type': 'application/json' },
+            });
         });
         vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
             if (pid === process.pid && (signal === 0 || signal === undefined) && !currentProcessDaemonFixtureAlive) {
@@ -201,7 +203,7 @@ describe('startDaemon ownership preflight', () => {
         });
     });
 
-    it('fails closed before auth setup when daemon state is missing but a same-runtime daemon process is alive', async () => {
+    it('fails closed before auth setup when a same-runtime daemon process has proven current scope', async () => {
         await withTempDir('happier-start-daemon-orphan-process-conflict-', async (homeDir) => {
             envScope.patch({
                 HAPPIER_HOME_DIR: homeDir,
@@ -219,6 +221,10 @@ describe('startDaemon ownership preflight', () => {
                             pid: 4242,
                             type: 'dev-daemon',
                             command: `${process.execPath} --import tsx ${join(process.cwd(), 'src/index.ts')} daemon start-sync`,
+                            daemonOwnershipEnvironmentVariables: {
+                                HAPPIER_HOME_DIR: homeDir,
+                                HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: 'cloud',
+                            },
                         },
                     ],
                 };
@@ -248,7 +254,7 @@ describe('startDaemon ownership preflight', () => {
         });
     });
 
-    it('force-stops a state-less same-runtime daemon process when takeover is requested', async () => {
+    it('force-stops a state-less same-runtime daemon with proven current scope when takeover is requested', async () => {
         await withTempDir('happier-start-daemon-orphan-process-takeover-', async (homeDir) => {
             envScope.patch({
                 HAPPIER_HOME_DIR: homeDir,
@@ -279,6 +285,10 @@ describe('startDaemon ownership preflight', () => {
                     pid: 4242,
                     type: 'dev-daemon',
                     command: `${process.execPath} --import tsx ${join(process.cwd(), 'src/index.ts')} daemon start-sync`,
+                    daemonOwnershipEnvironmentVariables: {
+                        HAPPIER_HOME_DIR: homeDir,
+                        HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: 'cloud',
+                    },
                 };
                 return {
                     ...actual,

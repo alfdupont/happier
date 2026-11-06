@@ -165,12 +165,13 @@ OAuth scopes requested by the server:
 
 Important:
 - All values are normalized to lowercase.
-- Allowlists affect access only when GitHub is included in `AUTH_REQUIRED_LOGIN_PROVIDERS`.
+- A non-empty user allowlist is checked before a GitHub signup or identity connection is created, whether or not GitHub is required for login.
+- Login access is restricted by GitHub allowlists only when GitHub is included in `AUTH_REQUIRED_LOGIN_PROVIDERS`.
 
 ### User allowlist
 - `AUTH_GITHUB_ALLOWED_USERS` (CSV of GitHub logins)
 
-If set and GitHub is required for login, the user must match this list or they get `403 not-eligible`.
+If set, a GitHub signup or identity connection must match this list. If GitHub is required for login, the user must also match it to log in or they get `403 not-eligible`.
 
 ### Org allowlist
 - `AUTH_GITHUB_ALLOWED_ORGS` (CSV of org slugs)

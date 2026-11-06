@@ -6,7 +6,7 @@ import type { CommandInvocation } from '@happier-dev/cli-common/process';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 import { HAPPIER_BASE_SYSTEM_PROMPT_V1 } from '@happier-dev/protocol';
 
-import { resolveClaudeSdkPermissionModeFromEnhancedMode } from '../utils/permissionMode';
+import { resolveClaudeSdkPermissionModeFromEnhancedMode, shouldAllowClaudePermissionBypass } from '../utils/permissionMode';
 import { getClaudeSystemPrompt } from '../utils/systemPrompt';
 import { isClaudeCliJavaScriptFile, resolveClaudeCliPath } from '../utils/resolveClaudeCliPath';
 import { ensureClaudeJsRuntimeExecutable } from '../utils/ensureClaudeJsRuntimeExecutable';
@@ -16,7 +16,7 @@ import {
   resolveClaudeStatuslineOriginalCommand,
   type ClaudeStatuslineOverlaySettings,
 } from '../statusline/buildClaudeStatuslineOverlay';
-import { stripNestedSessionDetectionEnv } from '@/utils/processEnv/stripNestedSessionDetectionEnv';
+import { resolveClaudeSessionEnvOverlay } from '../spawn/resolveClaudeSessionEnvOverlay';
 import { buildMissingJavaScriptRuntimeMessage } from '@/runtime/js/buildMissingJavaScriptRuntimeMessage';
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable';
 import { isBun } from '@/utils/runtime';
@@ -247,6 +247,7 @@ function resolveStatuslineOverlaySettings<Mode extends EnhancedMode>(params: Rea
 function buildClaudeArgs<Mode extends EnhancedMode>(
   input: ClaudeUnifiedTerminalSpawnInput<Mode>,
   statuslineSettings: ClaudeStatuslineOverlaySettings | undefined,
+  env: Readonly<NodeJS.ProcessEnv>,
 ): string[] {
   const args: string[] = [];
   const terminalOptions = resolveClaudeTerminalCliOptions({
@@ -288,7 +289,9 @@ function buildClaudeArgs<Mode extends EnhancedMode>(
     args.push('--mcp-config', input.happierMcpConfigJson.trim());
   }
 
-  args.push('--allow-dangerously-skip-permissions');
+  if (shouldAllowClaudePermissionBypass(env)) {
+    args.push('--allow-dangerously-skip-permissions');
+  }
 
   if (permissionMode !== 'default') {
     args.push('--permission-mode', permissionMode);
@@ -301,7 +304,7 @@ function readMaterializedEnvKeySet(env: Pick<NodeJS.ProcessEnv, string>): Set<st
 }
 
 function buildClaudeEnv(envOverlay: Readonly<Record<string, string>> | undefined): Record<string, string> {
-  const env = stripNestedSessionDetectionEnv(buildClaudeSubprocessEnv({
+  const env = buildClaudeSubprocessEnv({
     envOverlay: {
       DISABLE_AUTOUPDATER: '1',
       // Do not force IS_DEMO: Claude then hides workspace trust while still suppressing plugin hooks.
@@ -311,7 +314,7 @@ function buildClaudeEnv(envOverlay: Readonly<Record<string, string>> | undefined
       // placeholder at the process boundary instead of weakening draft detection.
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     },
-  }));
+  });
   return Object.fromEntries(
     Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
@@ -414,10 +417,13 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
   // Env first: the statusline overlay resolves the user's original statusline command from the
   // EFFECTIVE config root of the spawned process (CLAUDE_CONFIG_DIR / HOME in the child env).
   const happierSessionId = normalizeCurrentHappierSessionId(input.happySessionId);
-  const env = withCurrentHappierSessionId(buildClaudeEnv(input.envOverlay), happierSessionId ?? '');
+  const env = withCurrentHappierSessionId(buildClaudeEnv({
+    ...input.envOverlay,
+    ...resolveClaudeSessionEnvOverlay({ claudeCodeIncludeInNativeHistory: input.first.mode.claudeCodeIncludeInNativeHistory }),
+  }), happierSessionId ?? '');
   const statuslineSettings = resolveStatuslineOverlaySettings({ input, deps, env });
   const materializedMcpConfig = await materializeClaudeMcpConfigArgsForSpawn(
-    buildClaudeArgs(input, statuslineSettings),
+    buildClaudeArgs(input, statuslineSettings, env),
   );
   const args = materializedMcpConfig.args;
 
@@ -494,7 +500,9 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
       }),
     };
   } catch (error) {
-    await materializedMcpConfig.cleanup();
+    try { await materializedMcpConfig.cleanup(); } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Claude terminal launch preparation failed with incomplete cleanup', { cause: error });
+    }
     throw error;
   }
 }

@@ -17,6 +17,7 @@ export const RPC_METHODS = {
   DAEMON_MEMORY_ENSURE_UP_TO_DATE: 'daemon.memory.ensureUpToDate',
   DAEMON_MEMORY_STATUS: 'daemon.memory.status',
   DAEMON_SERVER_WORK_STATUS: 'daemon.serverWork.status',
+  DAEMON_NOTIFICATIONS_TEST_PUSH: 'daemon.notifications.testPush',
   DAEMON_MEMORY_SETTINGS_GET: 'daemon.memory.settings.get',
   DAEMON_MEMORY_SETTINGS_SET: 'daemon.memory.settings.set',
   DAEMON_MCP_SERVERS_TEST: 'daemon.mcpServers.test',
@@ -63,6 +64,7 @@ export const RPC_METHODS = {
   DAEMON_DIRECT_SESSION_TRANSCRIPT_READ_AFTER: 'daemon.directSessions.transcript.readAfter',
   DAEMON_DIRECT_SESSION_TAKEOVER: 'daemon.directSessions.takeover',
   DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST: 'daemon.directSessions.takeoverPersist',
+  DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST_START: 'daemon.directSessions.takeoverPersist.start',
   DAEMON_SESSION_GOAL_GET: 'daemon.sessionGoal.get',
   DAEMON_SESSION_GOAL_SET: 'daemon.sessionGoal.set',
   DAEMON_SESSION_GOAL_CLEAR: 'daemon.sessionGoal.clear',
@@ -71,6 +73,7 @@ export const RPC_METHODS = {
   DAEMON_SESSION_USAGE_LIMIT_WAIT_RESUME_ENABLE: 'daemon.sessionUsageLimit.waitResume.enable',
   DAEMON_SESSION_USAGE_LIMIT_WAIT_RESUME_CANCEL: 'daemon.sessionUsageLimit.waitResume.cancel',
   DAEMON_SESSION_USAGE_LIMIT_CHECK_NOW: 'daemon.sessionUsageLimit.checkNow',
+  DAEMON_CONNECTED_SERVICE_IMPORT: 'daemon.connectedService.import',
   DAEMON_CONNECTED_SERVICE_QUOTA_RECOVERY_CREDIT_CONSUME: 'daemon.connectedServiceQuota.recoveryCredit.consume',
   DAEMON_SESSION_CONNECTED_SERVICE_AUTH_SWITCH: 'daemon.sessionConnectedServiceAuth.switch',
   DAEMON_SESSION_RUNNER_STATUS_GET: 'daemon.sessionRunner.status.get',
@@ -105,6 +108,8 @@ export const RPC_METHODS = {
   SESSION_CONTINUATION_INSPECT: 'session.continuation.inspect',
   /** One source read/decrypt for every target shown by the Agent picker. */
   SESSION_CONTINUATION_INSPECT_BATCH: 'session.continuation.inspectBatch',
+  /** Exact configured targets; older daemons cannot safely parse these selections. */
+  SESSION_CONTINUATION_INSPECT_BACKEND_TARGETS: 'session.continuation.inspectBackendTargets',
   /**
    * Read-only rebuild of the activation brief one transition divider stands
    * for. Runs the same bounded context pass the transition ran, bounded by the
@@ -217,6 +222,7 @@ const SOCKET_RPC_PROVIDER_STARTING_METHODS = new Set<string>([
   RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_RESUME_V2,
   RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER,
   RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST,
+  RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST_START,
 ]);
 
 function normalizeSocketRpcSessionId(value: unknown): string | null {
@@ -282,6 +288,7 @@ export const RPC_ERROR_MESSAGES = {
 // Session-scoped RPC method names (used with `${sessionId}:${method}` over socket RPC).
 export const SESSION_RPC_METHODS = {
   SESSION_PERMISSION_RESPOND_LEGACY: 'permission',
+  SESSION_PERMISSION_RESPOND_TO_OCCURRENCE_V1: 'session.permission.respondToOccurrence.v1',
   SESSION_STRUCTURED_QUESTION_RESPOND_V1: 'session.structuredQuestion.respond.v1',
   SESSION_USER_MESSAGE_SEND: 'session.userMessage.send',
   SESSION_PENDING_QUEUE_MATERIALIZE_NEXT: 'session.pendingQueue.materializeNext',
@@ -323,6 +330,7 @@ export const SESSION_RPC_METHODS = {
 
 export function isDelegatedSessionApprovalRpcMethod(methodSuffix: string): boolean {
   return methodSuffix === SESSION_RPC_METHODS.SESSION_PERMISSION_RESPOND_LEGACY
+    || methodSuffix === SESSION_RPC_METHODS.SESSION_PERMISSION_RESPOND_TO_OCCURRENCE_V1
     || methodSuffix === SESSION_RPC_METHODS.SESSION_STRUCTURED_QUESTION_RESPOND_V1;
 }
 

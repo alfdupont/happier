@@ -44,6 +44,8 @@ const setWorkspaceLabelsV1 = vi.fn();
 let collapsedGroupKeysV1: Record<string, boolean> = {};
 const setCollapsedGroupKeysV1 = vi.fn();
 let sessionFolderViewModeV1: 'off' | 'tree' = 'off';
+let foldersFeatureEnabled = true;
+const folderFeatureListeners = new Set<() => void>();
 const setSessionFolderViewModeV1 = vi.fn();
 let sessionFoldersV1: any = { v: 1, folders: [] };
 const setSessionFoldersV1 = vi.fn();
@@ -367,6 +369,7 @@ vi.mock('@/components/ui/lists/flashListCompat/SessionListVirtualizedList', asyn
     SessionListVirtualizedList: ((await import('@/dev/testkit/mocks/flashList')) as typeof import('@/dev/testkit/mocks/flashList')).createCapturingFlashListMock({
         componentName: 'FlashListCompat',
         renderItems: true,
+        memoizeItems: true,
     }).module.FlashList,
 }));
 
@@ -493,7 +496,7 @@ installSessionShellCommonModuleMocks({
         return createModalModuleMock().module;
     },
     storage: async (importOriginal) => {
-        const { createStorageModuleMock, createStorageStoreMock } = await import('@/dev/testkit/mocks/storage');
+        const { createStorageModuleMock, createReactiveStorageStoreMock } = await import('@/dev/testkit/mocks/storage');
         return createStorageModuleMock({
             importOriginal,
             overrides: {
@@ -533,7 +536,7 @@ installSessionShellCommonModuleMocks({
                 },
                 useSessionFolderAssignmentsBySessionKey: () => sessionFolderAssignmentsBySessionKey,
                 useLocalSettingMutable: useLocalSettingMutableMock,
-                storage: createStorageStoreMock(storageState),
+                storage: createReactiveStorageStoreMock(storageState),
             },
         });
     },
@@ -634,7 +637,13 @@ vi.mock('@/hooks/server/useEffectiveServerSelection', () => ({
 }));
 
 vi.mock('@/hooks/server/useFeatureDecision', () => ({
-    useFeatureDecision: () => ({ state: 'enabled' }),
+    useFeatureDecision: (featureId: string) => {
+        const enabled = React.useSyncExternalStore(
+            React.useCallback((listener: () => void) => { folderFeatureListeners.add(listener); return () => { folderFeatureListeners.delete(listener); }; }, []),
+            () => featureId === 'sessions.folders' ? foldersFeatureEnabled : true,
+        );
+        return { state: enabled ? 'enabled' : 'disabled' };
+    },
 }));
 
 let mockVisibleSessionListViewData: any[] | null = [
@@ -798,6 +807,9 @@ function findRecordedGestureDetectors(
     );
 }
 
+// Load the real owner after installing boundaries, outside the first behavior timeout.
+await import('./SessionsList');
+
 describe('SessionsList (native virtualization)', () => {
     beforeEach(async () => {
         const { clearSessionListHeaderFilterRetentionForTests } = await import('./search/useSessionListHeaderFilterRetention');
@@ -811,6 +823,7 @@ describe('SessionsList (native virtualization)', () => {
         workspaceLabelsV1 = {};
         collapsedGroupKeysV1 = {};
         sessionFolderViewModeV1 = 'off';
+        foldersFeatureEnabled = true;
         sessionFoldersV1 = { v: 1, folders: [] };
         sessionListOrderingModeV1 = 'custom';
         sessionListIdentityDisplay = 'avatar';
@@ -920,7 +933,7 @@ describe('SessionsList (native virtualization)', () => {
         expect(readTargets().get('server_a:sess_a').tags).toEqual(['updated-while-closed']);
     });
 
-    it('expands the header search input and collapses it on blur when empty', async () => {
+    it('keeps explicitly opened search mounted on blur until it is dismissed', async () => {
         mockVisibleSessionListViewData = [
             {
                 type: 'header',
@@ -969,6 +982,10 @@ describe('SessionsList (native virtualization)', () => {
             await new Promise((resolve) => setTimeout(resolve, 60));
         });
 
+        expect(screen.findByTestId('session-list-search-input')).toBe(input);
+        await act(async () => {
+            screen.findByTestId('session-list-search-clear')?.props.onPress?.({ stopPropagation: vi.fn() });
+        });
         expect(screen.findAllByTestId('session-list-search-input')).toHaveLength(0);
     });
 
@@ -1086,6 +1103,21 @@ describe('SessionsList (native virtualization)', () => {
         expect(screen.findAllByTestId('session-list-session:sess_a')).toHaveLength(0);
         expect(screen.findAllByTestId('session-list-header:active')).toHaveLength(1);
         expect(screen.findAllByTestId('session-list-session:sess_b')).toHaveLength(1);
+
+        // A live session update can remove the section that originally owned search.
+        mockVisibleSessionListViewData = mockVisibleSessionListViewData.map((item) => item.groupKey === 'active'
+            ? item.type === 'header'
+                ? { ...item, title: 'Inactive', headerKind: 'inactive', groupKey: 'inactive' }
+                : { ...item, groupKey: 'inactive', groupKind: 'date' }
+            : item);
+        const { SessionsList } = await import('./SessionsList');
+        await screen.update(<SessionsList />);
+        expect(screen.findByTestId('session-list-search-input')?.props.value).toBe('other-repo');
+        await act(async () => {
+            screen.findByTestId('session-list-search-clear')?.props.onPress?.({ stopPropagation: vi.fn() });
+        });
+        expect(screen.findAllByTestId('session-list-search-input')).toHaveLength(0);
+        expect(screen.findAllByTestId('session-list-search-trigger').length).toBeGreaterThan(0);
     });
 
     it('keeps focused search open when clearing the last character after no results', async () => {
@@ -1412,19 +1444,20 @@ describe('SessionsList (native virtualization)', () => {
         expect(list.props.getItemType?.(visibleSessionListViewData[2], 2)).toBe('session:default:tail');
     });
 
-    it('disables web FlatList virtualization for first-page-sized lists', async () => {
+    it('uses the shared virtualized surface for first-page-sized web lists', async () => {
         platformOs = 'web';
 
         const screen = await renderSessionsList();
         const list = expectPresent(
-            screen.root.findAll((node) => String(node.type) === 'FlatList')[0],
-            'expected web FlatList',
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected shared virtualized surface',
         );
 
-        expect(list.props.disableVirtualization).toBe(true);
+        expect(screen.root.findAll((node) => String(node.type) === 'FlatList')).toHaveLength(0);
+        expect(list.props.getItemType).toBeTypeOf('function');
     });
 
-    it('disables web FlatList virtualization for medium sidebar lists', async () => {
+    it('uses the shared virtualized surface for medium web lists', async () => {
         platformOs = 'web';
         const header = expectPresent(
             mockVisibleSessionListViewData?.find((item) => item.type === 'header'),
@@ -1448,11 +1481,12 @@ describe('SessionsList (native virtualization)', () => {
 
         const screen = await renderSessionsList();
         const list = expectPresent(
-            screen.root.findAll((node) => String(node.type) === 'FlatList')[0],
-            'expected web FlatList',
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected shared virtualized surface',
         );
 
-        expect(list.props.disableVirtualization).toBe(true);
+        expect(screen.root.findAll((node) => String(node.type) === 'FlatList')).toHaveLength(0);
+        expect(list.props.getItemType).toBeTypeOf('function');
     });
 
     it('uses FlashListCompat for large web lists instead of relying on React Native Web FlatList virtualization', async () => {
@@ -1670,12 +1704,19 @@ describe('SessionsList (native virtualization)', () => {
         expect(updatedRow.props.resolveDropResult).toBe(initialRow.props.resolveDropResult);
         expect(updatedRow.props.onRegisterTreeRowBounds).toBe(initialRow.props.onRegisterTreeRowBounds);
         expect(updatedRow.props.onUnregisterTreeRowBounds).toBe(initialRow.props.onUnregisterTreeRowBounds);
-        expect(updatedRow.props.folderMoveMenuItems).toBe(initialRow.props.folderMoveMenuItems);
         expect(updatedRow.props.onMoveToFolder).toBe(initialRow.props.onMoveToFolder);
         expect(updatedRow.props.onMoveToWorkspaceRoot).toBe(initialRow.props.onMoveToWorkspaceRoot);
         expect(updatedRow.props.onMoveUp).toBe(initialRow.props.onMoveUp);
         expect(updatedRow.props.onMoveDown).toBe(initialRow.props.onMoveDown);
-        expect(updatedRow.props.onSelectFolderMoveMenuItem).toBe(initialRow.props.onSelectFolderMoveMenuItem);
+    });
+
+    it('updates mounted row folder actions when the folder gate changes with folder view off', async () => {
+        const screen = await renderSessionsList();
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toEqual(expect.any(Function));
+        await act(async () => { foldersFeatureEnabled = false; folderFeatureListeners.forEach((listener) => listener()); });
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toBeUndefined();
+        await act(async () => { foldersFeatureEnabled = true; folderFeatureListeners.forEach((listener) => listener()); });
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toEqual(expect.any(Function));
     });
 
     it('invalidates mounted native rows when a row presentation setting changes', async () => {
@@ -1815,6 +1856,33 @@ describe('SessionsList (native virtualization)', () => {
         expect(updatedRow.props.rowAttentionAnimationEnabled).toBe(initialRow.props.rowAttentionAnimationEnabled);
     });
 
+
+    it('activates an already mounted large-web row when viewability changes and receives completion', async () => {
+        platformOs = 'web';
+        const header = expectPresent(mockVisibleSessionListViewData?.find((item) => item.type === 'header'), 'expected header');
+        mockVisibleSessionListViewData = [header, ...Array.from({ length: 145 }, (_, index) => ({
+            type: 'session', session: { ...sessionA, id: `sess_visible_${index}` },
+            groupKey, groupKind: 'date', serverId: 'server_a', serverName: 'Server A',
+        }))];
+        const screen = await renderSessionsList();
+        const list = expectPresent(screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0], 'expected virtualized web list');
+        const target = expectPresent(list.props.data.find((item: SessionListViewItem) => item.type === 'session' && item.session.id === 'sess_visible_80'), 'expected target');
+        expect(findSessionItem(screen, 'sess_visible_80')?.props.rowModel.session.thinking).toBe(false);
+        await act(async () => list.props.onViewableItemsChanged({ changed: [], viewableItems: [{ item: target, index: 81, isViewable: true, key: 'session:server_a:sess_visible_80' }] }));
+        const { storage } = await import('@/sync/domains/state/storage');
+        const previousState = storage.getState();
+        try {
+            const working = { ...sessionA, id: 'sess_visible_80', active: true, activeAt: Date.now(), thinking: true, thinkingAt: Date.now(), presence: 'online' as const, latestTurnStatus: 'in_progress' as const, latestTurnStatusObservedAt: Date.now() };
+            await act(async () => storage.setState((state) => ({ sessionListRenderables: { ...state.sessionListRenderables, sess_visible_80: working } })));
+            expect(findSessionItem(screen, 'sess_visible_80')?.props.rowModel.session.thinking).toBe(true);
+            await act(async () => storage.setState((state) => ({ sessionListRenderables: { ...state.sessionListRenderables, sess_visible_80: { ...working, thinking: false, latestTurnStatus: 'completed', latestTurnStatusObservedAt: Date.now() } } })));
+            expect(findSessionItem(screen, 'sess_visible_80')?.props.rowModel.session.thinking).toBe(false);
+            expect(findSessionItem(screen, 'sess_visible_80')?.props.rowModel.status.state).not.toBe('thinking');
+        } finally {
+            await act(async () => storage.setState(previousState, true));
+        }
+    });
+
     it('keeps row action props stable when FlashList re-renders the same item', async () => {
         platformOs = 'android';
         sessionFolderViewModeV1 = 'tree';
@@ -1837,7 +1905,6 @@ describe('SessionsList (native virtualization)', () => {
         expect(secondRow.props.onMoveToWorkspaceRoot).toBe(firstRow.props.onMoveToWorkspaceRoot);
         expect(secondRow.props.onMoveUp).toBe(firstRow.props.onMoveUp);
         expect(secondRow.props.onMoveDown).toBe(firstRow.props.onMoveDown);
-        expect(secondRow.props.onSelectFolderMoveMenuItem).toBe(firstRow.props.onSelectFolderMoveMenuItem);
         expect(secondRow.props.tags).toBe(firstRow.props.tags);
         expect(secondRow.props.allKnownTags).toBe(firstRow.props.allKnownTags);
     });
@@ -2196,6 +2263,22 @@ describe('SessionsList (native virtualization)', () => {
         });
 
         expect(setSessionMruOrderV1).not.toHaveBeenCalled();
+    });
+
+    it('keeps disabled folder commands inert when invoked by keyboard', async () => {
+        mockPathname = '/session/sess_a';
+        foldersFeatureEnabled = false;
+        sessionFolderAssignmentsBySessionKey = { 'server_a:sess_a': 'planning' };
+        await renderSessionsList();
+        const { Modal } = await import('@/modal');
+        vi.mocked(Modal.show).mockClear();
+        vi.mocked(Modal.alert).mockClear();
+        await act(async () => {
+            keyboardShortcutHandlersRef.current?.['sessions.row.moveToFolder']?.();
+            keyboardShortcutHandlersRef.current?.['sessions.row.moveToWorkspaceRoot']?.();
+        });
+        expect(Modal.show).not.toHaveBeenCalled();
+        expect(Modal.alert).not.toHaveBeenCalled();
     });
 
     it('registers visible session shortcut handlers through the keyboard provider', async () => {
@@ -2998,7 +3081,8 @@ describe('SessionsList (native virtualization)', () => {
         expect(opened.props.nativeContextMenuOpen).toBe(true);
     });
 
-    it('closes an open iOS native context menu when native list scrolling starts', async () => {
+    it.each(['ios', 'android'] as const)('closes an open %s native context menu when native list scrolling starts', async (platform) => {
+        platformOs = platform;
         const screen = await renderSessionsList();
         const list = expectPresent(
             screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
@@ -3019,9 +3103,21 @@ describe('SessionsList (native virtualization)', () => {
 
         const closed = expectPresent(findSessionItem(screen, 'sess_a'), 'expected sess_a session row after scroll start');
         expect(closed.props.nativeContextMenuOpen).toBe(false);
+
+        await act(async () => {
+            first.props.onNativeContextMenuOpenChange(true);
+        });
+        expect(findSessionItem(screen, 'sess_a')?.props.nativeContextMenuOpen).toBe(false);
+
+        await act(async () => {
+            list.props.onScrollEndDrag?.();
+            first.props.onNativeContextMenuOpenChange(true);
+        });
+        expect(findSessionItem(screen, 'sess_a')?.props.nativeContextMenuOpen).toBe(true);
     });
 
-    it('ignores stale iOS native context menu close requests from another row', async () => {
+    it.each(['ios', 'android'] as const)('ignores stale %s native context menu close requests from another row', async (platform) => {
+        platformOs = platform;
         const screen = await renderSessionsList();
         const first = expectPresent(findSessionItem(screen, 'sess_a'), 'expected sess_a session row');
 
@@ -3041,7 +3137,7 @@ describe('SessionsList (native virtualization)', () => {
         expect(stillOpen.props.nativeContextMenuOpen).toBe(true);
     });
 
-    it('does not wrap Android rows in drag or context-menu long-press gestures', async () => {
+    it('shares Android context-menu state without enabling inline drag gestures', async () => {
         platformOs = 'android';
 
         const screen = await renderSessionsList();
@@ -3049,8 +3145,8 @@ describe('SessionsList (native virtualization)', () => {
         const first = expectPresent(findSessionItem(screen, 'sess_a'), 'expected sess_a session row');
         expect(first.props.reorderHandleGesture).toBeUndefined();
         expect(first.props.nativeInlineDragEnabled).toBeUndefined();
-        expect(first.props.nativeContextMenuOpen).toBeUndefined();
-        expect(first.props.onNativeContextMenuOpenChange).toBeUndefined();
+        expect(first.props.nativeContextMenuOpen).toBe(false);
+        expect(first.props.onNativeContextMenuOpenChange).toEqual(expect.any(Function));
         expect(findRecordedGestureDetectors(screen)).toHaveLength(0);
     });
 
@@ -3378,6 +3474,29 @@ describe('SessionsList (native virtualization)', () => {
         expect(readMachineTargetForSessionMock).toHaveBeenCalledWith('sess_b');
     });
 
+    it.each([true, false])('offers project folder creation only when its handler is available (%s)', async (enabled) => {
+        platformOs = 'ios';
+        const { ProjectGroupHeader } = await import('./ProjectGroupHeader');
+        const screen = await renderScreen(
+            <ProjectGroupHeader
+                item={{
+                    type: 'header', title: '/repo', headerKind: 'project', workspaceKey: 'wl_repo',
+                    workspaceScopeHint: { serverId: 'server_a', machineId: 'machine-target', rootPath: '/repo' },
+                }}
+                hasMultipleMachines={false}
+                onRenameWorkspace={vi.fn()}
+                onResetWorkspaceName={vi.fn()}
+                onCreateSession={vi.fn()}
+                onAddFolder={enabled ? vi.fn() : undefined}
+                collapsed={false}
+                onToggleCollapse={vi.fn()}
+                headerTestId="project-header"
+            />,
+        );
+        const menu = screen.root.findByType('DropdownMenu');
+        expect(menu.props.items.find((item: { id: string }) => item.id === 'add-folder')?.disabled).toBe(!enabled);
+    });
+
     it('shows project chevrons only on hover unless the group is collapsed, while keeping the add action visible', async () => {
         platformOs = 'web';
         const { ProjectGroupHeader } = await import('./SessionsList');
@@ -3399,7 +3518,6 @@ describe('SessionsList (native virtualization)', () => {
                     serverName: 'Server A',
                 } as any}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}
@@ -3458,7 +3576,6 @@ describe('SessionsList (native virtualization)', () => {
                     serverName: 'Server A',
                 } as any}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}
@@ -3493,7 +3610,6 @@ describe('SessionsList (native virtualization)', () => {
                     serverName: 'Server A',
                 } as any}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}
@@ -3533,7 +3649,6 @@ describe('SessionsList (native virtualization)', () => {
                     },
                 } as any}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 workspaceFaviconsEnabled={true}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
@@ -3602,7 +3717,6 @@ describe('SessionsList (native virtualization)', () => {
                     },
                 } as any}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}
@@ -3844,7 +3958,6 @@ describe('SessionsList (native virtualization)', () => {
             <ProjectGroupHeader
                 item={projectHeaderItem}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}
@@ -3899,7 +4012,6 @@ describe('SessionsList (native virtualization)', () => {
             <ProjectGroupHeader
                 item={projectHeaderItem}
                 hasMultipleMachines={false}
-                workspaceLabelsV1={{}}
                 onRenameWorkspace={vi.fn()}
                 onResetWorkspaceName={vi.fn()}
                 onCreateSession={vi.fn()}

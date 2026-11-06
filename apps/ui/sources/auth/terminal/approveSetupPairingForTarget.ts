@@ -8,9 +8,11 @@ import { authApprove, AuthApproveUnsupportedResponseError, type AuthApproveResul
 import { TokenStorage } from '@/auth/storage/tokenStorage';
 import { decodeBase64 } from '@/encryption/base64';
 import { createServerUrlComparableKey } from '@/sync/domains/server/url/serverUrlCanonical';
+import { parseToken } from '@/utils/auth/parseToken';
 
 import {
     buildTerminalResponseV2,
+    buildTerminalResponseV2TokenOnly,
     resolveTerminalProvisioningContentPrivateKey,
 } from './terminalProvisioning';
 
@@ -47,7 +49,8 @@ import {
  *     narrower than "only official binaries": the app must not release the key UNATTENDED to a CLI
  *     its own install path did not place.
  *
- * Then, and only then: read the credentials stored for that exact target, seal a V2 response from
+ * Then, and only then: read the credentials stored for that exact target, verify their token still
+ * names the original account, seal a V2 response from
  * the account content private key, post it through `authApprove` addressed at that same relay
  * (`serverFetch` refuses the authenticated write if the relay is not the focused one), and answer
  * the task. The answer carries a boolean and a reason code — never a token, secret or path — and a
@@ -195,14 +198,29 @@ export async function approveSetupPairingForTarget(params: Readonly<{
         return await refuse('credentials_unavailable');
     }
 
+    // A retained run keeps its original target, but this profile's credentials can change on
+    // a later sign-in. Bind the actual token before sealing any account key or contacting relay.
+    let credentialAccountId: string;
+    try {
+        credentialAccountId = parseToken(credentials.token);
+    } catch {
+        return await refuse('credentials_unusable');
+    }
+    if (credentialAccountId !== target.expectedAccountId.trim()) {
+        return await refuse('account_mismatch');
+    }
+
     let responseV2: Uint8Array;
+    let answerTokenOnly: Uint8Array | undefined;
     let terminalPublicKey: Uint8Array;
     try {
         terminalPublicKey = decodeBase64(prompt.publicKeyB64Url, 'base64url');
-        responseV2 = buildTerminalResponseV2({
-            contentPrivateKey: resolveTerminalProvisioningContentPrivateKey(credentials),
+        const contentPrivateKey = await resolveTerminalProvisioningContentPrivateKey(credentials, { endpointUrl: target.expectedRelayUrl });
+        responseV2 = contentPrivateKey ? buildTerminalResponseV2({
+            contentPrivateKey,
             terminalEphemeralPublicKey: terminalPublicKey,
-        });
+        }) : new Uint8Array();
+        answerTokenOnly = contentPrivateKey ? undefined : buildTerminalResponseV2TokenOnly({ terminalEphemeralPublicKey: terminalPublicKey });
     } catch {
         return await refuse('credentials_unusable');
     }
@@ -212,6 +230,7 @@ export async function approveSetupPairingForTarget(params: Readonly<{
         // V1 (legacy secret export) is never offered to an automatic approval.
         result = await authApprove(credentials.token, terminalPublicKey, new Uint8Array(), responseV2, {
             endpointUrl: target.expectedRelayUrl,
+            answerTokenOnly,
         });
     } catch (error) {
         return await refuse(error instanceof AuthApproveUnsupportedResponseError ? 'v2_unavailable' : 'approve_failed');

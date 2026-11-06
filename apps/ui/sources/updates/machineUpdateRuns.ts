@@ -8,11 +8,127 @@ import { machineCapabilitiesInvoke } from '@/sync/ops';
 import { MACHINE_RPC_POLL_INTERVAL_MS } from '@/sync/ops/machineRpcPollInterval';
 import type { AgentId } from '@/agents/catalog/catalog';
 import { t } from '@/text';
-import type { ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
+import { serverAccountScopeKeySuffix, type ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
 
 import type { UpdateItem, UpdateItemStep } from './items/updateItem';
 import type { UpdateRunObservation } from './items/buildMachineUpdateItems';
 import { recordUpdateCompleted } from './updateCompletions';
+import { planUpdateAll } from './items/buildUpdatesSummary';
+
+export type UpdateAllProgress = Readonly<{ done: number; total: number; stopping: boolean }>;
+
+// The plan's lifetime is the update action's, so closing every detail view releases only its
+// subscription. No discovery runs here: the explicit press supplies the already displayed items.
+const batchesByScope = new Map<string, UpdateAllProgress>();
+const batchListeners = new Set<() => void>();
+
+function publishUpdateBatch(key: string, progress: UpdateAllProgress | null): void {
+    if (progress) batchesByScope.set(key, progress);
+    else batchesByScope.delete(key);
+    for (const listener of batchListeners) listener();
+}
+
+export function readUpdateBatch(scope: ServerAccountScope | null): UpdateAllProgress | null {
+    return scope ? batchesByScope.get(serverAccountScopeKeySuffix(scope)) ?? null : null;
+}
+
+export function stopUpdateBatch(scope: ServerAccountScope | null): void {
+    if (!scope) return;
+    const progress = readUpdateBatch(scope);
+    if (progress && !progress.stopping) publishUpdateBatch(serverAccountScopeKeySuffix(scope), { ...progress, stopping: true });
+}
+
+export async function runUpdateBatch(
+    scope: ServerAccountScope,
+    items: readonly UpdateItem[],
+    executeItem: (item: UpdateItem) => Promise<void>,
+): Promise<void> {
+    const key = serverAccountScopeKeySuffix(scope);
+    if (batchesByScope.has(key)) return;
+    const plan = planUpdateAll(items);
+    if (plan.total === 0) return;
+    const byId = new Map(items.map((item) => [item.id, item]));
+    publishUpdateBatch(key, { done: 0, total: plan.total, stopping: false });
+    const settle = () => {
+        const progress = batchesByScope.get(key);
+        if (progress) publishUpdateBatch(key, { ...progress, done: progress.done + 1 });
+    };
+    try {
+        // Helpers → agents → Happier CLI per machine; machines and the app run side by side.
+        const results = await Promise.allSettled([
+            ...plan.machines.map(async (machine) => {
+                for (const itemId of machine.itemIds) {
+                    if (batchesByScope.get(key)?.stopping) return;
+                    const item = byId.get(itemId);
+                    if (item) await executeItem(item);
+                    settle();
+                }
+            }),
+            (async () => {
+                const appItem = plan.appItemId ? byId.get(plan.appItemId) : undefined;
+                if (!appItem || batchesByScope.get(key)?.stopping) return;
+                if (appItem.action.kind === 'run' && appItem.action.verb === 'update') await executeItem(appItem);
+                settle();
+            })(),
+        ]);
+        // Keep the batch observable until every already-started machine settles, even when an
+        // executor throws. Its existing row owner presents the error; preserve the rejected call.
+        for (const result of results) if (result.status === 'rejected') throw result.reason;
+    } finally {
+        publishUpdateBatch(key, null);
+    }
+}
+
+export function useUpdateBatch(
+    scope: ServerAccountScope | null,
+    items: readonly UpdateItem[],
+    executeItem: (item: UpdateItem) => Promise<void>,
+): Readonly<{
+    batch: UpdateAllProgress | null;
+    updateAll: () => Promise<void>;
+    stopAfterCurrent: () => void;
+}> {
+    const key = scope ? serverAccountScopeKeySuffix(scope) : null;
+    const read = React.useCallback(() => key ? batchesByScope.get(key) ?? null : null, [key]);
+    const batch = React.useSyncExternalStore(
+        React.useCallback((listener: () => void) => {
+            batchListeners.add(listener);
+            return () => { batchListeners.delete(listener); };
+        }, []), read, read,
+    );
+    const updateAll = React.useCallback(async () => {
+        if (scope) await runUpdateBatch(scope, items, executeItem);
+    }, [executeItem, items, scope]);
+    const stopAfterCurrent = React.useCallback(() => stopUpdateBatch(scope), [scope]);
+    return { batch, updateAll, stopAfterCurrent };
+}
+
+/** Explicit checks outlive the view that started them, just like Update All. */
+const checksByServer = new Map<string, Promise<void>>();
+const checkListeners = new Set<() => void>();
+
+export function useUpdateCheck(serverId: string, check: () => Promise<void>): Readonly<{
+    checking: boolean;
+    checkNow: () => Promise<void>;
+}> {
+    const read = React.useCallback(() => checksByServer.has(serverId), [serverId]);
+    const checking = React.useSyncExternalStore(React.useCallback((listener: () => void) => {
+        checkListeners.add(listener);
+        return () => { checkListeners.delete(listener); };
+    }, []), read, read);
+    const checkNow = React.useCallback(() => {
+        const current = checksByServer.get(serverId);
+        if (current) return current;
+        const pending = Promise.resolve().then(check).finally(() => {
+            checksByServer.delete(serverId);
+            for (const listener of checkListeners) listener();
+        });
+        checksByServer.set(serverId, pending);
+        for (const listener of checkListeners) listener();
+        return pending;
+    }, [check, serverId]);
+    return { checking, checkNow };
+}
 
 export {
     markUpdateCompletionsSeen,
@@ -127,8 +243,11 @@ function readRuntimeSentence(message: string): string | null {
     return /[.!?…]$/.test(text) ? text : null;
 }
 
-/** K6 failure codes → one sentence, when the runtime gave no sentence of its own. */
-function describeInstallFailure(code: string | undefined): string {
+/** Known structured failures own their guidance; other failures may supply a runtime sentence. */
+function describeInstallFailure({ code, message }: Readonly<{ code?: string; message: string }>): string {
+    if (code === 'archive-expanded-byte-limit') return t('updates.row.archiveExpandedByteLimit');
+    const runtimeSentence = readRuntimeSentence(message);
+    if (runtimeSentence) return runtimeSentence;
     if (code === 'update-not-verified') return t('updates.row.updateNotVerified');
     if (code === 'update-not-available') return t('updates.row.updateItYourWay');
     return t('updates.row.failedGeneric');
@@ -157,13 +276,13 @@ function readTaskResult(value: unknown): Readonly<{ ok: boolean; code?: string }
  * the app's machine-RPC cadence. No deadline is guessed: the task settles as soon as the updater
  * is spawned. A machine that stops answering first leaves the outcome unknown, never admitted.
  */
-async function awaitRemoteTaskOutcome(serverId: string, machineId: string, taskId: string): Promise<RemoteTaskOutcome> {
+async function awaitRemoteTaskOutcome(scope: ServerAccountScope, machineId: string, taskId: string): Promise<RemoteTaskOutcome> {
     for (;;) {
         const polled = await machineCapabilitiesInvoke(machineId, {
             id: 'tool.systemTasks',
             method: 'poll',
             params: { taskId, cursor: 0 },
-        }, { serverId });
+        }, scope);
         if (!polled.supported || !polled.response.ok) return { kind: 'unknown' };
         const payload = polled.response.result as { result?: unknown } | null;
         const result = readTaskResult(payload?.result);
@@ -178,7 +297,7 @@ async function runRemoteCliUpdate(scope: ServerAccountScope, itemId: string, mac
         id: 'tool.systemTasks',
         method: 'start',
         params: { spec: { protocolVersion: 1, kind: 'cli.update.v1', params: {} } },
-    }, { serverId });
+    }, scope);
     if (!started.supported) {
         // A transport loss may still have reached the machine: unknown (Retry), not a refusal.
         setRecord(serverId, itemId, {
@@ -196,7 +315,7 @@ async function runRemoteCliUpdate(scope: ServerAccountScope, itemId: string, mac
         setRecord(serverId, itemId, { status: 'failed', message: describeRemoteFailure(undefined) });
         return;
     }
-    const outcome = await awaitRemoteTaskOutcome(serverId, machineId, taskId);
+    const outcome = await awaitRemoteTaskOutcome(scope, machineId, taskId);
     if (outcome.kind === 'unknown') {
         setRecord(serverId, itemId, { status: 'failed', message: t('updates.row.outcomeUnknown') });
         return;
@@ -216,8 +335,8 @@ async function runRemoteCliUpdate(scope: ServerAccountScope, itemId: string, mac
  * latest version) through the capability-cache owner, so a finished update resolves its row and
  * the pill count from the machine's own answer.
  */
-export function refreshMachineUpdateFacts(serverId: string, machineId: string): void {
-    void prefetchMachineCapabilities({ machineId, serverId, request: { ...buildMachineUpdateFactsRequest(), bypassCache: true } });
+export function refreshMachineUpdateFacts(serverId: string, machineId: string): Promise<void> {
+    return prefetchMachineCapabilities({ machineId, serverId, request: { ...buildMachineUpdateFactsRequest(), bypassCache: true } });
 }
 
 /**
@@ -230,13 +349,14 @@ export async function runMachineItemUpdate(
 ): Promise<void> {
     const machineId = item.machineId;
     if (!machineId || item.action.kind !== 'run') return;
-    // Captured once: the run, its polls and its record stay on the server its row came from.
+    // Captured once: mutation and polls authenticate as the account that initiated this row.
     const scope = context.scope;
     const serverId = scope.serverId;
     if (readScope(serverId).get(item.id)?.status === 'running') return;
     setRecord(serverId, item.id, { status: 'running' });
 
     const subject = item.subject;
+    let completed: 'finished' | 'alreadyCurrent' | null = null;
     try {
         if (subject.kind === 'happier-cli') {
             await runRemoteCliUpdate(scope, item.id, machineId, context.lastUpdateSignature ?? '');
@@ -262,7 +382,7 @@ export async function runMachineItemUpdate(
             setRecord(serverId, item.id, { status: 'failed', message: t('updates.row.failedGeneric') });
             return;
         }
-        const result = await machineCapabilitiesInvoke(machineId, request, { serverId, timeoutMs: INSTALL_INVOKE_TIMEOUT_MS });
+        const result = await machineCapabilitiesInvoke(machineId, request, { ...scope, timeoutMs: INSTALL_INVOKE_TIMEOUT_MS });
         if (!result.supported) {
             setRecord(serverId, item.id, {
                 status: 'failed',
@@ -273,21 +393,24 @@ export async function runMachineItemUpdate(
         if (!result.response.ok) {
             setRecord(serverId, item.id, {
                 status: 'failed',
-                message: readRuntimeSentence(result.response.error.message) ?? describeInstallFailure(result.response.error.code),
+                message: describeInstallFailure(result.response.error),
                 logPath: typeof result.response.logPath === 'string' ? result.response.logPath : null,
             });
             return;
         }
         const outcome = result.response.result as { alreadyCurrent?: unknown } | null | undefined;
         if (outcome?.alreadyCurrent === true) {
-            setRecord(serverId, item.id, { status: 'alreadyCurrent' });
+            completed = 'alreadyCurrent';
             return;
         }
-        setRecord(serverId, item.id, { status: 'finished' });
-        recordUpdateCompleted(scope, item.id);
+        completed = 'finished';
     } catch {
         setRecord(serverId, item.id, { status: 'failed', message: t('updates.row.failedGeneric') });
     } finally {
-        refreshMachineUpdateFacts(serverId, machineId);
+        await refreshMachineUpdateFacts(serverId, machineId);
+        if (completed) {
+            setRecord(serverId, item.id, { status: completed });
+            if (completed === 'finished') recordUpdateCompleted(scope, item.id);
+        }
     }
 }

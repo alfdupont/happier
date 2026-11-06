@@ -18,7 +18,7 @@ import { getLatestDaemonLog } from '@/ui/logger';
 import { runDoctorCommand } from '@/ui/doctor';
 import { listDaemonStatusesForAllKnownServers, stopAllDaemonsBestEffort } from '@/daemon/multiDaemon';
 import { spawnDetachedDaemonStartSync } from '@/daemon/runtime/spawnDetachedDaemonStartSync';
-import { readCredentials } from '@/persistence';
+import { readCredentials, updateSettings } from '@/persistence';
 import { resolveLaunchAgentPlistPath, resolveSystemdUserUnitPath } from '@/daemon/service/plan';
 import { configuration } from '@/configuration';
 import { decodeJwtPayload } from '@/cloud/decodeJwtPayload';
@@ -48,6 +48,7 @@ import { resolveDaemonServiceCliRuntimeFromEnv } from '@/daemon/service/cli';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { writeJsonStdout } from '@/cli/output/jsonEnvelope';
+import { cmd, createStepPrinter, definitionList, errorFrame, fail, ok, warn } from '@happier-dev/cli-common/output';
 
 async function printDaemonJson(payload: unknown): Promise<void> {
   await writeJsonStdout(payload);
@@ -83,6 +84,7 @@ ${chalk.bold('Usage:')}
   happier daemon restart [--takeover]  Restart the daemon (stop -> start)
   happier daemon restart --restart-session-runners  Restart the daemon, preserve sessions, then restart tracked session runners on the current CLI
   happier daemon restart-session-runners [--session-id <id>] [--dry-run] [--force-current-cli]  Restart eligible tracked session runners on the current CLI
+  happier daemon restart-session-runners --on-update on|off  Automatically restart idle stale session runners whenever the daemon starts on a newer CLI
   happier daemon stop               Stop a manual daemon (sessions stay alive; use happier service stop for installed background services)
   happier daemon stop --kill-sessions  Stop a manual daemon and its tracked sessions
   happier daemon stop --all         Stop daemons for all configured relays
@@ -107,11 +109,11 @@ ${chalk.bold('Usage:')}
   For installed background services, use happier service start|stop|restart.
 
   If you want to kill all happier related processes run
-  ${chalk.cyan('happier doctor clean')}
+  ${cmd('happier doctor clean')}
 
 ${chalk.bold('Note:')} The daemon is the local Happier process on this computer. Automatic startup is provided by installed background services (\`happier service\`).
 
-${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happier doctor clean')}
+${chalk.bold('To clean up runaway processes:')} Use ${cmd('happier doctor clean')}
 `);
 }
 
@@ -125,6 +127,63 @@ function parseDaemonSessionIdOption(args: readonly string[]): string | null {
   const value = args[index + 1]?.trim() ?? '';
   if (!value || value.startsWith('--')) return '';
   return value;
+}
+
+function parseDaemonOnUpdateOption(args: readonly string[]): boolean | 'invalid' | null {
+  const index = args.indexOf('--on-update');
+  if (index < 0) return null;
+  const value = args[index + 1]?.trim().toLowerCase();
+  if (value === 'on') return true;
+  if (value === 'off') return false;
+  return 'invalid';
+}
+
+const ON_UPDATE_CONFLICTING_FLAGS = ['--session-id', '--dry-run', '--force-current-cli'] as const;
+
+async function exitWithOnUpdateError(
+  error: string,
+  message: string,
+  jsonRequested: boolean,
+): Promise<never> {
+  if (jsonRequested) {
+    await printDaemonJson({ ok: false, error, message });
+  } else {
+    console.error(message);
+  }
+  process.exit(1);
+}
+
+async function handleSessionRunnerOnUpdateOption(
+  args: readonly string[],
+  enabled: boolean | 'invalid',
+  jsonRequested: boolean,
+): Promise<never> {
+  if (enabled === 'invalid') {
+    return await exitWithOnUpdateError('invalid_on_update_value', '`--on-update` requires `on` or `off`.', jsonRequested);
+  }
+  const conflictingFlag = ON_UPDATE_CONFLICTING_FLAGS.find((flag) => args.includes(flag));
+  if (conflictingFlag) {
+    return await exitWithOnUpdateError(
+      'on_update_conflicting_options',
+      `\`--on-update\` only changes the setting and cannot be combined with \`${conflictingFlag}\`.`,
+      jsonRequested,
+    );
+  }
+
+  try {
+    await updateSettings((current) => ({ ...current, restartSessionRunnersOnUpdate: enabled }));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return await exitWithOnUpdateError('settings_update_failed', `Failed to save the setting: ${reason}`, jsonRequested);
+  }
+  if (jsonRequested) {
+    await printDaemonJson({ ok: true, restartSessionRunnersOnUpdate: enabled });
+  } else if (enabled) {
+    console.log('Automatic session runner restart after updates: on (takes effect the next time the daemon starts)');
+  } else {
+    console.log('Automatic session runner restart after updates: off');
+  }
+  process.exit(0);
 }
 
 function printSessionRunnerRestartSummary(result: RestartAllDaemonSessionRunnersResult, dryRun: boolean): void {
@@ -190,19 +249,15 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
   }
 
   if (daemonSubcommand === 'list') {
-    try {
-      const sessions = await listDaemonSessions();
+    const sessions = await listDaemonSessions();
 
-      if (sessions.length === 0) {
-        console.log(
-          'No active sessions this daemon is aware of (they might have been started by a previous version of the daemon)',
-        );
-      } else {
-        console.log('Active sessions:');
-        await writeJsonStdout(sessions, { pretty: true });
-      }
-    } catch {
-      console.log('No daemon running');
+    if (sessions.length === 0) {
+      console.log(
+        'This daemon has no tracked active sessions. Use `happier session list --active` to list active sessions on the relay.',
+      );
+    } else {
+      console.log('Active sessions:');
+      await writeJsonStdout(sessions, { pretty: true });
     }
     return;
   }
@@ -225,6 +280,10 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
 
   if (daemonSubcommand === 'restart-session-runners') {
     const jsonRequested = args.includes('--json');
+    const onUpdate = parseDaemonOnUpdateOption(args);
+    if (onUpdate !== null) {
+      await handleSessionRunnerOnUpdateOption(args, onUpdate, jsonRequested);
+    }
     const dryRun = args.includes('--dry-run');
     const mode = parseDaemonSessionRunnerRestartMode(args);
     const sessionId = parseDaemonSessionIdOption(args);
@@ -306,9 +365,11 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
           relayId: configuration.activeServerId,
         });
       } else {
-        console.log('Daemon already running');
-        console.log(`  Relay URL: ${configuration.serverUrl}`);
-        console.log(`  Relay profile: ${configuration.activeServerId}`);
+        console.log(ok('Daemon already running'));
+        console.log(definitionList([
+          { label: 'Relay URL', value: configuration.serverUrl },
+          { label: 'Relay profile', value: configuration.activeServerId },
+        ], { indent: '  ' }));
       }
       process.exit(0);
     }
@@ -365,26 +426,38 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     }
 
     if (takeoverDecision.kind === 'manual-owner-takeover' && !jsonRequested) {
-      console.error('Taking over the current manual daemon before starting another daemon...');
+      console.error(warn('Taking over the current manual daemon before starting another daemon'));
     }
 
-    const child = await spawnDetachedDaemonStartSync(takeoverRequested
-      ? {
-        env: {
-          ...process.env,
-          HAPPIER_DAEMON_TAKEOVER: '1',
-        },
-      }
-      : {});
-    child.unref();
+    // Starting waits until the daemon answers; show that as a timed step (never in --json).
+    const steps = createStepPrinter({ enabled: !jsonRequested });
+    steps.start('Starting daemon');
+    let started = false;
+    let child: Awaited<ReturnType<typeof spawnDetachedDaemonStartSync>>;
+    try {
+      child = await spawnDetachedDaemonStartSync(takeoverRequested
+        ? {
+          env: {
+            ...process.env,
+            HAPPIER_DAEMON_TAKEOVER: '1',
+          },
+        }
+        : {});
+      child.unref();
 
-    const timeoutMs = readDaemonStartWaitTimeoutMs();
-    const pollMs = readDaemonStartWaitPollMs();
-    const started = await waitForDaemonRunningWithinBudget({
-      isRunning: () => checkIfDaemonRunningAndCleanupStaleState(),
-      timeoutMs,
-      pollMs,
-    });
+      const timeoutMs = readDaemonStartWaitTimeoutMs();
+      const pollMs = readDaemonStartWaitPollMs();
+      started = await waitForDaemonRunningWithinBudget({
+        isRunning: () => checkIfDaemonRunningAndCleanupStaleState(),
+        timeoutMs,
+        pollMs,
+      });
+    } catch (error) {
+      steps.stop('x', 'Starting daemon');
+      throw error;
+    }
+    if (started) steps.stop('✓', 'Started daemon');
+    else steps.pause();
 
     if (started) {
       let account: string | undefined;
@@ -405,10 +478,11 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
           ...(account ? { account } : {}),
         });
       } else {
-        console.log('Daemon started successfully');
-        console.log(`  Relay URL: ${configuration.serverUrl}`);
-        console.log(`  Relay profile: ${configuration.activeServerId}`);
-        if (account) console.log(`  Account: ${account}`);
+        console.log(definitionList([
+          { label: 'Relay URL', value: configuration.serverUrl },
+          { label: 'Relay profile', value: configuration.activeServerId },
+          ...(account ? [{ label: 'Account', value: account }] : []),
+        ], { indent: '  ' }));
       }
     } else {
       const inspection = await inspectDaemonRunningStateAndCleanupStaleState().catch(() => ({ status: 'not-running' as const }));
@@ -423,12 +497,12 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
             ...(latestDaemonLog?.path ? { latestDaemonLogPath: latestDaemonLog.path } : {}),
           });
         } else {
-          console.log('Daemon is still starting in the background');
-          console.log(`  Relay URL: ${configuration.serverUrl}`);
-          console.log(`  Relay profile: ${configuration.activeServerId}`);
-          if (latestDaemonLog?.path) {
-            console.log(`  Latest daemon log: ${latestDaemonLog.path}`);
-          }
+          console.log(warn('Daemon is still starting in the background'));
+          console.log(definitionList([
+            { label: 'Relay URL', value: configuration.serverUrl },
+            { label: 'Relay profile', value: configuration.activeServerId },
+            ...(latestDaemonLog?.path ? [{ label: 'Latest daemon log', value: latestDaemonLog.path }] : []),
+          ], { indent: '  ' }));
         }
         process.exit(0);
       }
@@ -441,10 +515,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
           ...(latestDaemonLog?.path ? { latestDaemonLogPath: latestDaemonLog.path } : {}),
         });
       } else {
-        console.error('Failed to start daemon');
-        if (latestDaemonLog?.path) {
-          console.error(`Latest daemon log: ${latestDaemonLog.path}`);
-        }
+        console.error(errorFrame('Failed to start daemon', latestDaemonLog?.path ? [`Latest daemon log: ${latestDaemonLog.path}`] : []));
       }
       process.exit(1);
     }
@@ -456,9 +527,11 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     const takeoverRequested = args.includes('--takeover');
     const startupSource = resolveDaemonStartupSourceFromEnv(process.env);
     if (ownership.kind === 'compatible' && startupSource !== 'self-restart') {
-      console.log(chalk.green('Daemon already running'));
-      console.log(`  Relay URL: ${configuration.serverUrl}`);
-      console.log(`  Relay profile: ${configuration.activeServerId}`);
+      console.log(ok('Daemon already running'));
+      console.log(definitionList([
+        { label: 'Relay URL', value: configuration.serverUrl },
+        { label: 'Relay profile', value: configuration.activeServerId },
+      ], { indent: '  ' }));
       process.exit(0);
     }
     const takeoverDecision = resolveDaemonTakeoverDecision({
@@ -507,8 +580,9 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
 
   if (daemonSubcommand === 'stop') {
     const stopSessions = args.includes('--kill-sessions');
+    const steps = createStepPrinter({ enabled: !args.includes('--json') });
     if (args.includes('--all')) {
-      await stopAllDaemonsBestEffort({ stopSessions });
+      await steps.run('Stopping all daemons', () => stopAllDaemonsBestEffort({ stopSessions }), (result) => result.status === 'stopped' ? 'Stopped all daemons' : 'No daemons were running');
       process.exit(0);
     }
     const ownership = await evaluateCurrentDaemonOwner();
@@ -517,13 +591,10 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
         intent: 'daemon-stop',
         owner: ownership.owner,
       });
-      console.error(message.title);
-      for (const line of message.lines) {
-        console.error(`  ${line}`);
-      }
+      console.error(errorFrame(message.title, [...message.lines]));
       process.exit(1);
     }
-    await stopDaemon({ stopSessions });
+    await steps.run('Stopping daemon', () => stopDaemon({ stopSessions }), (result) => result.status === 'stopped' ? 'Stopped daemon' : 'No daemon was running');
     process.exit(0);
   }
 
@@ -618,17 +689,27 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
       }
     }
 
-    const restartResult = await restartDaemonAndWait({
-      stopSessions,
-      takeover: takeoverRequested,
-      ...(restartSessionRunners
-        ? {
-          restartSessionRunners: true,
-          restartSessionRunnersMode: 'force_current_cli' as const,
-        }
-        : {}),
-    });
+    const restartSteps = createStepPrinter({ enabled: !jsonRequested });
+    restartSteps.start('Restarting daemon');
+    let restartResult: Awaited<ReturnType<typeof restartDaemonAndWait>>;
+    try {
+      restartResult = await restartDaemonAndWait({
+        stopSessions,
+        takeover: takeoverRequested,
+        ...(restartSessionRunners
+          ? {
+            restartSessionRunners: true,
+            restartSessionRunnersMode: 'force_current_cli' as const,
+          }
+          : {}),
+      });
+    } catch (error) {
+      restartSteps.stop('x', 'Restarting daemon');
+      throw error;
+    }
     const started = typeof restartResult === 'boolean' ? restartResult : restartResult.ok;
+    if (started && !(typeof restartResult !== 'boolean' && restartResult.status === 'starting')) restartSteps.stop('✓', 'Restarted daemon');
+    else restartSteps.pause();
     const restartStatus = typeof restartResult === 'boolean' ? undefined : restartResult.status;
     const sessionRunnerRestart = typeof restartResult === 'boolean'
       ? undefined
@@ -646,12 +727,12 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
             ...(latestDaemonLog?.path ? { latestDaemonLogPath: latestDaemonLog.path } : {}),
           });
         } else {
-          console.log('Daemon is still restarting in the background');
-          console.log(`  Relay URL: ${configuration.serverUrl}`);
-          console.log(`  Relay profile: ${configuration.activeServerId}`);
-          if (latestDaemonLog?.path) {
-            console.log(`  Latest daemon log: ${latestDaemonLog.path}`);
-          }
+          console.log(warn('Daemon is still restarting in the background'));
+          console.log(definitionList([
+            { label: 'Relay URL', value: configuration.serverUrl },
+            { label: 'Relay profile', value: configuration.activeServerId },
+            ...(latestDaemonLog?.path ? [{ label: 'Latest daemon log', value: latestDaemonLog.path }] : []),
+          ], { indent: '  ' }));
         }
         process.exit(0);
       }
@@ -665,15 +746,16 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
           ...(sessionRunnerRestart ? { sessionRunnerRestart } : {}),
         });
       } else {
-        console.log('Daemon restarted successfully');
-        console.log(`  Relay URL: ${configuration.serverUrl}`);
-        console.log(`  Relay profile: ${configuration.activeServerId}`);
-        if (sessionRunnerRestart) {
-          console.log(
-            `  Session runners: ${sessionRunnerRestart.restartedCount} restarted, ` +
-            `${sessionRunnerRestart.skippedCount} skipped, ${sessionRunnerRestart.failedCount} failed`,
-          );
-        }
+        console.log(definitionList([
+          { label: 'Relay URL', value: configuration.serverUrl },
+          { label: 'Relay profile', value: configuration.activeServerId },
+          ...(sessionRunnerRestart
+            ? [{
+              label: 'Session runners',
+              value: `${sessionRunnerRestart.restartedCount} restarted, ${sessionRunnerRestart.skippedCount} skipped, ${sessionRunnerRestart.failedCount} failed`,
+            }]
+            : []),
+        ], { indent: '  ' }));
       }
       process.exit(0);
     }
@@ -698,10 +780,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
       if (sessionRunnerRestart) {
         printSessionRunnerRestartFailureAfterDaemonRestart(sessionRunnerRestart);
       } else {
-        console.error(failureMessage);
-      }
-      if (!sessionRunnerRestart && latestDaemonLog?.path) {
-        console.error(`Latest daemon log: ${latestDaemonLog.path}`);
+        console.error(errorFrame(failureMessage, latestDaemonLog?.path ? [`Latest daemon log: ${latestDaemonLog.path}`] : []));
       }
     }
     process.exit(1);
@@ -749,6 +828,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
             daemon: {
               installed: entry.service.installed,
               running: entry.daemon.running,
+              presence: entry.daemon.presence,
               pid: entry.daemon.pid,
               httpPort: entry.daemon.httpPort ?? null,
               staleStateFile: Boolean(entry.daemon.staleStateFile),
@@ -766,7 +846,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     if (args.includes('--all')) {
       const statuses = await listDaemonStatusesForAllKnownServers();
       for (const entry of statuses) {
-        const state = entry.daemon.running ? `running (pid ${entry.daemon.pid ?? '—'})` : 'not running';
+        const state = entry.daemon.presence === 'unverified' ? 'unverified (authenticated control unavailable)' : entry.daemon.running ? `running (pid ${entry.daemon.pid ?? '—'})` : 'not running';
         console.log(`${entry.name} (${entry.serverId})`);
         if (entry.serverUrl) console.log(`  Relay URL: ${entry.serverUrl}`);
         console.log(`  Daemon: ${state}`);
@@ -793,7 +873,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     try {
       await runDaemonServiceCliCommand({ argv: ['install', ...args.slice(2)] });
     } catch (error) {
-      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+      console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
       process.exit(1);
     }
     return;
@@ -803,7 +883,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     try {
       await runDaemonServiceCliCommand({ argv: ['uninstall', ...args.slice(2)] });
     } catch (error) {
-      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+      console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
       process.exit(1);
     }
     return;

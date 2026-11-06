@@ -113,7 +113,7 @@ describe('happier self update for binary installs', () => {
       argv: ['repair'],
       commandPath: 'happier doctor',
     });
-    expect(maybeRunDoctorRepairMock).toHaveBeenCalledWith({ migrationRan: false });
+    expect(maybeRunDoctorRepairMock).toHaveBeenCalledWith({ migrationRan: false, channel: 'stable' });
   });
 
   it('binds an exact --to version to the transaction', async () => {
@@ -184,6 +184,8 @@ describe('happier self update for binary installs', () => {
   });
 
   it('recognises the Homebrew keg from the compiled binary path when argv only names the embedded bundle', async () => {
+    // Load the runtime asset owner before replacing the executable boundary with a nonexistent keg.
+    await import('./self');
     // A Bun-compiled `happier` reports `argv[1]` as `/$bunfs/root/happier`; only `execPath` (the
     // resolved executable) says where the payload was installed.
     const originalExecPath = process.execPath;

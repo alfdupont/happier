@@ -23,6 +23,8 @@ export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   serviceId: string;
   groupId: string;
   activeProfileId: string | null;
+  lastSwitchReason?: string | null;
+  lastSwitchAt?: number | null;
   generation: number;
   runtimeStateRevision: number;
   /** Exact credential epoch for the active profile when the projection can resolve it. */
@@ -30,6 +32,9 @@ export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   policy: ConnectedServiceAuthGroupPolicyV1;
   members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
   memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  /** Models requested or applied by live sessions sharing this pool. */
+  requiredModelIds?: ReadonlyArray<string>;
+  quotaProbeDeferredUntilMsByProfileId?: ReadonlyMap<string, number>;
 }>;
 
 export type LeaseCompletion = Readonly<{
@@ -220,7 +225,16 @@ export type ConnectedServiceAuthGroupSwitchResult =
       diagnostics?: unknown;
     }>
   | Readonly<{
+      status: 'quota_proof_unavailable';
+      activeProfileId: string | null;
+      generation: number;
+      retryAtMs?: number;
+      diagnostics?: ConnectedServiceAuthGroupSwitchDecisionDiagnostics;
+    }>
+  | Readonly<{
       status: 'no_eligible_member';
+      /** Present for current-member observation; absent for a full-pool selection. */
+      activeProfileId?: string | null;
       generation: number;
       groupExhausted: true;
       retryAtMs: number | null;
@@ -272,6 +286,7 @@ export function isReasonEnabled(policy: ConnectedServiceAuthGroupPolicyV1, reaso
       return policy.switchOn.usageLimit;
     case 'auth_expired':
     case 'permission_denied':
+    case 'plan':
       return policy.switchOn.authExpired;
     case 'refresh_failed':
       return policy.switchOn.refreshFailure || policy.switchOn.authExpired;
@@ -452,11 +467,13 @@ export function buildLeaseCompletion(input: Readonly<{
 export function buildSessionApplyFromLeaseCompletion(input: Readonly<{
   completion: LeaseCompletion;
   sessionId?: string;
+  reason: string;
 }>): LeaseCompletion {
   const { sessionId: _ownerSessionId, ...completion } = input.completion;
   return {
     ...completion,
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    reason: input.reason,
   };
 }
 
@@ -610,7 +627,6 @@ export type ConnectedServiceAuthGroupSwitchPipelineRequest = Readonly<{
 }>;
 
 export type ConnectedServiceAuthGroupSwitchPipelinePhase =
-  | 'lease_loser_non_apply'
   | 'lease_loser_apply'
   | 'record_observed_generation'
   | 'policy'

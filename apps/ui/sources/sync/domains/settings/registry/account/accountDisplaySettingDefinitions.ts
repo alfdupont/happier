@@ -5,7 +5,7 @@ import {
     HappierReplayWritableMaxSeedCharsSchema,
 } from '@happier-dev/protocol';
 import { z } from 'zod';
-
+import { ThemeProfileLibrarySchema } from '@/theme/profiles/themeProfilePersistence';
 import { AccountThemeSelectionV1Schema } from '@/theme/profiles/themeAccountSelection';
 
 function bucketCount(value: number, smallMax: number, mediumMax: number): 'small' | 'medium' | 'large' {
@@ -21,6 +21,12 @@ function bucketBytes(value: number, smallMax: number, mediumMax: number): 'small
 }
 
 export const ACCOUNT_DISPLAY_SETTING_DEFINITIONS = defineSettingDefinitions({
+    themeProfiles: {
+        schema: ThemeProfileLibrarySchema,
+        default: [],
+        description: 'Custom theme library shared by account clients; activation remains local',
+        storageScope: 'account',
+    },
     appearanceThemeSelectionV1: {
         // The theme itself stays local (see themePreference/themeProfiles); this only
         // remembers the latest selection so a device without one can restore it.
@@ -61,6 +67,20 @@ export const ACCOUNT_DISPLAY_SETTING_DEFINITIONS = defineSettingDefinitions({
         schema: z.boolean(),
         default: false,
         description: 'Whether to show line numbers in tool view diffs',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
+    showChatCodeBlockWrapControls: {
+        schema: z.boolean(),
+        default: true,
+        description: 'Whether to show per-block wrapping controls in chat code blocks',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
+    wrapChatCodeBlocks: {
+        schema: z.boolean(),
+        default: false,
+        description: 'Whether chat code blocks wrap long lines by default',
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
     },

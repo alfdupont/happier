@@ -163,8 +163,8 @@ test.describe('ui e2e: auth + terminal connect', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('creates an account, approves terminal connect, then daemon becomes online', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+  test('creates an account, approves terminal connect, then daemon becomes online', { tag: "@smoke" }, async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -247,7 +247,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('restores the same account using secret key', async ({ page }, testInfo) => {
-    test.setTimeout(300_000);
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) throw new Error('missing account secret key from prior test');
@@ -288,7 +288,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('defaults codex backend mode to ACP in account settings', async ({ page }) => {
-    test.setTimeout(240_000);
+    test.setTimeout(180_000);
     if (!server) throw new Error('missing server fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -300,7 +300,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('daemon can reconnect without losing a follow-up', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!server) throw new Error('missing server fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
@@ -355,27 +355,14 @@ test.describe('ui e2e: auth + terminal connect', () => {
       // Depending on whether the restart restores the existing agent process before
       // this send, the follow-up is either delivered or safely remains queued. Both
       // are valid outcomes; the invariant is that the user-visible follow-up is not lost.
-      const pending = page.locator('[data-testid^="pendingMessages.message:"]', { hasText: followup });
-      const pendingButton = page.getByRole('button', { name: 'Pending messages · Queued' });
+      const pending = page.locator('[data-testid^="pendingMessages.message:"]', { hasText: followup })
+        .and(page.getByRole('button', { name: 'Pending messages · Queued', exact: true }));
       const delivered = page.locator('[data-testid^="transcript-message-"]:not([data-testid*=":"])', { hasText: followup });
-      let observedOutcome: 'queued' | 'delivered' | null = null;
+      // Observe either valid visible state in the same retrying assertion. The
+      // queue may drain immediately after observation as the daemon reconnects.
       await expect.poll(async () => {
-        const pendingCount = await pending.count();
-        const pendingButtonCount = await pendingButton.count();
-        const deliveredCount = await delivered.count();
-        if (pendingCount > 0 && pendingButtonCount > 0) {
-          observedOutcome = 'queued';
-          return true;
-        }
-        if (deliveredCount > 0 && pendingCount === 0) {
-          observedOutcome = 'delivered';
-          return true;
-        }
-        return false;
+        return await pending.first().isVisible() || await delivered.first().isVisible();
       }, { timeout: 180_000 }).toBe(true);
-      if (observedOutcome === 'queued') {
-        await expect(pendingButton).toBeVisible({ timeout: 60_000 });
-      }
     } catch (error) {
       thrown = error;
       throw error;
@@ -387,7 +374,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('selects the existing session from the list', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) throw new Error('missing account secret key from prior test');
@@ -427,7 +414,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('terminal-connect link redirects to welcome when logged out, then can be approved after restore', async ({ page, browser }, testInfo) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) {

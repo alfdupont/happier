@@ -157,6 +157,15 @@ function readSetupMachineId(task: DesktopSystemTaskRecord): string {
     return machineId;
 }
 
+async function confirmRelayMove(page: Page): Promise<void> {
+    // Move/Switch is the last configured action. The three-button modal renders 0, 2, 1,
+    // so DOM order would select Connect too instead of the final configured action.
+    const buttons = page.locator('[data-testid^="web-modal-button-"]');
+    const move = page.getByTestId(`web-modal-button-${await buttons.count() - 1}`);
+    await expect(move).toBeEnabled();
+    await move.click();
+}
+
 async function waitForActiveMachine(params: Readonly<{ baseUrl: string; token: string; machineId: string; timeoutMs: number }>): Promise<MachineIdentityRow> {
     let row: MachineIdentityRow | undefined;
     await expect.poll(async () => {
@@ -334,7 +343,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     }
 
     test('fresh first setup: the app is usable at once and this computer becomes ready without a question', async ({ context }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const computer = await newComputer('fresh');
         const app = await openDesktopApp({ context, computer, uiBaseUrl });
@@ -367,7 +376,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     });
 
     test('daemon paired to another account: the question names both accounts; Keep leaves it, Switch moves it', async ({ context }) => {
-        test.setTimeout(480_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const computer = await newComputer('account');
         const accountB = await createSeededAccount(server.baseUrl);
@@ -473,7 +482,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     }
 
     test('daemon on another relay (still up): the account question names both relays and both accounts; Switch converges', async ({ context }) => {
-        test.setTimeout(480_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const { computer, otherRelay, otherRelayUrl, otherAccount } = await setUpOnAnotherRelay('relay-account');
         try {
@@ -485,7 +494,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
                 await expect(body).toContainText(relayHost(otherRelayUrl));
                 await expect(body).toContainText(relayHost(server.baseUrl));
                 await expect(body).toContainText(accountIdHint(otherAccount.accountId));
-                await app.page.getByTestId('web-modal-button-1').click();
+                await confirmRelayMove(app.page);
                 const converged = await expectConvergedOnAppRelay(app, computer, server.baseUrl);
                 expect(converged.daemonAccountId).toBe(converged.appAccountId);
             } catch (error) {
@@ -497,7 +506,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     });
 
     test('daemon on a relay that is gone: the relay question names both hosts and Move converges on the app relay', async ({ context }) => {
-        test.setTimeout(480_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const { computer, otherRelay, otherRelayUrl } = await setUpOnAnotherRelay('relay-gone');
         await otherRelay.stop();
@@ -509,7 +518,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             const body = app.page.getByText(/^This computer’s background service is connected to /);
             await expect(body).toContainText(relayHost(otherRelayUrl));
             await expect(body).toContainText(relayHost(server.baseUrl));
-            await app.page.getByTestId('web-modal-button-2').click();
+            await confirmRelayMove(app.page);
             await expectConvergedOnAppRelay(app, computer, server.baseUrl);
         } catch (error) {
             throw appendBrowserDiagnostics(error, app.diagnostics());
@@ -517,7 +526,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     });
 
     test('daemon already set up from the terminal on this relay and account: a cold deep link asks nothing, changes nothing, and offers the CLI update', async ({ context }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const computer = await newComputer('terminal');
         const account = await signUpInPlainBrowser(context, uiBaseUrl);
@@ -561,7 +570,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
     });
 
     test('a failure Retry cannot fix: one sentence, Continue without this computer, and the app stays usable', async ({ context }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         const computer = await newComputer('blocked');
         computer.setUserManagerAvailable(false);
         const app = await openDesktopApp({ context, computer, uiBaseUrl });
@@ -601,7 +610,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
      * machine answers, Retry proves it ready.
      */
     test('converged but not answering through the relay: fails closed with one sentence, then Retry proves it ready', async ({ context }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const computer = await newComputer('unreachable');
         const app = await openDesktopApp({ context, computer, uiBaseUrl });
@@ -644,7 +653,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
      * "Let Happier manage it" then moves this computer onto the managed CLI and proves it ready.
      */
     test('R12: Keep my own, then that CLI is uninstalled: the next open asks again before using another CLI', async ({ context }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         // Cross-ring on purpose: this dev app's leftover managed CLI is dev while the kept npm CLI's
         // service is the default channel's; Manage must still be a pure runtime switch (R13 b).
@@ -684,7 +693,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
      * that removes it (shown, never run): discovery walks past the managed shim.
      */
     test('R12: managed CLI first needs no choice and Settings still lists the old copy', async ({ context }) => {
-        test.setTimeout(480_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const computer = await newComputer('cli-manage', { ring: 'stable', foreignCli: true });
         const own = computer.foreignCli!;
@@ -713,7 +722,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
      * account — and this computer must then be proven ready for Y.
      */
     test('R13 (a): app launched pinned to another relay: setup puts everything on the app relay and proves it ready', async ({ context }) => {
-        test.setTimeout(480_000);
+        test.setTimeout(180_000);
         if (!server) throw new Error('missing server');
         const { computer, otherRelay, otherRelayUrl, otherServerId } = await setUpOnAnotherRelay('relay-pinned');
         const otherCredentialsPath = join(computer.happierHomeDir, 'servers', otherServerId, 'access.key');
@@ -729,7 +738,7 @@ test.describe('ui e2e: desktop local setup through the real hsetup (hermetic com
             try {
                 await ensureAccountReadyForConnect({ page: app.page, timeoutMs: 180_000 });
                 await expect(app.page.getByText(/^Switch this computer to .+\?$/)).toBeVisible({ timeout: 240_000 });
-                await app.page.getByTestId('web-modal-button-1').click();
+                await confirmRelayMove(app.page);
                 // Placement first (the executor's contract), then the readiness proof.
                 const converged = await expectConvergedOnAppRelay(app, computer, server.baseUrl, { proveReady: false });
                 expect(converged.daemonAccountId).toBe(converged.appAccountId);

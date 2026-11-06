@@ -25,12 +25,16 @@ export type ExecutionRunBackendController = {
   turnCount: number;
   turnEpoch: number;
   turnInFlight: boolean;
+  turnHadMeaningfulActivity?: boolean;
+  recoveryAbortController?: AbortController;
   turnCancelReason: 'steer' | 'stop' | 'timeout' | 'outcome_unknown' | null;
   turnCancelEpoch: number | null;
   pendingExternalMessages: ExecutionRunExternalMessage[];
   pendingExternalMessagesSignal: { promise: Promise<void>; resolve: () => void } | null;
   lastMarkerWriteAtMs: number;
   terminalMarkerWritePromise?: Promise<void>;
+  disposalPromise?: Promise<void>;
+  cancellationPromise?: Promise<void>;
   /**
    * Run-owned readiness for the initially admitted backend occurrence. A send arriving after the
    * durable run handle is returned waits here instead of racing session provisioning.
@@ -46,6 +50,8 @@ export type ExecutionRunVoiceAgentController = {
   cancelled: boolean;
   lastMarkerWriteAtMs: number;
   terminalMarkerWritePromise?: Promise<void>;
+  disposalPromise?: Promise<void>;
+  cancellationPromise?: Promise<void>;
   terminalPromise: Promise<void>;
   resolveTerminal: () => void;
   transcript: Readonly<{ persistenceMode: 'ephemeral' | 'persistent'; epoch: number }>;
@@ -57,6 +63,7 @@ export type ExecutionRunVoiceAgentController = {
 export type ExecutionRunController = ExecutionRunBackendController | ExecutionRunVoiceAgentController;
 
 export function resetExecutionRunBackendOutput(ctrl: ExecutionRunBackendController): void {
+  ctrl.turnHadMeaningfulActivity = false;
   ctrl.buffer = '';
   ctrl.modelOutputSegmentSnapshot = undefined;
   ctrl.sidechainStreamBuffer = '';

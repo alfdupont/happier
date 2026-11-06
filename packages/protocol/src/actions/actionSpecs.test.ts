@@ -11,6 +11,10 @@ import {
 import { serializeActionSpec } from './actionCatalog.js';
 import { ActionApprovalSchema, ActionOperationDeclarationV1Schema, ActionSpecSchema, ActionSurfaceSchema, getActionSpec, isActionSpecSurfacedOn, listActionSpecs, listActionSpecsForSurface, listVoicePromptHotPathSpecs, resolveActionApprovalFlow } from './actionSpecs.js';
 
+it('accepts the existing empty mode id to clear a native override', () => {
+  expect(getActionSpec('session.mode.set').inputSchema.safeParse({ modeId: '' }).success).toBe(true);
+});
+
 const RESULT_REQUIRED_BLOCKING_ACTION_IDS = [
   'action.spec.search',
   'action.spec.get',
@@ -21,6 +25,7 @@ const RESULT_REQUIRED_BLOCKING_ACTION_IDS = [
   'session.status.get',
   'session.work_state.get',
   'session.goal.get',
+  'session.goal.clear',
   'session.terminalComposer.clear',
   'session.pendingInput.interruptAndRun',
   'session.usageLimit.checkNow',
@@ -59,7 +64,6 @@ const RESULT_NONE_DEFERRED_ACTION_IDS = [
   'session.permission_mode.set',
   'session.model.set',
   'session.goal.set',
-  'session.goal.clear',
   'session.usageLimit.waitResume.enable',
   'session.usageLimit.waitResume.cancel',
   'session.archive',
@@ -72,6 +76,7 @@ const RESULT_NONE_DEFERRED_ACTION_IDS = [
 ] as const;
 
 const RESULT_OPTIONAL_DEFERRED_ACTION_IDS = [
+  'session.config_option.set',
   'review.start',
   'subagents.plan.start',
   'subagents.delegate.start',
@@ -96,6 +101,7 @@ const RESULT_OPTIONAL_DEFERRED_ACTION_IDS = [
 ] as const;
 
 const EXTERNALLY_CONTROLLABLE_SESSION_AGENT_UNSUPPORTED_ACTIONS = {
+  'session.handoff': 'moving the current session between machines stays an external orchestration decision.',
   'voice_agent.start': 'voice-agent launches are a separate user-facing runtime surface, not an in-session self-control primitive.',
   'session.spawn_picker': 'the interactive spawn picker remains UI/external-client only; in-session agents use session.spawn_new.',
   'session.terminalComposer.clear': 'clearing a human terminal composer is an explicit human/UI decision.',
@@ -572,7 +578,7 @@ describe('Action Spec Registry', () => {
     expect(getActionSpec('session.work_state.get' as any).bindings?.mcpToolName).toBe('session_work_state_get');
     expect(getActionSpec('session.goal.get' as any).approval).toEqual({ result: 'required' });
     expect(getActionSpec('session.goal.set' as any).approval).toEqual({ result: 'none' });
-    expect(getActionSpec('session.goal.clear' as any).approval).toEqual({ result: 'none' });
+    expect(getActionSpec('session.goal.clear').approval).toEqual({ result: 'required' });
     expect(getActionSpec('session.vendor_plugin_catalog.list' as any).bindings?.mcpToolName).toBe('session_vendor_plugin_catalog_list');
     expect(getActionSpec('session.skill_catalog.list' as any).bindings?.mcpToolName).toBe('session_skill_catalog_list');
   });

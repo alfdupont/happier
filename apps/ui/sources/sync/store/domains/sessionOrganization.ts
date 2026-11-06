@@ -5,6 +5,7 @@ import type {
     SessionOrganizationOrderEntry,
     SessionOrganizationPin,
     SessionOrganizationSnapshot,
+    SessionOrganizationSessionAppearance,
     SessionOrganizationTag,
 } from '@happier-dev/protocol';
 
@@ -38,6 +39,7 @@ export type SessionOrganizationOptimisticRecord = Readonly<{
         SessionOrganizationDomain,
         | 'sessionOrganizationPinsBySessionKey'
         | 'sessionOrganizationAttentionStandingsBySessionKey'
+        | 'sessionOrganizationAppearancesBySessionKey'
         | 'sessionOrganizationFoldersByFolderKey'
         | 'sessionOrganizationTagsByTagKey'
         | 'sessionOrganizationLabelsByLabelKey'
@@ -50,6 +52,7 @@ export type SessionOrganizationOptimisticRecord = Readonly<{
         SessionOrganizationDomain,
         | 'sessionOrganizationPinsBySessionKey'
         | 'sessionOrganizationAttentionStandingsBySessionKey'
+        | 'sessionOrganizationAppearancesBySessionKey'
         | 'sessionOrganizationFoldersByFolderKey'
         | 'sessionOrganizationTagsByTagKey'
         | 'sessionOrganizationLabelsByLabelKey'
@@ -65,6 +68,8 @@ export type SessionOrganizationDomain = {
     sessionOrganizationSnapshotVersionByServerId: Record<string, number>;
     sessionOrganizationPinsBySessionKey: Record<string, SessionOrganizationPin>;
     sessionOrganizationAttentionStandingsBySessionKey: Record<string, SessionAttentionStanding>;
+    sessionOrganizationAppearancesBySessionKey: Record<string, SessionOrganizationSessionAppearance>;
+    sessionOrganizationSessionAppearancesSupportedByServerId: Record<string, boolean>;
     sessionOrganizationFoldersByFolderKey: Record<string, SessionOrganizationFolder>;
     sessionOrganizationFolderAssignmentsBySessionKey: Record<string, string | null>;
     sessionOrganizationTagsByTagKey: Record<string, SessionOrganizationTag>;
@@ -81,6 +86,8 @@ export type SessionOrganizationDomain = {
     setSessionOrganizationError: (serverId: string, error: string | null) => void;
     setSessionPinOptimistic: (serverId: string, sessionId: string, pin: SessionOrganizationPin | null) => string;
     setSessionAttentionStandingOptimistic: (serverId: string, sessionId: string, standing: SessionAttentionStanding | null) => string;
+    setSessionAppearanceOptimistic: (serverId: string, sessionId: string, appearance: SessionOrganizationSessionAppearance | null) => string;
+    confirmSessionAppearanceOptimistic: (recordId: string, sessionId: string, appearance: SessionOrganizationSessionAppearance | null) => void;
     setSessionOrganizationFolderAssignmentOptimistic: (serverId: string, sessionId: string, folderId: string | null) => string;
     setSessionTagAssignmentsOptimistic: (serverId: string, sessionId: string, tagIds: readonly string[]) => string;
     upsertSessionOrganizationFolderOptimistic: (serverId: string, folder: SessionOrganizationFolder) => string;
@@ -96,6 +103,7 @@ export type SessionOrganizationDomain = {
     reconcileSessionOrganizationTagDelete: (serverId: string, tagId: string) => void;
     rollbackSessionOrganizationOptimistic: (recordId: string) => void;
     commitSessionOrganizationOptimistic: (recordId: string) => void;
+    confirmSessionAttentionStandingOptimistic: (recordId: string, sessionId: string, standing: SessionAttentionStanding | null) => void;
     clearSessionOrganizationForServer: (serverId: string) => void;
     applySessionFolderAssignments: (serverId: string, assignments: readonly SessionFolderAssignment[]) => void;
     setSessionFolderAssignmentsLoading: (serverId: string, loading: boolean) => void;
@@ -115,13 +123,24 @@ function hasOwn(record: Record<string, unknown>, key: string): boolean {
     return Object.prototype.hasOwnProperty.call(record, key);
 }
 
+function equalDisplayValue(left: unknown, right: unknown): boolean {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+    if (Array.isArray(left) !== Array.isArray(right)) return false;
+    const record = right as Record<string, unknown>;
+    const entries = Object.entries(left);
+    return entries.length === Object.keys(right).length
+        && entries.every(([key, value]) => hasOwn(record, key) && equalDisplayValue(value, record[key]));
+}
+
 function shallowEqualValue(a: unknown, b: unknown): boolean {
     if (a === b) return true;
     if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
     const aEntries = Object.entries(a);
     const bRecord = b as Record<string, unknown>;
     if (aEntries.length !== Object.keys(bRecord).length) return false;
-    return aEntries.every(([key, value]) => bRecord[key] === value);
+    return aEntries.every(([key, value]) => bRecord[key] === value
+        || (key === 'display' && equalDisplayValue(bRecord[key], value)));
 }
 
 function entriesEqual<T>(a: readonly T[] | undefined, b: readonly T[]): boolean {
@@ -142,7 +161,8 @@ function replaceServerRecord<T>(
         }
     }
     for (const [id, value] of entries) {
-        next[buildSessionOrganizationServerKey(serverId, id)] = value;
+        const key = buildSessionOrganizationServerKey(serverId, id);
+        next[key] = shallowEqualValue(current[key], value) ? current[key] : value;
     }
     if (Object.keys(next).length !== Object.keys(current).length) return next;
     for (const [key, value] of Object.entries(next)) {
@@ -394,16 +414,71 @@ function applyRecordDelta<T>(
     return next;
 }
 
+type OrganizationOptimisticValue = SessionAttentionStanding | SessionOrganizationSessionAppearance | SessionOrganizationLabel;
+type OrganizationOptimisticValueMap = 'sessionOrganizationAttentionStandingsBySessionKey' | 'sessionOrganizationAppearancesBySessionKey' | 'sessionOrganizationLabelsByLabelKey';
+
+function rebaseOrganizationValueSnapshots<T extends OrganizationOptimisticValue>(
+    records: Record<string, SessionOrganizationOptimisticRecord>,
+    settled: SessionOrganizationOptimisticRecord,
+    key: string,
+    value: T | undefined,
+    map: OrganizationOptimisticValueMap,
+): void {
+    for (const [id, record] of Object.entries(records)) {
+        if (readOptimisticRecordSequence(record) <= readOptimisticRecordSequence(settled)) continue;
+        const before = record.before[map];
+        const after = record.after[map];
+        if (!before || !shallowEqualValue(before[key], settled.after[map]?.[key])) continue;
+        records[id] = {
+            ...record,
+            before: { ...record.before, [map]: setRecordValue<OrganizationOptimisticValue>(before, key, value) },
+            after: after && shallowEqualValue(after[key], before[key])
+                ? { ...record.after, [map]: setRecordValue<OrganizationOptimisticValue>(after, key, value) }
+                : record.after,
+        };
+    }
+}
+
+function rollbackOrganizationValueMap<T extends OrganizationOptimisticValue>(
+    current: Record<string, T>,
+    before: Record<string, T> | undefined,
+    after: Record<string, T> | undefined,
+    rolledBackRecord: SessionOrganizationOptimisticRecord,
+    remainingRecords: Record<string, SessionOrganizationOptimisticRecord>,
+    map: OrganizationOptimisticValueMap,
+): Record<string, T> {
+    if (!before || !after) return current;
+    let next = current;
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+        if (shallowEqualValue(before[key], after[key])) continue;
+        // Undo only this write's value; preserve later writes and other records, including
+        // confirmed writes that are no longer in the optimistic-record collection.
+        if (shallowEqualValue(next[key], after[key])) next = setRecordValue(next, key, before[key]);
+        rebaseOrganizationValueSnapshots(remainingRecords, rolledBackRecord, key, before[key], map);
+    }
+    return next;
+}
+
 function rebaseRemainingOptimisticRecords<S extends SessionOrganizationDomain>(
     state: S,
     rolledBackRecord: SessionOrganizationOptimisticRecord,
     remainingRecords: Record<string, SessionOrganizationOptimisticRecord>,
 ): Partial<S> {
     let pins = rolledBackRecord.before.sessionOrganizationPinsBySessionKey ?? state.sessionOrganizationPinsBySessionKey;
-    let attentionStandings = rolledBackRecord.before.sessionOrganizationAttentionStandingsBySessionKey ?? state.sessionOrganizationAttentionStandingsBySessionKey;
+    const attentionStandings = rollbackOrganizationValueMap(state.sessionOrganizationAttentionStandingsBySessionKey,
+        rolledBackRecord.before.sessionOrganizationAttentionStandingsBySessionKey,
+        rolledBackRecord.after.sessionOrganizationAttentionStandingsBySessionKey,
+        rolledBackRecord, remainingRecords, 'sessionOrganizationAttentionStandingsBySessionKey');
+    const appearances = rollbackOrganizationValueMap(state.sessionOrganizationAppearancesBySessionKey,
+        rolledBackRecord.before.sessionOrganizationAppearancesBySessionKey,
+        rolledBackRecord.after.sessionOrganizationAppearancesBySessionKey,
+        rolledBackRecord, remainingRecords, 'sessionOrganizationAppearancesBySessionKey');
     let folders = rolledBackRecord.before.sessionOrganizationFoldersByFolderKey ?? state.sessionOrganizationFoldersByFolderKey;
     let tags = rolledBackRecord.before.sessionOrganizationTagsByTagKey ?? state.sessionOrganizationTagsByTagKey;
-    let labels = rolledBackRecord.before.sessionOrganizationLabelsByLabelKey ?? state.sessionOrganizationLabelsByLabelKey;
+    const labels = rollbackOrganizationValueMap(state.sessionOrganizationLabelsByLabelKey,
+        rolledBackRecord.before.sessionOrganizationLabelsByLabelKey,
+        rolledBackRecord.after.sessionOrganizationLabelsByLabelKey,
+        rolledBackRecord, remainingRecords, 'sessionOrganizationLabelsByLabelKey');
     let orderEntries = rolledBackRecord.before.sessionOrganizationOrderEntriesByScopeKey ?? state.sessionOrganizationOrderEntriesByScopeKey;
     let tagAssignments = rolledBackRecord.before.sessionOrganizationTagAssignmentsBySessionKey ?? state.sessionOrganizationTagAssignmentsBySessionKey;
     let organizationFolderAssignments = rolledBackRecord.before.sessionOrganizationFolderAssignmentsBySessionKey ?? state.sessionOrganizationFolderAssignmentsBySessionKey;
@@ -411,14 +486,8 @@ function rebaseRemainingOptimisticRecords<S extends SessionOrganizationDomain>(
 
     for (const record of sortOptimisticRecords(Object.values(remainingRecords))) {
         pins = applyRecordDelta(pins, record.before.sessionOrganizationPinsBySessionKey, record.after.sessionOrganizationPinsBySessionKey);
-        attentionStandings = applyRecordDelta(
-            attentionStandings,
-            record.before.sessionOrganizationAttentionStandingsBySessionKey,
-            record.after.sessionOrganizationAttentionStandingsBySessionKey,
-        );
         folders = applyRecordDelta(folders, record.before.sessionOrganizationFoldersByFolderKey, record.after.sessionOrganizationFoldersByFolderKey);
         tags = applyRecordDelta(tags, record.before.sessionOrganizationTagsByTagKey, record.after.sessionOrganizationTagsByTagKey);
-        labels = applyRecordDelta(labels, record.before.sessionOrganizationLabelsByLabelKey, record.after.sessionOrganizationLabelsByLabelKey);
         orderEntries = applyRecordDelta(orderEntries, record.before.sessionOrganizationOrderEntriesByScopeKey, record.after.sessionOrganizationOrderEntriesByScopeKey);
         tagAssignments = applyRecordDelta(tagAssignments, record.before.sessionOrganizationTagAssignmentsBySessionKey, record.after.sessionOrganizationTagAssignmentsBySessionKey);
         organizationFolderAssignments = applyRecordDelta(
@@ -436,6 +505,7 @@ function rebaseRemainingOptimisticRecords<S extends SessionOrganizationDomain>(
     return {
         sessionOrganizationPinsBySessionKey: pins,
         sessionOrganizationAttentionStandingsBySessionKey: attentionStandings,
+        sessionOrganizationAppearancesBySessionKey: appearances,
         sessionOrganizationFoldersByFolderKey: folders,
         sessionOrganizationTagsByTagKey: tags,
         sessionOrganizationLabelsByLabelKey: labels,
@@ -476,6 +546,8 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
         sessionOrganizationSchemaVersionByServerId: {},
         sessionOrganizationPinsBySessionKey: {},
         sessionOrganizationAttentionStandingsBySessionKey: {},
+        sessionOrganizationAppearancesBySessionKey: {},
+        sessionOrganizationSessionAppearancesSupportedByServerId: {},
         sessionOrganizationFoldersByFolderKey: {},
         sessionOrganizationFolderAssignmentsBySessionKey: {},
         sessionOrganizationTagsByTagKey: {},
@@ -498,6 +570,13 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                     serverId,
                     snapshot.pins.map((pin) => [pin.sessionId, pin] as const),
                 );
+                const appearances = snapshot.sessionAppearances === undefined
+                    ? state.sessionOrganizationAppearancesBySessionKey
+                    : replaceServerRecord(state.sessionOrganizationAppearancesBySessionKey, serverId,
+                        snapshot.sessionAppearances.map((appearance) => [appearance.sessionId, appearance] as const));
+                const appearancesSupported = options?.includeSessionAppearances === true
+                    ? setRecordValue(state.sessionOrganizationSessionAppearancesSupportedByServerId, serverId, snapshot.sessionAppearances !== undefined)
+                    : state.sessionOrganizationSessionAppearancesSupportedByServerId;
                 // Standings only ride along when the request asked for them, so an absent
                 // array means "not fetched" and must not clear what the store already knows.
                 const attentionStandings = snapshot.attentionStandings === undefined
@@ -553,17 +632,13 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                     snapshot.orderEntries,
                     options,
                 );
-                return {
-                    sessionOrganizationSchemaVersionByServerId: {
-                        ...state.sessionOrganizationSchemaVersionByServerId,
-                        [serverId]: snapshot.schemaVersion,
-                    },
-                    sessionOrganizationSnapshotVersionByServerId: {
-                        ...state.sessionOrganizationSnapshotVersionByServerId,
-                        [serverId]: snapshot.version,
-                    },
+                const next = {
+                    sessionOrganizationSchemaVersionByServerId: setRecordValue(state.sessionOrganizationSchemaVersionByServerId, serverId, snapshot.schemaVersion),
+                    sessionOrganizationSnapshotVersionByServerId: setRecordValue(state.sessionOrganizationSnapshotVersionByServerId, serverId, snapshot.version),
                     sessionOrganizationPinsBySessionKey: pins,
                     sessionOrganizationAttentionStandingsBySessionKey: attentionStandings,
+                    sessionOrganizationAppearancesBySessionKey: appearances,
+                    sessionOrganizationSessionAppearancesSupportedByServerId: appearancesSupported,
                     sessionOrganizationFoldersByFolderKey: folders,
                     sessionOrganizationFolderAssignmentsBySessionKey: folderAssignments,
                     sessionFolderAssignmentsBySessionKey: folderAssignments,
@@ -571,7 +646,8 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                     sessionOrganizationTagAssignmentsBySessionKey: tagAssignments,
                     sessionOrganizationOrderEntriesByScopeKey: orderEntries,
                     sessionOrganizationLabelsByLabelKey: labels,
-                } as Partial<S>;
+                };
+                return Object.entries(next).every(([key, value]) => state[key as keyof typeof next] === value) ? state : next as Partial<S>;
             });
         },
         setSessionOrganizationLoading: (serverId, loading) => {
@@ -621,6 +697,17 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                 ...addOptimisticRecord(current, record),
                 sessionOrganizationAttentionStandingsBySessionKey: afterStandings,
             }) as Partial<S>);
+            return record.id;
+        },
+        setSessionAppearanceOptimistic: (serverId, sessionId, appearance) => {
+            const key = buildSessionOrganizationServerKey(serverId, sessionId);
+            const state = get();
+            const after = setRecordValue(state.sessionOrganizationAppearancesBySessionKey, key, appearance ?? undefined);
+            const record = createOptimisticRecord({ serverId,
+                before: { sessionOrganizationAppearancesBySessionKey: state.sessionOrganizationAppearancesBySessionKey },
+                after: { sessionOrganizationAppearancesBySessionKey: after },
+            });
+            set((current) => ({ ...addOptimisticRecord(current, record), sessionOrganizationAppearancesBySessionKey: after }) as Partial<S>);
             return record.id;
         },
         setSessionOrganizationFolderAssignmentOptimistic: (serverId, sessionId, folderId) => {
@@ -893,6 +980,39 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                 return { sessionOrganizationOptimisticRecords: nextRecords } as Partial<S>;
             });
         },
+        confirmSessionAttentionStandingOptimistic: (recordId, sessionId, standing) => {
+            set((state) => {
+                const record = state.sessionOrganizationOptimisticRecords[recordId];
+                if (!record) return state;
+                const key = buildSessionOrganizationServerKey(record.serverId, sessionId);
+                const nextRecords = { ...state.sessionOrganizationOptimisticRecords };
+                delete nextRecords[recordId];
+                rebaseOrganizationValueSnapshots(nextRecords, record, key, standing ?? undefined, 'sessionOrganizationAttentionStandingsBySessionKey');
+                const current = state.sessionOrganizationAttentionStandingsBySessionKey;
+                return {
+                    sessionOrganizationOptimisticRecords: nextRecords,
+                    sessionOrganizationAttentionStandingsBySessionKey:
+                        shallowEqualValue(current[key], record.after.sessionOrganizationAttentionStandingsBySessionKey?.[key])
+                            ? setRecordValue(current, key, standing ?? undefined)
+                            : current,
+                } as Partial<S>;
+            });
+        },
+        confirmSessionAppearanceOptimistic: (recordId, sessionId, appearance) => {
+            set((state) => {
+                const record = state.sessionOrganizationOptimisticRecords[recordId];
+                if (!record) return state;
+                const key = buildSessionOrganizationServerKey(record.serverId, sessionId);
+                const records = { ...state.sessionOrganizationOptimisticRecords };
+                delete records[recordId];
+                rebaseOrganizationValueSnapshots(records, record, key, appearance ?? undefined, 'sessionOrganizationAppearancesBySessionKey');
+                const current = state.sessionOrganizationAppearancesBySessionKey;
+                return { sessionOrganizationOptimisticRecords: records,
+                    sessionOrganizationAppearancesBySessionKey: shallowEqualValue(current[key], record.after.sessionOrganizationAppearancesBySessionKey?.[key])
+                        ? setRecordValue(current, key, appearance ?? undefined) : current,
+                } as Partial<S>;
+            });
+        },
         clearSessionOrganizationForServer: (serverId) => {
             set((state) => {
                 const folderAssignments = removeServerRecordEntries(state.sessionOrganizationFolderAssignmentsBySessionKey, serverId);
@@ -905,6 +1025,8 @@ export function createSessionOrganizationDomain<S extends SessionOrganizationDom
                     ),
                     sessionOrganizationPinsBySessionKey: removeServerRecordEntries(state.sessionOrganizationPinsBySessionKey, serverId),
                     sessionOrganizationAttentionStandingsBySessionKey: removeServerRecordEntries(state.sessionOrganizationAttentionStandingsBySessionKey, serverId),
+                    sessionOrganizationAppearancesBySessionKey: removeServerRecordEntries(state.sessionOrganizationAppearancesBySessionKey, serverId),
+                    sessionOrganizationSessionAppearancesSupportedByServerId: setRecordValue(state.sessionOrganizationSessionAppearancesSupportedByServerId, serverId, undefined),
                     sessionOrganizationFoldersByFolderKey: removeServerRecordEntries(state.sessionOrganizationFoldersByFolderKey, serverId),
                     sessionOrganizationFolderAssignmentsBySessionKey: folderAssignments,
                     sessionFolderAssignmentsBySessionKey: folderAssignments,

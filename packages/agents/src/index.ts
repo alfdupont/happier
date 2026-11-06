@@ -152,6 +152,7 @@ export {
 export {
   BUILT_IN_ACP_CONFIG,
   getBuiltInAcpConfig,
+  resolveAcpPermissionModeId,
   hasBuiltInAcpConfig,
   isBuiltInAcpSessionListingDeclared,
   isAcpSessionListingDeclared,
@@ -290,6 +291,16 @@ export {
   GEMINI_CLI_OAUTH_SCOPES,
   GEMINI_CLI_OAUTH_TOKEN_URL,
 } from './providers/gemini/oauth.js';
+export {
+  AGY_OAUTH_AUTHORIZE_URL,
+  AGY_OAUTH_CALLBACK_URL,
+  AGY_OAUTH_CLIENT_ID,
+  AGY_OAUTH_ALLOW_RAW_AUTHORIZATION_CODE,
+  AGY_OAUTH_CLIENT_SECRET,
+  AGY_OAUTH_SCOPES,
+  AGY_OAUTH_TOKEN_URL,
+  AGY_OAUTH_USERINFO_URL,
+} from './providers/agy/oauth.js';
 
 export { computeMonotonicUpdatedAt, type MonotonicUpdatedAtPolicy } from './sessionControls/monotonic.js';
 export {
@@ -395,6 +406,7 @@ export {
 } from './sessionControls/existingSessionAutomationPolicy.js';
 export {
   resolveVendorHandoffIdFromSessionMetadata,
+  supportsExistingSessionHandoffState,
   evaluateVendorHandoffEligibility,
   type VendorHandoffEligibility,
   type VendorHandoffEligibilityReasonCode,

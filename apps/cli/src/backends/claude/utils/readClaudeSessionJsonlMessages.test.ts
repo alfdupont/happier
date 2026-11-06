@@ -91,6 +91,19 @@ describe('readClaudeSessionJsonlMessages', () => {
     ]);
   });
 
+  it('includes delivered native peer attachments while observing their original envelope', async () => {
+    tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-peer-'));
+    const sessionFilePath = join(tmpRoot, 'sess.jsonl');
+    const delivered = { type: 'attachment', uuid: 'file-peer', attachment: { type: 'queued_command',
+      prompt: '<cross-session-message from="uds:/tmp/sender.sock" from-name="Sender" from-mode="prompting">Delivered</cross-session-message>' } };
+    await writeFile(sessionFilePath, JSON.stringify(delivered) + '\n');
+    const observed: unknown[] = [];
+    const messages = await readClaudeSessionJsonlMessages({ sessionFilePath, logLabel: 'TEST', onJsonValue: value => observed.push(value) });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ type: 'user', uuid: 'file-peer', origin: { kind: 'peer', name: 'Sender' } });
+    expect(observed).toEqual([delivered]);
+  });
+
   it('drops Claude-internal state records that are not conversation content', async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-jsonl-'));
     const sessionFilePath = join(tmpRoot, 'sess.jsonl');
@@ -117,5 +130,36 @@ describe('readClaudeSessionJsonlMessages', () => {
 
     expect(messages.map((m) => m.type)).toEqual(['assistant']);
     expect(observed).toEqual(lines.map((line) => JSON.parse(line)));
+  });
+
+  it('observes complete startup history once with byte offsets while returning only the display tail', async () => {
+    tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-jsonl-history-'));
+    const sessionFilePath = join(tmpRoot, 'sess.jsonl');
+    // A native lifecycle row can be outside both the display tail and the pager's default line limit.
+    const history = JSON.stringify({ type: 'attachment', uuid: 'old-native', attachment: { type: 'queued_command' }, pad: '🙂'.repeat(2_100_000) }) + '\r\n';
+    const tail = JSON.stringify({ type: 'assistant', uuid: 'current', message: {} }) + '\n';
+    await writeFile(sessionFilePath, history + tail);
+    const observed: Array<{ uuid: unknown; offset: number }> = [];
+    const messages = await readClaudeSessionJsonlMessages({
+      sessionFilePath, logLabel: 'TEST', maxBytes: 1_024, observeFullHistory: true,
+      onJsonValue: (value, source) => {
+        const uuid = value && typeof value === 'object' && 'uuid' in value ? value.uuid : null;
+        observed.push({ uuid, offset: source.lineStartOffsetBytes });
+      },
+    });
+    expect(observed).toEqual([
+      { uuid: 'old-native', offset: 0 },
+      { uuid: 'current', offset: Buffer.byteLength(history) },
+    ]);
+    expect(messages.map(message => message.uuid)).toEqual(['current']);
+  });
+
+  it.each(['missing', 'incomplete'] as const)('rejects %s startup history rather than reporting an empty baseline', async (kind) => {
+    tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-jsonl-history-error-'));
+    const sessionFilePath = join(tmpRoot, 'sess.jsonl');
+    if (kind === 'incomplete') await writeFile(sessionFilePath, '{"type":"attachment"');
+    await expect(readClaudeSessionJsonlMessages({
+      sessionFilePath, logLabel: 'TEST', observeFullHistory: true,
+    })).rejects.toThrow(/startup transcript history/);
   });
 });

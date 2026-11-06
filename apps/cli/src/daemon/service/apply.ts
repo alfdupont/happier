@@ -5,6 +5,7 @@ import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 
 import {
   buildServiceCommandEnv,
+  applyServicePlan,
   isBenignServiceAbsenceFailure,
 } from '@happier-dev/cli-common/service';
 
@@ -16,6 +17,21 @@ export type DaemonServiceCommandFailureMode = 'best-effort' | 'strict';
 
 function formatDaemonServiceCommand(command: DaemonServicePlannedCommand): string {
   return `${command.cmd} ${command.args.join(' ')}`.trim();
+}
+
+function unavailableServiceCommand(command: DaemonServicePlannedCommand): Error & Readonly<{ code: 'service_manager_unavailable' }> {
+  return Object.assign(new Error(`Background service command is not available: ${formatDaemonServiceCommand(command)}`), {
+    code: 'service_manager_unavailable' as const,
+  });
+}
+
+export function assertDaemonServiceCommandsAvailable(commands: readonly DaemonServicePlannedCommand[]): void {
+  for (const command of commands) {
+    if (command.ignoreFailure) continue;
+    if (!commandExistsInPath({ cmd: command.cmd, envPath: process.env.PATH, platform: process.platform, pathext: process.env.PATHEXT })) {
+      throw unavailableServiceCommand(command);
+    }
+  }
 }
 
 function runCommand(command: DaemonServicePlannedCommand): { ok: boolean; out: string | null } {
@@ -141,8 +157,8 @@ export function runDaemonServiceCommands(
   for (const command of commands) {
     const exists = commandExistsInPath({ cmd: command.cmd, envPath: process.env.PATH, platform: process.platform, pathext: process.env.PATHEXT });
     if (!exists) {
-      if (failureMode === 'strict') {
-        throw new Error(`Background service command is not available: ${formatDaemonServiceCommand(command)}`);
+      if (failureMode === 'strict' && !command.ignoreFailure) {
+        throw unavailableServiceCommand(command);
       }
       continue;
     }
@@ -163,6 +179,10 @@ export async function applyDaemonServiceInstallPlan(
   plan: DaemonServiceInstallPlan,
   options: Readonly<{ runCommands?: boolean; commandFailureMode?: DaemonServiceCommandFailureMode }> = {},
 ): Promise<void> {
+  if (options.runCommands !== false) {
+    assertDaemonServiceCommandsAvailable(plan.commands);
+  }
+  await applyServicePlan({ writes: [], copies: plan.copies, commands: [] }, { runCommands: false });
   for (const file of plan.files) {
     await mkdir(dirname(file.path), { recursive: true });
     await writeFile(file.path, file.content, 'utf-8');

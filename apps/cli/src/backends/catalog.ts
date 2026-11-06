@@ -1,5 +1,5 @@
 import type { AgentId } from '@/agent/core';
-import { AGENTS_CORE } from '@happier-dev/agents';
+import { AGENTS_CORE, supportsExistingSessionHandoffState } from '@happier-dev/agents';
 import {
   type ConnectedServiceId,
   type DirectSessionsProviderId,
@@ -41,6 +41,8 @@ import type {
 } from '@/backends/connectedServices/verifyResumeReachableTypes';
 import type { ConnectedServiceProviderRuntimeAuthAdapter } from '@/daemon/connectedServices/runtimeAuth/types';
 import type { ConnectedServiceQuotaFetcherDescriptor } from '@/daemon/connectedServices/quotas/types';
+import type { ImportedSessionHandoffBundle } from '@/session/handoff/types';
+import { resolveSessionHandoffEligibility } from '@/session/handoff/resolveSessionHandoffEligibility';
 import type {
   ConnectedServiceRuntimeAuthSelectionMaterializerParams,
 } from '@/daemon/connectedServices/sessionAuthSwitch/runtimeAuthSelectionMaterializerTypes';
@@ -75,10 +77,46 @@ export const AGENTS: Partial<Record<CatalogAgentId, AgentCatalogEntry>> = {
   agy,
 };
 
-export function requireCatalogEntry(agentId: CatalogAgentId): AgentCatalogEntry {
-  const entry = AGENTS[agentId];
+function isCatalogAgentId(agentId: string): agentId is CatalogAgentId {
+  return Object.prototype.hasOwnProperty.call(AGENTS, agentId);
+}
+
+export function requireCatalogEntry(agentId: string): AgentCatalogEntry {
+  const entry = isCatalogAgentId(agentId) ? AGENTS[agentId] : undefined;
   if (!entry) throw new Error(`Missing catalog agent entry for ${agentId}`);
   return entry;
+}
+
+export function resolveExistingSessionHandoffEligibilityThroughCatalog(metadata: unknown) {
+  const eligibility = resolveSessionHandoffEligibility({ metadata });
+  if (!eligibility.eligible) return eligibility;
+  if (!supportsExistingSessionHandoffState(eligibility.agentId)
+    || !requireCatalogEntry(eligibility.agentId).resolveExistingSessionHandoffState) {
+    return { eligible: false, reasonCode: 'existing_state_unsupported', agentId: eligibility.agentId } as const;
+  }
+  return eligibility;
+}
+
+export async function resolveExistingSessionHandoffStateThroughCatalog(params: Readonly<{
+  metadata: unknown;
+  targetPath: string;
+  env?: NodeJS.ProcessEnv;
+  sessionStorageMode?: 'direct' | 'persisted';
+}>): Promise<ImportedSessionHandoffBundle> {
+  const eligibility = resolveExistingSessionHandoffEligibilityThroughCatalog(params.metadata);
+  if (!eligibility.eligible) {
+    throw new Error(`Session is not eligible for existing-state handoff: ${eligibility.reasonCode}`);
+  }
+  const resolver = requireCatalogEntry(eligibility.agentId).resolveExistingSessionHandoffState;
+  if (!resolver) throw new Error(`Existing-state handoff is unsupported for ${eligibility.agentId}`);
+  if (!params.targetPath.trim()) throw new Error('Target path is unavailable for existing-state handoff');
+  return await resolver({
+    metadata: params.metadata as Record<string, unknown>,
+    vendorResumeId: eligibility.vendorHandoffId,
+    targetPath: params.targetPath,
+    env: params.env ?? process.env,
+    sessionStorageMode: params.sessionStorageMode ?? eligibility.storageMode,
+  });
 }
 
 export function getConnectedServiceQuotaFetcherDescriptors(): ReadonlyArray<ConnectedServiceQuotaFetcherDescriptor> {
@@ -342,7 +380,7 @@ export function resolveConnectedServiceCandidatePersistedSessionFile(
  */
 export async function resolveAgentNativeSessionLogPathThroughCatalog(
   agentId: AgentId | null | undefined,
-  input: Readonly<{ vendorResumeId: string }>,
+  input: Readonly<{ vendorResumeId: string; metadata?: Record<string, unknown> }>,
 ): Promise<string | null> {
   const catalogId = resolveCatalogAgentId(agentId);
   const entry = AGENTS[catalogId];

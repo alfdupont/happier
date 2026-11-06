@@ -30,7 +30,8 @@ import { createConnectedServiceAuthGenerationApplyFailureError } from './connect
 import type { ConnectedServiceSessionAuthSwitchReason } from './connectedServiceSessionAuthSwitchCore';
 import { ConnectedServiceAuthGroupRuntimeStateRevisionConflictError } from '@/api/connectedServices/connectedServiceCredentialApi';
 import type { ConnectedServiceAuthGroupCandidatePreparationResult } from '../refresh/prepareConnectedServiceAuthGroupCandidateForSwitch';
-import type { ConnectedServiceGroupQuotaProbeResult, ConnectedServiceQuotaRecoveryCreditConsumeResult } from '../quotas/ConnectedServiceQuotasCoordinator';
+import type { AutomaticQuotaResetContext, ConnectedServiceGroupQuotaProbeResult, ConnectedServiceQuotaRecoveryCreditConsumeResult } from '../quotas/ConnectedServiceQuotasCoordinator';
+import { logger } from '@/ui/logger';
 
 type AuthGroupApi = Readonly<{
   getConnectedServiceAuthGroup(input: Readonly<{
@@ -43,6 +44,7 @@ type AuthGroupApi = Readonly<{
     activeProfileId: string;
     expectedGeneration: number;
     overrideRuntimeCooldown?: boolean;
+    switchReason?: string;
   }>): Promise<ConnectedServiceAuthGroupV1>;
   updateConnectedServiceAuthGroupRuntimeState?(input: Readonly<{
     serviceId: ConnectedServiceId;
@@ -94,15 +96,6 @@ function assertPredictiveSoftSwitchSessionApplyAllowed(input: Readonly<{
       policyReason: decision.reason,
       ...(input.applyMode ? { attemptedMode: input.applyMode } : {}),
     },
-  });
-}
-
-function assertExactConnectedServiceCredentialRevision(
-  credentialRevision: ConnectedServiceCredentialRevisionV1 | null | undefined,
-): asserts credentialRevision is ConnectedServiceCredentialRevisionV1 {
-  if (credentialRevision != null) return;
-  throw createConnectedServiceAuthGenerationApplyFailureError({
-    errorCode: 'credential_revision_missing',
   });
 }
 
@@ -194,10 +187,11 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
   accountUsageStore?: AccountUsageStoreForAuthGroupSwitchState | null;
   leases?: InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry;
   quotaFreshnessMs: number;
+  resolveRequiredModelIdsForGroup?: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string }>) => ReadonlyArray<string>;
   consumeAvailableRecoveryCreditForProfile?: (input: Readonly<{
     serviceId: ConnectedServiceId;
     profileId: string;
-    automaticResetContext: Readonly<{ groupId: string; sessionId?: string }>;
+    automaticResetContext: AutomaticQuotaResetContext;
   }>) => Promise<ConnectedServiceQuotaRecoveryCreditConsumeResult>;
   nowMs: () => number;
   sleepMs?: (ms: number) => Promise<void>;
@@ -274,7 +268,7 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
     ...(params.consumeAvailableRecoveryCreditForProfile ? {
-      consumeAvailableRecoveryCreditForProfile: async (input: Readonly<{ serviceId: string; profileId: string; automaticResetContext: Readonly<{ groupId: string; sessionId?: string }> }>) =>
+      consumeAvailableRecoveryCreditForProfile: async (input: Readonly<{ serviceId: string; profileId: string; automaticResetContext: AutomaticQuotaResetContext }>) =>
         await params.consumeAvailableRecoveryCreditForProfile!({ ...input, serviceId: ConnectedServiceIdSchema.parse(input.serviceId) }),
     } : {}),
     loadState: async (input) => {
@@ -312,6 +306,7 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
           : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group });
       const state: ConnectedServiceAuthGroupSwitchState = {
         ...unresolvedState,
+        requiredModelIds: params.resolveRequiredModelIdsForGroup?.({ serviceId, groupId: input.groupId }) ?? [],
         credentialRevision: params.resolveCredentialRevision?.(
           serviceId,
           unresolvedState.activeProfileId,
@@ -341,13 +336,27 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
     },
     commitSwitch: async (input) => {
       const serviceId = ConnectedServiceIdSchema.parse(input.serviceId);
-      const group = await params.api.updateConnectedServiceAuthGroupActiveProfile({
+      let group = await params.api.updateConnectedServiceAuthGroupActiveProfile({
         serviceId,
         groupId: input.groupId,
         activeProfileId: input.toProfileId,
         expectedGeneration: input.expectedGeneration,
         overrideRuntimeCooldown: true,
+        switchReason: input.reason,
       });
+      // Disable only after the canonical selector has moved the active account. Disabling the
+      // active member first invokes the released server's priority-only invariant fallback and
+      // can briefly publish an exhausted account to every session in the pool.
+      if (params.api.updateConnectedServiceAuthGroupMember) {
+        for (const member of group.members) {
+          if (!member.enabled || member.profileId === group.activeProfileId
+            || member.state.autoDisabledReason !== 'model_not_entitled') continue;
+          group = await params.api.updateConnectedServiceAuthGroupMember({
+            serviceId, groupId: input.groupId, profileId: member.profileId, enabled: false,
+            expectedGeneration: group.generation,
+          });
+        }
+      }
       await params.onCommittedSwitch?.({
         serviceId,
         groupId: input.groupId,
@@ -369,7 +378,12 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
       const credentialRevision = await params.resolveCurrentCredentialRevision(
         serviceId,
         unresolvedState.activeProfileId,
-      ).catch(() => null);
+      ).catch(() => {
+        logger.warn('[ConnectedServices] Credential revision read-back failed after account switch', {
+          serviceId, profileId: unresolvedState.activeProfileId, errorCode: 'credential_revision_read_failed',
+        });
+        return null;
+      });
       return {
         ...unresolvedState,
         credentialRevision,
@@ -434,9 +448,13 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
     resolvePostApplyCredentialRevision: async (input) => await params.resolveCurrentCredentialRevision(
       ConnectedServiceIdSchema.parse(input.serviceId),
       input.activeProfileId,
-    ).catch(() => null),
+    ).catch(() => {
+      logger.warn('[ConnectedServices] Credential revision read-back failed after account application', {
+        serviceId: input.serviceId, profileId: input.activeProfileId, errorCode: 'credential_revision_read_failed',
+      });
+      return null;
+    }),
     applyGeneration: async (input) => {
-      assertExactConnectedServiceCredentialRevision(input.credentialRevision);
       if (input.sessionId && params.applyConnectedServiceAuthGeneration) {
         const applied = await params.applyConnectedServiceAuthGeneration({
           sessionId: input.sessionId,
@@ -492,6 +510,9 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
     },
     recordObservedFailureState: async (input) => {
       if (!params.api.updateConnectedServiceAuthGroupRuntimeState) return;
+      // Explicit null is an unattributed provider-started failure. The tracked
+      // pool can be recovered, but no member may acquire a limiter from it.
+      if (input.observedProfileId === null) return;
       const observedProfileId = typeof input.observedProfileId === 'string' && input.observedProfileId.trim().length > 0
         ? input.observedProfileId.trim()
         : input.loaded.activeProfileId;
@@ -522,6 +543,7 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
           if (
             nextMemberState.autoDisabledReason === 'model_not_entitled'
             && params.api.updateConnectedServiceAuthGroupMember
+            && observedProfileId !== input.loaded.activeProfileId
           ) {
             await params.api.updateConnectedServiceAuthGroupMember({
               serviceId,

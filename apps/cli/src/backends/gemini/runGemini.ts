@@ -11,6 +11,7 @@ import os from 'node:os';
 import { resolve } from 'node:path';
 
 import { logger } from '@/ui/logger';
+import { isConditionalPendingSteerClaim } from '@happier-dev/protocol';
 import { resolveHasTTY } from '@/ui/tty/resolveHasTTY';
 import { Credentials } from '@/persistence';
 import { createSessionMetadata } from '@/agent/runtime/createSessionMetadata';
@@ -299,6 +300,7 @@ export async function runGemini(opts: {
       credentials: opts.credentials,
       settings: opts.accountSettingsContext?.settings ?? null,
       profileId: session.getMetadataSnapshot()?.profileId ?? null,
+      sessionMetadata: session.getMetadataSnapshot(),
       baseOverride,
       executionRunsFeatureEnabled: resolveCliFeatureDecision({
         featureId: 'execution.runs',
@@ -413,21 +415,21 @@ export async function runGemini(opts: {
         reason,
       }) === true;
     };
-    if (
-      pendingProviderAction === 'steer'
-    ) {
-      if (!rejectPendingQueueInputBeforeProviderEffect('steering_unavailable') && deliveryInfo?.providerAcceptancePending !== true) {
-        const localIds = message.localId ? [message.localId] : [];
+    if (isConditionalPendingSteerClaim({
+      requestedAction: deliveryInfo?.pendingRequestedAction,
+      providerAction: pendingProviderAction,
+    })) {
+      if (!rejectPendingQueueInputBeforeProviderEffect('steering_unavailable')) {
         await session.blockPendingMessageDelivery?.({
-          localIds,
-          reason: 'steering_unavailable',
-          providerEffect: 'none',
+          localIds: message.localId ? [message.localId] : [],
+          reason: 'steering_unavailable', providerEffect: 'none',
         });
       }
       return;
     }
     const queueDeliveryOptions = {
-      ...(pendingProviderAction ? { pendingProviderAction } : {}),
+      ...(pendingProviderAction ? { pendingProviderAction: pendingProviderAction === 'steer' ? 'send' as const : pendingProviderAction } : {}),
+      ...(deliveryInfo?.pendingRequestedAction ? { pendingRequestedAction: deliveryInfo.pendingRequestedAction } : {}),
       userMessageLocalId: message.localId ?? null,
       providerAcceptancePending: deliveryInfo?.providerAcceptancePending === true,
     };
@@ -505,8 +507,10 @@ export async function runGemini(opts: {
   //
 
   let abortController = new AbortController();
+  let explicitAbortPromise: Promise<boolean> | null = null;
   let shouldExit = false;
   let geminiBackend: GeminiBackendResult['backend'] | null = null;
+  const providerTurnEventSubscription: { unsubscribe: (() => void) | null } = { unsubscribe: null };
   let providerInputConsumer: SessionProviderInputConsumer<GeminiMode, string> | null = null;
   let providerInputAdmissionClosed = false;
   let providerInputDispatchDrain: Promise<void> = Promise.resolve();
@@ -526,45 +530,51 @@ export async function runGemini(opts: {
 
   const lastGeminiSessionIdPublished: { value: string | null } = { value: null };
 
-  async function handleAbort(): Promise<boolean> {
+  function handleAbort(): Promise<boolean> {
+    if (explicitAbortPromise) return explicitAbortPromise;
     if (!turnMessageState.thinking && !turnMessageState.isResponseInProgress) {
       logger.debug('[Gemini] Abort requested with no active turn; ignoring stale abort');
-      return false;
+      return Promise.resolve(false);
     }
 
-    logger.debug('[Gemini] Abort requested - stopping current task');
-    await permissionHandler.abortPendingRequestsAndFlush('Aborted by user');
-    await transcriptStream.flushAll({
-      reason: 'abort',
-      interruptedReason: 'abort-requested',
-    });
-    turnMessageState.thinking = false;
-    turnMessageState.isResponseInProgress = false;
-    session.keepAlive(false, 'remote');
-    
-    // Send turn_aborted event (like Codex) when abort is requested
-    session.sendAgentMessage('gemini', {
-      type: 'turn_aborted',
-      id: randomUUID(),
-    });
-    
-    // Reset diff processor
-    diffProcessor.reset();
-    
-    try {
-      abortController.abort();
-      messageQueue.reset();
-      if (geminiBackend && acpSessionId) {
-        await geminiBackend.cancel(acpSessionId);
+    explicitAbortPromise = (async () => {
+      logger.debug('[Gemini] Abort requested - stopping current task');
+      await permissionHandler.abortPendingRequestsAndFlush('Aborted by user');
+      await transcriptStream.flushAll({
+        reason: 'abort',
+        interruptedReason: 'abort-requested',
+      });
+      turnMessageState.thinking = false;
+      turnMessageState.isResponseInProgress = false;
+      session.keepAlive(false, 'remote');
+
+      // Send turn_aborted event (like Codex) when abort is requested
+      session.sendAgentMessage('gemini', {
+        type: 'turn_aborted',
+        id: randomUUID(),
+      });
+
+      // Reset diff processor
+      diffProcessor.reset();
+
+      try {
+        abortController.abort();
+        messageQueue.reset();
+        if (geminiBackend && acpSessionId) {
+          await geminiBackend.cancel(acpSessionId);
+        }
+        logger.debug('[Gemini] Abort completed - session remains active');
+        return true;
+      } catch (error) {
+        logger.debug('[Gemini] Error during abort:', error);
+        return false;
+      } finally {
+        abortController = new AbortController();
       }
-      logger.debug('[Gemini] Abort completed - session remains active');
-      return true;
-    } catch (error) {
-      logger.debug('[Gemini] Error during abort:', error);
-      return false;
-    } finally {
-      abortController = new AbortController();
-    }
+    })().finally(() => {
+      explicitAbortPromise = null;
+    });
+    return explicitAbortPromise;
   }
 
   let terminationHandlers: ReturnType<typeof registerRunnerTerminationHandlers> | null = null;
@@ -664,6 +674,8 @@ export async function runGemini(opts: {
 
         if (geminiBackend) {
           const backendToDispose = geminiBackend;
+          providerTurnEventSubscription.unsubscribe?.();
+          providerTurnEventSubscription.unsubscribe = null;
           await backendToDispose.dispose();
         }
 
@@ -715,6 +727,10 @@ export async function runGemini(opts: {
    * This function is called when backend is created or recreated
    */
   function setupGeminiMessageHandler(backend: GeminiBackendResult['backend']): void {
+    providerTurnEventSubscription.unsubscribe?.();
+    providerTurnEventSubscription.unsubscribe = backend.onProviderTurnEvent?.(() => {
+      session.sessionTurnLifecycle?.observeProviderTurnEvent();
+    }) ?? null;
     backend.onMessage(
       createGeminiBackendMessageHandler({
         session,
@@ -814,6 +830,10 @@ export async function runGemini(opts: {
       await initializedSession.commitPendingFirstInputAfterRuntimeReady?.();
 
     while (!shouldExit) {
+      // ACP can settle the active response before cancellation finishes. Wait for the
+      // runner-owned abort to reset its signal before admitting another input or turn.
+      if (explicitAbortPromise) await explicitAbortPromise;
+      if (shouldExit) break;
       let message: MessageBatch<GeminiMode, string> | null = pending;
       pending = null;
 
@@ -860,6 +880,8 @@ export async function runGemini(opts: {
         // Dispose old backend and create new one with new model
         if (geminiBackend) {
           const backendToDispose = geminiBackend;
+          providerTurnEventSubscription.unsubscribe?.();
+          providerTurnEventSubscription.unsubscribe = null;
           await backendToDispose.dispose();
           geminiBackend = null;
         }
@@ -1265,19 +1287,15 @@ export async function runGemini(opts: {
             session,
             error: turnFailureError,
             logPrefix: '[gemini]',
+            failedTurn: { sessionSeq: session.getLastObservedMessageSeq() },
           });
-          if (runtimeAuthResult?.recoveryReport?.handled !== true) {
+          if (!runtimeAuthResult) {
             await surfacePrimarySessionRuntimeIssue({
               provider: 'gemini',
               session,
               sessionSeq: session.getLastObservedMessageSeq(),
               cause: 'status_error',
-              error: runtimeAuthResult
-                ? Object.assign(
-                    turnFailureError instanceof Error ? turnFailureError : new Error(String(turnFailureError)),
-                    { runtimeAuthClassification: runtimeAuthResult.classification },
-                  )
-                : turnFailureError,
+              error: turnFailureError,
             });
           }
         }
@@ -1313,6 +1331,7 @@ export async function runGemini(opts: {
 
   } finally {
     terminationHandlers?.dispose();
+    if (explicitAbortPromise) await explicitAbortPromise;
     await closeProviderInputAdmission();
     // Clean up resources
     logger.debug('[gemini]: Final cleanup start');
@@ -1333,6 +1352,8 @@ export async function runGemini(opts: {
 
     if (geminiBackend) {
       const backendToDispose = geminiBackend;
+      providerTurnEventSubscription.unsubscribe?.();
+      providerTurnEventSubscription.unsubscribe = null;
       await backendToDispose.dispose();
     }
 

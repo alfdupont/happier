@@ -1,10 +1,9 @@
 import type { DaemonSpawnHooks } from '@/daemon/spawnHooks';
-import { validateProviderCliSpawn } from '@/runtime/managedTools/validateProviderCliSpawn';
 import { resolveClaudeConfigDirOverride } from '@/backends/claude/utils/resolveClaudeConfigDirOverride';
 import { resolveClaudeConfigDirEnvOverlay } from '@/backends/claude/utils/resolveClaudeConfigDirEnvOverlay';
 import { resolveClaudeExternalSandboxEnv } from '@/backends/claude/spawn/resolveClaudeExternalSandboxEnv';
 import { resolveProviderOutgoingMessageMetaExtras } from '@/settings/providerSettings';
-import { resolveInitialClaudeRemoteMetaState } from '@/backends/claude/remote/resolveInitialClaudeRemoteMetaState';
+import { readDaemonClaudeUnifiedTerminalPin, resolveInitialClaudeRemoteMetaState } from '@/backends/claude/remote/resolveInitialClaudeRemoteMetaState';
 import { normalizeClaudeRemoteMode } from '@/backends/claude/remote/normalizeClaudeRemoteMode';
 import { HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY } from '@/backends/claude/endpointRecovery/claudeEndpointArtifacts';
 
@@ -17,7 +16,9 @@ export const claudeDaemonSpawnHooks: DaemonSpawnHooks = {
       processEnv[HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY]?.trim(),
     );
     const unified = hasRecoverableDetachedProvider
-      || normalizeClaudeRemoteMode(resolveInitialClaudeRemoteMetaState({ metaDefaults: defaults })).kind === 'unifiedTerminal';
+      || normalizeClaudeRemoteMode(resolveInitialClaudeRemoteMetaState({ metaDefaults: defaults,
+        pinnedUnifiedTerminalEnabled: readDaemonClaudeUnifiedTerminalPin('daemon', processEnv),
+      })).kind === 'unifiedTerminal';
     return unified
       ? host === 'herdr' && !hasRecoverableDetachedProvider
         ? {
@@ -28,7 +29,6 @@ export const claudeDaemonSpawnHooks: DaemonSpawnHooks = {
         : { kind: 'provider', childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '1' } }
       : { kind: 'runner', startingMode: 'remote', childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '0' } };
   },
-  validateSpawn: async () => validateProviderCliSpawn({ agentId: 'claude' }),
   buildExtraEnvForChild: () => {
     return {
       ...resolveClaudeConfigDirEnvOverlay(process.env),

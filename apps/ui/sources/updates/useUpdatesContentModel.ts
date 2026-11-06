@@ -6,20 +6,21 @@ import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot'
 import { ensureMachineUpdateFactsBackground } from '@/capabilities/ensureAgentInstallablesBackground';
 import { useActiveServerAccountScope, useAllMachines } from '@/sync/domains/state/storage';
 import { isMachineOnline } from '@/utils/sessions/machineUtils';
+import { fireAndForget } from '@/utils/system/fireAndForget';
 import { storage } from '@/sync/domains/state/storageStore';
 import { resolveSessionMachineId } from '@/sync/domains/session/directSessions/resolveSessionMachineId';
 
 import { buildMachineUpdateGroups, readUpdatableInstallables, type UpdatesGroup } from './buildMachineUpdateGroups';
-import { buildUpdatesSummary, planUpdateAll, type UpdatesSummary } from './items/buildUpdatesSummary';
+import { buildUpdatesSummary, type UpdatesSummary } from './items/buildUpdatesSummary';
 import type { UpdateItem } from './items/updateItem';
 import { useMachinesCapabilitySnapshots } from './machineCapabilitySnapshots';
-import { markUpdateCompletionsSeen, refreshMachineUpdateFacts, runMachineItemUpdate, useMachineUpdateRuns, useUnseenUpdateCompletions } from './machineUpdateRuns';
+import { markUpdateCompletionsSeen, refreshMachineUpdateFacts, runMachineItemUpdate, useMachineUpdateRuns, useUnseenUpdateCompletions, useUpdateBatch, useUpdateCheck, type UpdateAllProgress } from './machineUpdateRuns';
 import { useAppUpdateStatus } from './useAppUpdateStatus';
 import { useThisComputerCliUpdate } from './useThisComputerCliUpdate';
 
 export type { UpdatesGroup };
 
-export type UpdateAllProgress = Readonly<{ done: number; total: number; stopping: boolean }>;
+export type { UpdateAllProgress } from './machineUpdateRuns';
 
 export type UpdatesContentModel = Readonly<{
     summary: UpdatesSummary;
@@ -34,6 +35,7 @@ export type UpdatesContentModel = Readonly<{
     updateAll: () => Promise<void>;
     stopAfterCurrent: () => void;
     batch: UpdateAllProgress | null;
+    checking: boolean;
     checkNow: () => void;
     skipAppVersion: (() => void) | null;
     /** Release notes stay reachable from the This app group (R13 (e)). */
@@ -132,54 +134,19 @@ export function useUpdatesContentModel(): UpdatesContentModel {
         await executeItem(item);
     }, [executeItem]);
 
-    const [batch, setBatch] = React.useState<UpdateAllProgress | null>(null);
-    const stopRef = React.useRef(false);
-    const itemsRef = React.useRef(allItems);
-    itemsRef.current = allItems;
+    const { batch, updateAll, stopAfterCurrent } = useUpdateBatch(updateScope, allItems, executeItem);
 
-    const updateAll = React.useCallback(async () => {
-        if (batch) return;
-        const plan = planUpdateAll(itemsRef.current);
-        if (plan.total === 0) return;
-
-        stopRef.current = false;
-        let done = 0;
-        setBatch({ done, total: plan.total, stopping: false });
-        const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
-        const settle = () => {
-            done += 1;
-            setBatch((current) => (current ? { ...current, done } : current));
-        };
-        // Per machine in order (the Happier CLI last, it restarts the daemon the others travel
-        // through); machines side by side; the app only downloads — its restart is the person's.
-        await Promise.all([
-            ...plan.machines.map(async (machine) => {
-                for (const itemId of machine.itemIds) {
-                    if (stopRef.current) return;
-                    const item = byId.get(itemId);
-                    if (item) await executeItem(item);
-                    settle();
-                }
-            }),
-            (async () => {
-                const appItem = plan.appItemId ? byId.get(plan.appItemId) : undefined;
-                if (!appItem || stopRef.current) return;
-                if (appItem.action.kind === 'run' && appItem.action.verb === 'update') await app.run();
-                settle();
-            })(),
+    const check = React.useCallback(async () => {
+        const results = await Promise.allSettled([
+            app.checkNow(),
+            ...(onlineKey ? onlineKey.split('\u0000') : []).map((machineId) => refreshMachineUpdateFacts(serverId, machineId)),
         ]);
-        setBatch(null);
-    }, [app, batch, executeItem]);
-
-    const stopAfterCurrent = React.useCallback(() => {
-        stopRef.current = true;
-        setBatch((current) => (current ? { ...current, stopping: true } : current));
-    }, []);
-
+        for (const result of results) if (result.status === 'rejected') throw result.reason;
+    }, [app.checkNow, onlineKey, serverId]);
+    const { checking, checkNow: runCheck } = useUpdateCheck(serverId, check);
     const checkNow = React.useCallback(() => {
-        void app.checkNow();
-        for (const machineId of onlineKey ? onlineKey.split('\u0000') : []) refreshMachineUpdateFacts(serverId, machineId);
-    }, [app, onlineKey, serverId]);
+        fireAndForget(runCheck(), { tag: 'Updates.checkNow' });
+    }, [runCheck]);
 
     const openWhatsNew = React.useCallback(() => {
         if (releaseNotesLauncher.open()) return;
@@ -204,8 +171,9 @@ export function useUpdatesContentModel(): UpdatesContentModel {
         stopAfterCurrent,
         batch,
         checkNow,
+        checking,
         skipAppVersion: app.skipVersion,
         openWhatsNew,
         whatsNewUnread: releaseNotes.hasUnread,
-    }), [app.skipVersion, batch, checkNow, checkedAt, groups, openWhatsNew, releaseNotes.hasUnread, runItem, sessionsRunningOn, stopAfterCurrent, summary, uncheckedMachineCount, updateAll]);
+    }), [app.skipVersion, batch, checkNow, checkedAt, checking, groups, openWhatsNew, releaseNotes.hasUnread, runItem, sessionsRunningOn, stopAfterCurrent, summary, uncheckedMachineCount, updateAll]);
 }

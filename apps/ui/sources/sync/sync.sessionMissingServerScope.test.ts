@@ -1,3 +1,4 @@
+import { getServerFetchUrl, matchServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TranscriptRowShellItem } from '@/components/sessions/transcript/measurement/transcriptRowShellSignature';
 
@@ -83,16 +84,14 @@ import { buildServerFeaturesResponse } from '@/hooks/server/serverFeaturesTestUt
 import { resetServerFeaturesClientForTests } from '@/sync/api/capabilities/serverFeaturesClient';
 import { markSessionHidden, markSessionVisible } from './domains/session/activeViewingSession';
 import { createDeferred } from '@/dev/testkit/hooks/createDeferred';
+import { Encryption } from '@/sync/encryption/encryption';
+import type { SessionByIdEncryption } from '@/sync/engine/sessions/sessionById';
 
 const initialStorageState = storage.getState();
 
 type SyncMetadataPatchTestAccess = {
     credentials: { token: string; secret: string } | null;
-    encryption: {
-        decryptEncryptionKey: (encryptedKey: string | null | undefined) => Promise<null>;
-        initializeSessions: () => Promise<void>;
-        getSessionEncryption: (sessionId: string) => null;
-    };
+    encryption: SessionByIdEncryption;
 };
 
 function createSession(sessionId: string): Session {
@@ -141,7 +140,7 @@ function expectHeaderValue(headers: HeadersInit | undefined, key: string, value:
 }
 
 function findRuntimeFetchCall(url: string) {
-    const call = runtimeFetchMock.mock.calls.find(([input]) => String(input) === url);
+    const call = runtimeFetchMock.mock.calls.find(([input]) => matchServerFetchUrl(url).asymmetricMatch(input));
     expect(call, `expected runtimeFetch to be called with ${url}`).toBeTruthy();
     return call;
 }
@@ -570,7 +569,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
 
         expect(requestMock).not.toHaveBeenCalled();
         expect(runtimeFetchMock).toHaveBeenCalledWith(
-            `https://owner.example/v2/sessions/${sessionId}/pending?includeDiscarded=1`,
+            matchServerFetchUrl(`https://owner.example/v2/sessions/${sessionId}/pending?includeDiscarded=1`),
             expect.objectContaining({
                 method: 'GET',
             }),
@@ -713,7 +712,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             if (url.endsWith('/v1/features')) {
                 return Response.json(buildServerFeaturesResponse());
             }
-            if (url === `https://owner.example/v2/sessions/${sessionId}/pending/${localId}/action`) {
+            if (matchServerFetchUrl(`https://owner.example/v2/sessions/${sessionId}/pending/${localId}/action`).asymmetricMatch(url)) {
                 expect(init).toEqual(expect.objectContaining({
                     method: 'PATCH',
                     body: JSON.stringify({ requestedAction: { v: 1, kind: 'steer_now' } }),
@@ -859,11 +858,11 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         createEncryptionFromAuthCredentialsMock.mockResolvedValue({});
         runtimeFetchMock.mockImplementation(async (input) => {
             const url = String(input);
-            if (url.endsWith(`/pending/${pendingId}/discard`)) {
+            if (getServerFetchUrl(input).pathname.endsWith(`/pending/${pendingId}/discard`)) {
                 getCredentialsForServerUrlMock.mockResolvedValue({ token: accountBToken, secret: 'owner-secret-b' });
                 return Response.json({ ok: true });
             }
-            if (url.endsWith('/pending?includeDiscarded=1')) {
+            if (matchServerFetchUrl(`https://owner.example/v2/sessions/${sessionId}/pending?includeDiscarded=1`).asymmetricMatch(url)) {
                 return Response.json({ pending: [] });
             }
             return new Response(null, { status: 404 });
@@ -899,7 +898,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         const ownerToken = buildTokenWithSub('owner-account-stable');
         getCredentialsForServerUrlMock.mockResolvedValue({ token: ownerToken, secret: 'owner-secret' });
         createEncryptionFromAuthCredentialsMock.mockResolvedValue({});
-        runtimeFetchMock.mockImplementation(async (input) => String(input).endsWith('/pending?includeDiscarded=1')
+        runtimeFetchMock.mockImplementation(async (input) => matchServerFetchUrl(`https://owner.example/v2/sessions/${sessionId}/pending?includeDiscarded=1`).asymmetricMatch(input)
             ? Response.json({ pending: [] })
             : Response.json({ ok: true }));
 
@@ -1013,6 +1012,69 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             }),
             serverId: 'server_override',
         });
+    });
+
+    it.each(['sendMessage', 'submitMessage'] as const)(
+        'preserves a failed cold-session hydration before %s',
+        async (entryPoint) => {
+            const sessionId = 'message_hydration_failure';
+            requestMock.mockRejectedValueOnce(new TypeError('Network request failed'));
+            const { sync } = await import('./sync');
+            const syncForHydration = sync as unknown as SyncMetadataPatchTestAccess;
+            syncForHydration.credentials = { token: 'active-token', secret: 'active-secret' };
+            syncForHydration.encryption = Encryption.createWithoutKeyMaterial();
+
+            await expect(sync[entryPoint](sessionId, 'Must not be sent')).rejects.toThrow('server_unavailable');
+
+            expect(storage.getState().sessions[sessionId]).toBeUndefined();
+        },
+    );
+
+    it.each((['sendMessage', 'submitMessage'] as const).flatMap((entryPoint) => (
+        [404, 401].map((status) => ({ entryPoint, status }))
+    )))('preserves a terminal $status hydration before $entryPoint', async ({ entryPoint, status }) => {
+        const sessionId = 'message_terminal_hydration_failure';
+        requestMock.mockImplementation(async () => Response.json({ error: 'Session not found' }, { status }));
+        const { sync } = await import('./sync');
+        const syncForHydration = sync as unknown as SyncMetadataPatchTestAccess;
+        syncForHydration.credentials = { token: 'active-token', secret: 'active-secret' };
+        syncForHydration.encryption = Encryption.createWithoutKeyMaterial();
+
+        const send = sync[entryPoint](sessionId, 'Must not be sent');
+        if (status === 401) {
+            await expect(send).rejects.toMatchObject({ kind: 'auth', code: 'not_authenticated' });
+        } else {
+            await expect(send).rejects.toThrow('not_found');
+        }
+        expect(storage.getState().sessions[sessionId]).toBeUndefined();
+    });
+
+    it.each([
+        {
+            failure: 'transport failure',
+            request: () => Promise.reject(new TypeError('Network request failed')),
+            errorCode: 'network_error',
+        },
+        {
+            failure: 'server rejection',
+            request: () => Promise.resolve(Response.json({ error: 'unavailable' }, { status: 503 })),
+            errorCode: 'http_error',
+        },
+    ])('preserves the hydration failure before patching metadata after a $failure', async ({ request, errorCode }) => {
+        const sessionId = 'metadata_hydration_failure';
+        requestMock.mockImplementationOnce(request);
+        const { sync } = await import('./sync');
+        const syncForMetadataPatch = sync as unknown as SyncMetadataPatchTestAccess;
+        syncForMetadataPatch.credentials = { token: 'active-token', secret: 'active-secret' };
+        syncForMetadataPatch.encryption = Encryption.createWithoutKeyMaterial();
+
+        await expect(sync.patchSessionMetadataWithRetry(sessionId, (metadata) => ({
+            ...metadata,
+            summary: { text: 'Must not be applied', updatedAt: 123 },
+        }))).rejects.toThrow(errorCode);
+
+        expect(storage.getState().sessions[sessionId]).toBeUndefined();
+        expect(emitSessionMetadataUpdateWithServerScopeMock).not.toHaveBeenCalled();
     });
 
     it('hydrates lightweight session rows before patching metadata', async () => {

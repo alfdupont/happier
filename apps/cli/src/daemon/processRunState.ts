@@ -1,12 +1,8 @@
 import { execFile } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
-import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath';
+import { isPidAliveBySignal as probePidAliveBySignal } from '../../scripts/process_tree.cjs';
 
 const execFileAsync = promisify(execFile);
-const processOwner = createRequire(import.meta.url)(resolveCliRuntimeAssetPath('scripts', 'process_tree.cjs')) as {
-  isPidAliveBySignal: (pid: number) => boolean;
-};
 
 /**
  * Coarse process run state for daemon liveness decisions.
@@ -23,7 +19,7 @@ const processOwner = createRequire(import.meta.url)(resolveCliRuntimeAssetPath('
 export type ProcessRunState = 'dead' | 'servable' | 'stopped' | 'zombie';
 
 export function isPidAliveBySignal(pid: number): boolean {
-  return processOwner.isPidAliveBySignal(pid);
+  return probePidAliveBySignal(pid);
 }
 
 function classifyPosixStateChar(stateOutput: string): ProcessRunState | null {
@@ -61,7 +57,7 @@ export async function readProcessRunState(pid: number, deps?: Readonly<{
   } catch {
     // ps exits non-zero when the pid does not exist; fall through to the signal probe.
   }
-  // No ps row: trust the signal probe (a pid can be unobservable to ps but still signalable in
-  // rare sandboxed setups — stay fail-closed and treat alive as servable).
-  return alive ? 'servable' : 'dead';
+  // The runner may exit while ps is pending. Re-observe the signal boundary instead of
+  // retaining the pre-probe snapshot; unobservable live PIDs still fail closed as servable.
+  return isPidAlive(pid) ? 'servable' : 'dead';
 }

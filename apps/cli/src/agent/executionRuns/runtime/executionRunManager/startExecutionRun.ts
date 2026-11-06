@@ -32,7 +32,7 @@ import {
   resolveExecutionRunBuiltInAgentId,
   resolveExecutionRunRuntimeBackendId,
 } from '@/agent/executionRuns/runtime/backendTargets';
-import { settleExecutionRunControllerOccurrence } from '@/agent/executionRuns/runtime/settleExecutionRunControllerOccurrence';
+import { disposeExecutionRunBackendController, settleExecutionRunControllerOccurrence } from '@/agent/executionRuns/runtime/settleExecutionRunControllerOccurrence';
 
 type SendAcp = AcpSendFn;
 
@@ -164,6 +164,7 @@ export async function startExecutionRun(args: Readonly<{
   waitForRuntimeActivityTerminal: (runId: string) => Promise<void>;
   runs: Map<string, ExecutionRunState>;
   controllers: Map<string, ExecutionRunController>;
+  isSessionClosing?: () => boolean;
   enqueueMarkerWrite: (runId: string, write: () => Promise<void>) => Promise<void>;
   writeActivityMarker: (runId: string, nowMs: number, opts?: Readonly<{ force?: boolean }>) => Promise<void>;
   finishRun: FinishRun;
@@ -430,6 +431,7 @@ export async function startExecutionRun(args: Readonly<{
       };
       args.controllers.set(runId, ctrl);
       controllerOccurrence = ctrl;
+      args.onPublicStateUpdated?.(runId);
       await args.writeActivityMarker(runId, args.getNowMs(), { force: true }).catch(() => {});
       return startResult;
     }
@@ -503,12 +505,16 @@ export async function startExecutionRun(args: Readonly<{
 
     const settleProvisionedSessionAfterCancellation = async (childSessionId: SessionId): Promise<void> => {
       try {
-        await backend.cancel(childSessionId);
+        // Stop can dispose before provisioning returns its native session. Cancel that
+        // late session while the parent is open; shutdown and timeout keep teardown final.
+        if (!ctrl.disposalPromise || (ctrl.cancelled && !args.isSessionClosing?.())) {
+          await backend.cancel(childSessionId);
+        }
       } catch {
         // Best effort: dispose below remains the authoritative backend teardown.
       }
       try {
-        await backend.dispose();
+        await disposeExecutionRunBackendController(ctrl);
       } catch {
         // Best effort
       }
@@ -586,7 +592,7 @@ export async function startExecutionRun(args: Readonly<{
         // Best effort
       }
       try {
-        await ctrl.backend.dispose();
+        await disposeExecutionRunBackendController(ctrl);
       } catch {
         // Best effort
       }
@@ -603,12 +609,7 @@ export async function startExecutionRun(args: Readonly<{
           const childSessionId = await provisionBackendController();
           if (!childSessionId) return;
 
-          void args
-            .executeBoundedRun({ runId, callId, sidechainId, startedAtMs, params: args.params })
-            .finally(() => {
-              // Ensure terminal promise resolves even if executeBoundedRun throws unexpectedly.
-              settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
-            });
+          void args.executeBoundedRun({ runId, callId, sidechainId, startedAtMs, params: args.params });
         } catch (error: unknown) {
           await failBackendProvisioning(error);
         }
@@ -645,6 +646,7 @@ export async function startExecutionRun(args: Readonly<{
           const profile = resolveExecutionRunIntentProfile(args.params.intent);
           await args.send(runId, { message: profile.buildPrompt(start) });
         }
+        if (args.controllers.get(runId) === ctrl) args.onPublicStateUpdated?.(runId);
       } catch (error: unknown) {
         await failBackendProvisioning(error);
       }
@@ -685,7 +687,7 @@ export async function startExecutionRun(args: Readonly<{
     }
     if (controllerOccurrence) {
       try {
-        if (controllerOccurrence.kind === 'backend') await controllerOccurrence.backend.dispose();
+        if (controllerOccurrence.kind === 'backend') await disposeExecutionRunBackendController(controllerOccurrence);
       } catch {
         // best effort
       }

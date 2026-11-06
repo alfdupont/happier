@@ -165,25 +165,6 @@ function readCatalogRuntimeOptions(rawCwd: string | undefined): Readonly<{ cwd?:
   return cwd.length > 0 ? { cwd } : {};
 }
 
-function buildUsageLimitRecoveryIntent(input: Readonly<{
-  issueFingerprint?: string;
-  nowMs: number;
-}>): SessionUsageLimitRecoveryV1 {
-  return SessionUsageLimitRecoveryV1Schema.parse({
-    v: 1,
-    status: 'waiting',
-    issueFingerprint: input.issueFingerprint ?? `usage-limit:${input.nowMs}`,
-    armedAtMs: input.nowMs,
-    resetAtMs: null,
-    nextCheckAtMs: null,
-    attemptCount: 0,
-    maxAttempts: 0,
-    lastProbeError: null,
-    resumePromptMode: 'standard',
-    selectedAuth: { kind: 'native' },
-  });
-}
-
 function readCurrentUsageLimitRecoveryIntent(metadata: Metadata | null | undefined): unknown {
   return metadata && typeof metadata === 'object'
     ? (metadata as Record<string, unknown>)[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY]
@@ -266,6 +247,7 @@ export function registerSessionControlHandlers(
       result: TResult;
     }>) => Promise<TResult> | TResult) | null;
     sessionRuntimeControls?: SessionRuntimeControls | null;
+    getUsageLimitRecoveryCheckNow?: () => SessionRuntimeControls['checkUsageLimitRecoveryNow'];
     /**
      * QAE-1: propagates a SUCCESSFUL user wait-resume cancel to the daemon-side
      * durable recovery owners (runtime-auth recovery + inactive usage-limit
@@ -280,12 +262,6 @@ export function registerSessionControlHandlers(
     }>) => Promise<unknown> | unknown) | null;
   }>,
 ): void {
-  let usageLimitRecoveryFeatureEnabledPromise: Promise<boolean> | null = null;
-  const usageLimitRecoveryFeatureEnabled = async (): Promise<boolean> => {
-    usageLimitRecoveryFeatureEnabledPromise ??= resolveUsageLimitRecoveryFeatureEnabled();
-    return await usageLimitRecoveryFeatureEnabledPromise;
-  };
-
   rpc.registerHandler(SESSION_RPC_METHODS.SESSION_WORK_STATE_GET, async (raw: unknown) => {
     const parsed = SessionWorkStateGetRequestV1Schema.safeParse(raw);
     if (!parsed.success) return invalidInput();
@@ -424,7 +400,7 @@ export function registerSessionControlHandlers(
       ...((parsed.data.remember === true || parsed.data.rememberPreference === true) ? { rememberPreference: true } : {}),
       ...(parsed.data.resumePromptMode ? { resumePromptMode: parsed.data.resumePromptMode } : {}),
     };
-    if (!await usageLimitRecoveryFeatureEnabled()) {
+    if (!await resolveUsageLimitRecoveryFeatureEnabled()) {
       return usageLimitRecoveryFeatureDisabledResult({ sessionId: request.sessionId });
     }
     // F1: without the runtime control there is no runner that can actually wait
@@ -456,7 +432,7 @@ export function registerSessionControlHandlers(
         ? { runtimeAuthRecoveryAttemptId: parsed.data.runtimeAuthRecoveryAttemptId }
         : {}),
     };
-    if (!await usageLimitRecoveryFeatureEnabled()) {
+    if (!await resolveUsageLimitRecoveryFeatureEnabled()) {
       return usageLimitRecoveryFeatureDisabledResult({ sessionId: request.sessionId });
     }
     if (typeof request.issueFingerprint !== 'string' || typeof request.armedAtMs !== 'number') {
@@ -498,7 +474,14 @@ export function registerSessionControlHandlers(
       }
       return result;
     };
-    if (typeof opts.sessionRuntimeControls?.cancelUsageLimitWaitResume !== 'function') {
+    // Runtime-auth-linked waits retain the existing exact metadata cancellation
+    // path and daemon notification, even when ordinary Session controls exist.
+    const currentRecovery = SessionUsageLimitRecoveryV1Schema.safeParse(
+      readCurrentUsageLimitRecoveryIntent(opts.getSessionMetadata?.()),
+    );
+    if (typeof opts.sessionRuntimeControls?.cancelUsageLimitWaitResume !== 'function'
+      || Boolean(exactRequest.runtimeAuthRecoveryAttemptId)
+      || (currentRecovery.success && Boolean(currentRecovery.data.runtimeAuthRecoveryAttemptId))) {
       if (typeof opts.updateSessionMetadataWithResult !== 'function') {
         return normalizeUsageLimitRecoveryOperationResult(
           unsupported(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_WAIT_RESUME_CANCEL),
@@ -531,6 +514,7 @@ export function registerSessionControlHandlers(
             candidateMetadata: writeUsageLimitRecoveryIntent(metadata, {
               ...latest.data,
               status: 'cancelled',
+              nextCheckAtMs: null,
             }),
             mode: 'cancel',
           }) as Metadata;
@@ -569,16 +553,19 @@ export function registerSessionControlHandlers(
   rpc.registerHandler(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW, async (raw: unknown) => {
     const parsed = SessionUsageLimitCheckNowRequestV1Schema.safeParse(raw);
     if (!parsed.success) return invalidInput();
-    if (!await usageLimitRecoveryFeatureEnabled()) {
+    if (!await resolveUsageLimitRecoveryFeatureEnabled()) {
       return usageLimitRecoveryFeatureDisabledResult({ sessionId: parsed.data.sessionId });
     }
-    if (typeof opts.sessionRuntimeControls?.checkUsageLimitRecoveryNow !== 'function') {
+    const checkNow = opts.getUsageLimitRecoveryCheckNow
+      ? opts.getUsageLimitRecoveryCheckNow()
+      : opts.sessionRuntimeControls?.checkUsageLimitRecoveryNow;
+    if (typeof checkNow !== 'function') {
       return normalizeUsageLimitRecoveryOperationResult(
         unsupported(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW),
         parsed.data.sessionId,
       );
     }
-    return normalizeUsageLimitRecoveryOperationResult(await opts.sessionRuntimeControls.checkUsageLimitRecoveryNow({
+    return normalizeUsageLimitRecoveryOperationResult(await checkNow({
       sessionId: parsed.data.sessionId,
       ...(typeof parsed.data.provider === 'string' ? { provider: parsed.data.provider } : {}),
       ...(parsed.data.operation ? { operation: parsed.data.operation } : {}),

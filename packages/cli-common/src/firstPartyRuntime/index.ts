@@ -30,6 +30,11 @@ export { resolveInstalledFirstPartyComponentPaths } from './resolveInstalledComp
 export type { InstalledFirstPartyComponentPaths } from './resolveInstalledComponentPaths.js';
 export { resolveJunctionFreeCurrentPath } from './resolveJunctionFreeCurrentPath.js';
 export {
+  isSelfContainedCliBinary,
+  resolveInstalledCliRuntimeRootPath,
+  resolveSelfContainedCliRuntimeRootPath,
+} from './resolveSelfContainedCliRuntimeRoot.js';
+export {
   readInstalledVersionMarkers,
   readInstalledVersionMarkersSync,
   writeInstalledVersionMarker,
@@ -136,6 +141,8 @@ export {
   resolveServerMigrationsEnabled,
   resolvePrismaSqliteDatabaseUrlOptionsFromEnv,
   resolveServerLightSqliteDatabaseUrlOptionsFromEnv,
+  resolvePrismaSqliteDatabaseFilePath,
+  readPrismaSqliteConnectionParams,
 } from './selfHostServerEnv.js';
 export type { PrismaSqliteDatabaseUrlOptions, SelfHostServerMigrationPlan } from './selfHostServerEnv.js';
 

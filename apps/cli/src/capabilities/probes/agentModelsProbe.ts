@@ -1,7 +1,7 @@
 import { createCatalogAcpBackend } from '@/agent/acp/createCatalogAcpBackend';
 import { resolveCliPathOverride } from '@/agent/acp/resolveCliPathOverride';
 import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
-import { isAcpModelConfigOptionLike, normalizeAcpConfigOptionChoices } from '@/agent/acp/configOptionChoiceNormalization';
+import { resolveAcpModelConfigOption, normalizeAcpConfigOptionChoices } from '@/agent/acp/configOptionChoiceNormalization';
 import type { AgentBackend, SessionId } from '@/agent/core';
 import { AGENTS } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
@@ -19,6 +19,7 @@ import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { normalizeContextWindowTokens } from '@/backends/modelCapabilities/contextWindowTokens';
 import { applyObservedAcpModelOptions, isAcpModelScopedConfigOption } from '@/agent/acp/runtime/sessionModelsState';
+import { lazySchema } from '@happier-dev/protocol';
 import { logger } from '@/ui/logger';
 
 type ProbedAgentModelOptionValue = string | number | boolean | null;
@@ -63,37 +64,37 @@ const agentModelsProbeCache = new AsyncTtlCache<ProbedAgentModelsResult>({
   errorTtlMs: PROBE_MODELS_FAILURE_TTL_MS,
 });
 
-const ProbeModelsObservationSchema = z.object({
+const ProbeModelsObservationSchema = lazySchema(() => z.object({
   availableModels: z.array(z.unknown()),
   observedAt: z.number().finite().nonnegative().optional(),
   refreshError: z.boolean().optional(),
   source: z.enum(['dynamic', 'static']).optional(),
-});
-const ProbeNonEmptyStringSchema = z.string().trim().min(1);
-const ProbeDescriptionSchema = z.string();
-const ProbeOptionValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
-const ProbeModelOptionChoiceInputSchema = z.object({
+}));
+const ProbeNonEmptyStringSchema = lazySchema(() => z.string().trim().min(1));
+const ProbeDescriptionSchema = lazySchema(() => z.string());
+const ProbeOptionValueSchema = lazySchema(() => z.union([z.string(), z.number(), z.boolean(), z.null()]));
+const ProbeModelOptionChoiceInputSchema = lazySchema(() => z.object({
   value: z.unknown().optional(),
   name: ProbeNonEmptyStringSchema,
   description: ProbeDescriptionSchema.optional(),
-});
-const ProbeModelOptionInputSchema = z.object({
+}));
+const ProbeModelOptionInputSchema = lazySchema(() => z.object({
   id: ProbeNonEmptyStringSchema,
   name: ProbeNonEmptyStringSchema,
   description: ProbeDescriptionSchema.optional(),
   type: ProbeNonEmptyStringSchema,
   currentValue: z.unknown().optional(),
   options: z.array(z.unknown()).optional(),
-});
-const ProbeDynamicModelInputSchema = z.object({
+}));
+const ProbeDynamicModelInputSchema = lazySchema(() => z.object({
   id: ProbeNonEmptyStringSchema,
   name: ProbeNonEmptyStringSchema,
   description: ProbeDescriptionSchema.optional(),
   contextWindowTokens: z.unknown().optional(),
   extendedContextModelId: ProbeNonEmptyStringSchema.optional(),
   modelOptions: z.array(z.unknown()).optional(),
-});
-const ProbeConfigOptionCandidateSchema = z.object({
+}));
+const ProbeConfigOptionCandidateSchema = lazySchema(() => z.object({
   id: z.string().optional(),
   name: z.string().optional(),
   category: z.string().optional(),
@@ -101,7 +102,7 @@ const ProbeConfigOptionCandidateSchema = z.object({
   type: z.string().optional(),
   currentValue: z.unknown().optional(),
   options: z.array(z.unknown()).optional(),
-});
+}));
 
 export function resetAgentModelsProbeCacheForTests(): void {
   agentModelsProbeCache.clear();
@@ -353,15 +354,13 @@ function normalizeProbeConfigOptions(configOptionsRaw: unknown[]) {
     .map((parsed) => parsed.data);
 }
 
-function normalizeModelsFromConfigOptions(configOptionsRaw: unknown): ProbedAgentModel[] | null {
+function normalizeModelsFromConfigOptions(configOptionsRaw: unknown, modelConfigOptionId?: string | null): ProbedAgentModel[] | null {
   if (!Array.isArray(configOptionsRaw)) return null;
 
   const configOptions = normalizeProbeConfigOptions(configOptionsRaw);
   if (configOptions.length === 0) return null;
 
-  const candidate =
-    configOptions.find(isAcpModelConfigOptionLike) ??
-    null;
+  const candidate = resolveAcpModelConfigOption(configOptions, modelConfigOptionId);
   if (!candidate) return null;
 
   const optionsRaw = candidate.options ?? null;
@@ -395,14 +394,16 @@ function attachObservedModelOptions(
   models: ProbedAgentModel[],
   configOptionsRaw: unknown,
   currentModelId?: unknown,
+  modelConfigOptionId?: string | null,
 ): ProbedAgentModel[] {
   if (!Array.isArray(configOptionsRaw)) return models;
   const configOptions = normalizeProbeConfigOptions(configOptionsRaw);
+  const selector = resolveAcpModelConfigOption(configOptions, modelConfigOptionId);
   const observedModelId = typeof currentModelId === 'string'
     ? currentModelId
-    : configOptions.find(isAcpModelConfigOptionLike)?.currentValue;
+    : selector?.currentValue;
   const observedOptions = configOptions
-    .filter(isAcpModelScopedConfigOption)
+    .filter((option) => option !== selector && isAcpModelScopedConfigOption(option))
     .map(normalizeProbeModelOption)
     .filter((option): option is ProbedAgentModelOption => option !== null);
   return applyObservedAcpModelOptions(models, observedModelId, observedOptions);
@@ -436,8 +437,8 @@ function preferSessionStartValues(
 }
 
 /**
- * Selects each listed model on the probe's own disposable session to record the model-scoped
- * options ACP reports for it. Models that cannot be observed before the deadline are left out.
+ * Select each listed model on the disposable probe session to record the model-scoped options ACP
+ * reports for it. Models that cannot be observed before the existing probe deadline stay unset.
  */
 async function observeModelScopedOptionsPerModel(params: {
   backend: ProbeModelsBackend;
@@ -445,11 +446,23 @@ async function observeModelScopedOptionsPerModel(params: {
   models: ReadonlyArray<ProbedAgentModel>;
   modelConfigOptionId: string | undefined;
   deadlineAt: number;
+  signal?: AbortSignal;
 }): Promise<Map<string, ProbedAgentModelOption[]>> {
   const observed = new Map<string, ProbedAgentModelOption[]>();
   const { backend, sessionId, modelConfigOptionId } = params;
+  const warnIncomplete = (reason: string, unobservedModelCount: number): void => {
+    if (unobservedModelCount <= 0) return;
+    logger.warnFile('[agentModelsProbe] Per-model option discovery incomplete', {
+      modelConfigOptionId: modelConfigOptionId ?? null,
+      reason,
+      unobservedModelCount,
+    });
+  };
   if (!modelConfigOptionId || !backend.setSessionConfigOption || !backend.getSessionConfigOptionsState) {
-    logger.debug('[agentModelsProbe] Per-model options need a model config option the backend can set; only the current model has options');
+    warnIncomplete(
+      'backend-cannot-select-model',
+      params.models.filter((model) => model.id !== 'default' && !model.modelOptions).length,
+    );
     return observed;
   }
 
@@ -457,17 +470,27 @@ async function observeModelScopedOptionsPerModel(params: {
   const sessionConfigOptions = Array.isArray(sessionConfigOptionsRaw) ? normalizeProbeConfigOptions(sessionConfigOptionsRaw) : [];
   const modelConfigOption = sessionConfigOptions.find((option) => option.id === modelConfigOptionId);
   if (!modelConfigOption) {
-    logger.debug(`[agentModelsProbe] Session reports no "${modelConfigOptionId}" config option; only the current model has options`);
+    warnIncomplete(
+      'model-selector-not-reported',
+      params.models.filter((model) => model.id !== 'default' && !model.modelOptions).length,
+    );
     return observed;
   }
   const sessionStartOptions = readProbeModelScopedOptions(sessionConfigOptionsRaw);
+  const incompleteReasons = new Set<string>();
+  let unobservedModelCount = 0;
 
-  for (const model of params.models) {
+  for (let modelIndex = 0; modelIndex < params.models.length; modelIndex += 1) {
+    const model = params.models[modelIndex]!;
+    params.signal?.throwIfAborted();
     if (model.id === 'default' || model.id === modelConfigOption.currentValue || model.modelOptions) continue;
 
     const remainingMs = params.deadlineAt - Date.now();
     if (remainingMs <= 0) {
-      logger.debug(`[agentModelsProbe] Probe deadline reached before model "${model.id}"; it and later models have no options`);
+      incompleteReasons.add('probe-deadline');
+      unobservedModelCount += params.models.slice(modelIndex).filter((candidate) =>
+        candidate.id !== 'default' && candidate.id !== modelConfigOption.currentValue && !candidate.modelOptions,
+      ).length;
       break;
     }
 
@@ -475,8 +498,7 @@ async function observeModelScopedOptionsPerModel(params: {
     const outcome = await Promise.race([
       backend.setSessionConfigOption(sessionId, modelConfigOptionId, model.id).then(
         () => 'selected' as const,
-        (error: unknown) => {
-          logger.debug(`[agentModelsProbe] Failed to select model "${model.id}" on the probe session; it has no options`, error);
+        () => {
           return 'failed' as const;
         },
       ),
@@ -488,8 +510,12 @@ async function observeModelScopedOptionsPerModel(params: {
         clearTimeout(timerId);
       }
     });
+    params.signal?.throwIfAborted();
     if (outcome === 'timeout') {
-      logger.debug(`[agentModelsProbe] Probe deadline reached while selecting model "${model.id}"; it and later models have no options`);
+      incompleteReasons.add('probe-deadline');
+      unobservedModelCount += params.models.slice(modelIndex).filter((candidate) =>
+        candidate.id !== 'default' && candidate.id !== modelConfigOption.currentValue && !candidate.modelOptions,
+      ).length;
       break;
     }
     if (outcome === 'selected') {
@@ -497,7 +523,13 @@ async function observeModelScopedOptionsPerModel(params: {
         model.id,
         preferSessionStartValues(readProbeModelScopedOptions(backend.getSessionConfigOptionsState()), sessionStartOptions),
       );
+    } else {
+      incompleteReasons.add('model-selection-failed');
+      unobservedModelCount += 1;
     }
+  }
+  if (incompleteReasons.size > 0) {
+    warnIncomplete([...incompleteReasons].join(','), unobservedModelCount);
   }
   return observed;
 }
@@ -506,6 +538,8 @@ export async function probeModelsFromAcpBackend(params: {
   backend: AgentBackend;
   timeoutMs: number;
   modelConfig?: Pick<AgentModelConfig, 'acpModelConfigOptionId' | 'acpModelOptionsScope'>;
+  modelConfigOptionId?: string | null;
+  signal?: AbortSignal;
 }): Promise<ReadonlyArray<ProbedAgentModel> | null> {
   const backend: ProbeModelsBackend = params.backend;
 
@@ -534,23 +568,33 @@ export async function probeModelsFromAcpBackend(params: {
     const state = backend.getSessionModelState();
     const modelsRaw = state?.availableModels;
     const dynamicModels = normalizeDynamicModels(modelsRaw);
-    if (dynamicModels) models = attachObservedModelOptions(dynamicModels, configOptions, state?.currentModelId);
+    if (dynamicModels) {
+      models = attachObservedModelOptions(
+        dynamicModels,
+        configOptions,
+        state?.currentModelId,
+        params.modelConfig?.acpModelConfigOptionId ?? params.modelConfigOptionId,
+      );
+    }
   }
 
   if (!models && typeof backend.getSessionConfigOptionsState === 'function') {
-    const configModels = normalizeModelsFromConfigOptions(configOptions);
-    if (configModels) models = attachObservedModelOptions(configModels, configOptions);
+    const modelConfigOptionId = params.modelConfig?.acpModelConfigOptionId ?? params.modelConfigOptionId;
+    const configModels = normalizeModelsFromConfigOptions(configOptions, modelConfigOptionId);
+    if (configModels) {
+      models = attachObservedModelOptions(configModels, configOptions, undefined, modelConfigOptionId);
+    }
   }
 
   if (!models || params.modelConfig?.acpModelOptionsScope !== 'per_model') return models;
 
-  // ACP reports model-scoped options only for the current model; observe the others one by one.
   const observedOptions = await observeModelScopedOptionsPerModel({
     backend,
     sessionId,
     models,
     modelConfigOptionId: params.modelConfig.acpModelConfigOptionId,
     deadlineAt,
+    signal: params.signal,
   });
   return models.map((model) => {
     const modelOptions = observedOptions.get(model.id);
@@ -570,6 +614,9 @@ export async function probeAgentModelsBestEffort(params: {
   processEnv?: NodeJS.ProcessEnv;
   connectedServiceSelectionCacheKey?: string | null;
   bypassCache?: boolean;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  onNativeCleanup?: import('./catalogProbeLifecycle').RegisterNativeCatalogCleanup;
 }): Promise<ProbedAgentModelsResult> {
   const nowMs = Date.now();
   const cwd = typeof params.cwd === 'string' && params.cwd.trim().length > 0 ? params.cwd.trim() : process.cwd();
@@ -602,6 +649,7 @@ export async function probeAgentModelsBestEffort(params: {
   if (!params.bypassCache && !usesProviderOwnedCache && cached?.kind === 'success' && agentModelsProbeCache.isFresh(cached, nowMs)) return cached.value;
 
   const runProbe = async (): Promise<ProbedAgentModelsResult> => {
+    params.signal?.throwIfAborted();
     const cached2 = agentModelsProbeCache.get(cacheKey);
     const nowMs2 = Date.now();
     if (!params.bypassCache && !usesProviderOwnedCache && cached2?.kind === 'success' && agentModelsProbeCache.isFresh(cached2, nowMs2)) return cached2.value;
@@ -638,7 +686,10 @@ export async function probeAgentModelsBestEffort(params: {
         processEnv: params.processEnv,
       });
       if (configuredBackend) {
-        const models = await probeModelsFromAcpBackend({ backend: configuredBackend, timeoutMs, modelConfig }).catch(() => null);
+        const ownedBackend = configuredBackend;
+        params.onNativeCleanup?.(() => ownedBackend.dispose());
+        params.signal?.throwIfAborted();
+        const models = await probeModelsFromAcpBackend({ backend: configuredBackend, timeoutMs, modelConfig, signal: params.signal }).catch(() => null);
         if (models) {
           const res: ProbedAgentModelsResult = { ...fallback, availableModels: models, source: 'dynamic', observedAt: Date.now() };
           if (!usesProviderOwnedCache) {
@@ -664,6 +715,9 @@ export async function probeAgentModelsBestEffort(params: {
           bypassCache: params.bypassCache,
           cwd,
           timeoutMs,
+          deadlineAt: params.deadlineAt,
+          signal: params.signal,
+          onNativeCleanup: params.onNativeCleanup,
           profileId,
           accountSettings: params.accountSettings ?? null,
           credentials: params.credentials ?? null,
@@ -737,7 +791,7 @@ export async function probeAgentModelsBestEffort(params: {
       return failedResult();
     }
 
-    const spawnValidation = await validateCatalogAcpProbeSpawn(params.agentId);
+    const spawnValidation = await validateCatalogAcpProbeSpawn(params.agentId, { processEnv: params.processEnv, cwd });
     if (!spawnValidation.ok) {
       return failedResult();
     }
@@ -760,10 +814,14 @@ export async function probeAgentModelsBestEffort(params: {
         permissionHandler,
         permissionMode: 'default',
         ...probeBackendOptions,
+        readinessOnly: true,
       });
       backend = created.backend;
+      const ownedBackend = backend;
+      params.onNativeCleanup?.(() => ownedBackend.dispose());
+      params.signal?.throwIfAborted();
 
-      const models = await probeModelsFromAcpBackend({ backend, timeoutMs, modelConfig }).catch(() => null);
+      const models = await probeModelsFromAcpBackend({ backend, timeoutMs, modelConfig, signal: params.signal }).catch(() => null);
       if (!models) {
         return failedResult();
       }
@@ -782,7 +840,7 @@ export async function probeAgentModelsBestEffort(params: {
     }
   };
 
-  const result = usesProviderOwnedCache
+  const result = usesProviderOwnedCache || params.signal
     ? await runProbe()
     : await agentModelsProbeCache.runDedupe(cacheKey, runProbe);
   return usesProviderOwnedCache ? { ...result, cacheable: false } : result;

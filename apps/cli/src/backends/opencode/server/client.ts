@@ -1,5 +1,6 @@
 import { logger } from '@/ui/logger';
 import { normalizeOpenCodeCliGeneration } from '@happier-dev/agents';
+import { normalizeOpenCodeAppSkills } from '@happier-dev/protocol';
 import type { MessageBuffer } from '@/ui/ink/messageBuffer';
 import {
   OPEN_CODE_BROKER_LOAD_NONCE_ENV,
@@ -24,6 +25,8 @@ import {
   isLoopbackManagedOpenCodeBaseUrl,
   readSharedManagedOpenCodeServerStateByBaseUrlBestEffort,
   readSharedManagedOpenCodeServerStateBestEffort,
+  retainSharedManagedOpenCodeServerClient,
+  withSharedManagedOpenCodeServerAccess,
   type SharedManagedOpenCodeServerState,
 } from './sharedManagedServer';
 import {
@@ -91,11 +94,8 @@ function resolveOpenCodeServerHttpTimeoutMs(env: NodeJS.ProcessEnv): number | nu
   if (typeof raw !== 'string') return defaultTimeoutMs;
   const parsed = Number.parseInt(raw.trim(), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultTimeoutMs;
-  // Fail closed on absurdly low timeouts: these tend to create flakey control-plane polling and
-  // false-negative health probes under normal load.
-  const clamped = Math.min(120_000, Math.trunc(parsed));
-  if (clamped < 1000) return defaultTimeoutMs;
-  return clamped;
+  // Pre-session probes pass their remaining deadline, which may be less than one second.
+  return Math.min(120_000, Math.trunc(parsed));
 }
 
 export function resolveOpenCodeSseReadIdleTimeoutMs(env: NodeJS.ProcessEnv): number | null {
@@ -108,7 +108,7 @@ export function resolveOpenCodeSseReadIdleTimeoutMs(env: NodeJS.ProcessEnv): num
   return Math.max(5_000, Math.min(120_000, Math.trunc(parsed)));
 }
 
-async function fetchJson<T>(params: {
+async function fetchOpenCodeJson<T>(params: {
   url: string;
   method: 'GET' | 'PATCH' | 'POST' | 'PUT' | 'DELETE';
   headers: Record<string, string>;
@@ -281,7 +281,21 @@ function toOpenCodeV2McpConfig(config: unknown): unknown {
   return enabled ? rest : { ...rest, disabled: true };
 }
 
+export class OpenCodeServerCommandUnsupportedError extends Error {
+  readonly code = 'opencode_command_unsupported' as const;
+  readonly reason: 'delivery' | 'attachments';
+
+  constructor(reason: 'delivery' | 'attachments') {
+    super(reason === 'delivery'
+      ? 'OpenCode V1 commands do not support steer or queue delivery'
+      : 'OpenCode V1 commands support only file attachments');
+    this.name = 'OpenCodeServerCommandUnsupportedError';
+    this.reason = reason;
+  }
+}
+
 export type OpenCodeServerRuntimeClient = Readonly<{
+  getApiGeneration: () => Promise<'v1' | 'v2'>;
   supportsInFlightSteer: () => boolean;
   /** Returns true when changing directory restarted the directory-scoped event stream. */
   setDirectoryOverride: (directory: string) => boolean;
@@ -301,6 +315,7 @@ export type OpenCodeServerRuntimeClient = Readonly<{
   sessionStatusList: () => Promise<Record<string, { type?: string }>>;
   globalConfigGet: () => Promise<{ model?: string }>;
   agentsList: () => Promise<ReadonlyArray<{ id?: string; name: string; description?: string }>>;
+  appCommands: () => Promise<unknown[]>;
   appSkills: () => Promise<unknown[]>;
   providersList: () => Promise<ReadonlyArray<{ id: string; env?: readonly string[]; models?: Record<string, unknown> }>>;
   mcpAdd: (opts: { directory?: string; name: string; config: unknown }) => Promise<OpenCodeMcpStatus>;
@@ -313,6 +328,17 @@ export type OpenCodeServerRuntimeClient = Readonly<{
     model?: OpenCodeModelRef;
     variant?: string;
     config?: Record<string, unknown>;
+    delivery?: 'steer' | 'queue';
+  }) => Promise<void>;
+  sessionCommand: (opts: {
+    sessionId: string;
+    command: string;
+    arguments: string;
+    messageId?: string;
+    parts?: readonly unknown[];
+    agent?: string;
+    model?: OpenCodeModelRef;
+    variant?: string;
     delivery?: 'steer' | 'queue';
   }) => Promise<void>;
   sessionSummarize: (opts: {
@@ -463,6 +489,22 @@ function normalizeOpenCodeV2Message(raw: unknown, sessionId: string): unknown {
   return { info, parts };
 }
 
+export class OpenCodeSkillIdentityError extends Error {
+  readonly code = 'opencode_skill_identity_missing';
+  constructor() {
+    super('OpenCode skill selection has no unique native identity');
+    this.name = 'OpenCodeSkillIdentityError';
+  }
+}
+
+function projectOpenCodeV1PromptParts(parts: unknown[]): unknown[] {
+  return parts.map((part) => {
+    const record = part && typeof part === 'object' && !Array.isArray(part) ? part as Record<string, unknown> : null;
+    return record?.type === 'skill' && typeof record.text === 'string'
+      ? { type: 'text', text: record.text, synthetic: true } : part;
+  });
+}
+
 /**
  * Released V2 `POST /api/session/:id/prompt` takes a flat `PromptInput` body
  * (`{ text, files?, agents?, skills?, metadata? }`); the earlier preview nested it under `prompt`.
@@ -470,6 +512,8 @@ function normalizeOpenCodeV2Message(raw: unknown, sessionId: string): unknown {
 function buildOpenCodeV2Prompt(parts: unknown[]): Record<string, unknown> {
   const text: string[] = [];
   const files: unknown[] = [];
+  const agents: Array<{ name: string }> = [];
+  const skills: Array<{ id: string }> = [];
   for (const part of parts) {
     const record = part && typeof part === 'object' && !Array.isArray(part) ? part as Record<string, unknown> : null;
     if (record?.type === 'text' && typeof record.text === 'string') text.push(record.text);
@@ -483,9 +527,21 @@ function buildOpenCodeV2Prompt(parts: unknown[]): Record<string, unknown> {
         ...(typeof record.filename === 'string' ? { name: record.filename } : {}),
       });
     }
+    else if (record?.type === 'agent' && typeof record.name === 'string') {
+      agents.push({ name: record.name });
+    }
+    else if (record?.type === 'skill') {
+      if (typeof record.id !== 'string' || !record.id.trim()) throw new OpenCodeSkillIdentityError();
+      skills.push({ id: record.id });
+    }
     else throw new Error('OpenCode V2 prompt contains an unsupported part');
   }
-  return { text: text.join(''), ...(files.length > 0 ? { files } : {}) };
+  return {
+    text: text.join('\n\n'),
+    ...(files.length > 0 ? { files } : {}),
+    ...(agents.length > 0 ? { agents } : {}),
+    ...(skills.length > 0 ? { skills } : {}),
+  };
 }
 
 async function sleepUntilOrAbort(ms: number, signal: AbortSignal): Promise<void> {
@@ -516,20 +572,64 @@ async function sleepUntilOrAbort(ms: number, signal: AbortSignal): Promise<void>
   });
 }
 
-export async function createOpenCodeServerRuntimeClient(params: Readonly<{
+type OpenCodeServerRuntimeClientParams = Readonly<{
   directory: string;
   messageBuffer: MessageBuffer;
   baseUrlOverride?: string | null;
   managedServerLaunchFingerprint?: string | null;
   env?: NodeJS.ProcessEnv;
   onManagedServerIdentityChanged?: (change: OpenCodeManagedServerIdentityChange) => void;
-}>): Promise<OpenCodeServerRuntimeClient> {
+}>;
+
+export async function createOpenCodeServerRuntimeClient(params: OpenCodeServerRuntimeClientParams): Promise<OpenCodeServerRuntimeClient> {
   const env = params.env ?? process.env;
+  const explicitBaseUrl = params.baseUrlOverride?.trim() || env.HAPPIER_OPENCODE_SERVER_URL?.trim();
+  return await withSharedManagedOpenCodeServerAccess(async () => {
+    const { client, baseUrl } = await createOpenCodeServerRuntimeClientUnderLock({ ...params, env }, explicitBaseUrl);
+    let release: () => Promise<void>;
+    try {
+      release = await retainSharedManagedOpenCodeServerClient(baseUrl, !explicitBaseUrl, params.managedServerLaunchFingerprint);
+    } catch (error) {
+      await client.dispose();
+      throw error;
+    }
+    const dispose = client.dispose;
+    let disposal: Promise<void> | undefined;
+    return {
+      ...client,
+      dispose: () => disposal ??= (async () => {
+        await dispose();
+        await release().catch(error => logger.warn('[OpenCodeServer] Client release failed; retaining custody', error));
+      })(),
+    };
+  }, explicitBaseUrl, params.managedServerLaunchFingerprint);
+}
+
+async function createOpenCodeServerRuntimeClientUnderLock(
+  params: OpenCodeServerRuntimeClientParams & { env: NodeJS.ProcessEnv },
+  explicitBaseUrl: string | undefined,
+): Promise<{
+  client: OpenCodeServerRuntimeClient; baseUrl: string;
+}> {
+  const env = params.env;
+  let disposed = false;
+  const commandAbort = new AbortController();
+  const pendingRequests = new Set<Promise<unknown>>();
+  const trackRequest = <T>(promise: Promise<T>): Promise<T> => {
+    pendingRequests.add(promise);
+    void promise.then(() => pendingRequests.delete(promise), () => pendingRequests.delete(promise));
+    return promise;
+  };
+  const fetchJson = <T>(request: Parameters<typeof fetchOpenCodeJson>[0]): Promise<T> => {
+    if (disposed) return Promise.reject(new Error('OpenCode client disposed'));
+    return trackRequest(fetchOpenCodeJson<T>({
+      ...request,
+      signal: request.signal ? AbortSignal.any([request.signal, commandAbort.signal]) : commandAbort.signal,
+    }));
+  };
   const httpTimeoutMs = resolveOpenCodeServerHttpTimeoutMs(env);
   const readIdleTimeoutMs = resolveOpenCodeSseReadIdleTimeoutMs(env);
-  const baseUrlOverrideRaw = typeof params.baseUrlOverride === 'string' ? params.baseUrlOverride.trim() : '';
-  const envUrlRaw = typeof env.HAPPIER_OPENCODE_SERVER_URL === 'string' ? env.HAPPIER_OPENCODE_SERVER_URL.trim() : '';
-  const usingManagedServer = baseUrlOverrideRaw.length === 0 && envUrlRaw.length === 0;
+  const usingManagedServer = !explicitBaseUrl;
 
   const headers = resolveOpenCodeServerAuthHeadersFromEnv(env);
 
@@ -549,17 +649,10 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
           ? OPEN_CODE_V2_READINESS_PATHS
           : OPEN_CODE_AUTO_READINESS_PATHS;
       for (const path of paths) {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), probeTimeoutMs);
-        timer.unref?.();
-        const res = await fetch(buildUrl(candidateBaseUrl, path), { method: 'GET', headers, signal: ctrl.signal }).catch(() => null);
-        clearTimeout(timer);
-        if (res?.ok) {
-          const body = await res.json().catch(() => null) as unknown;
-          if (isOpenCodeServerReadyResponse(path, body)) {
-            return true;
-          }
-        }
+        const body = await fetchJson<unknown>({
+          url: buildUrl(candidateBaseUrl, path), method: 'GET', headers, timeoutMs: probeTimeoutMs,
+        }).catch(() => null);
+        if (isOpenCodeServerReadyResponse(path, body)) return true;
       }
       return false;
     } catch {
@@ -568,8 +661,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
   };
 
   let baseUrl = normalizeBaseUrl(
-    baseUrlOverrideRaw
-      || envUrlRaw
+    explicitBaseUrl
       || await ensureSharedManagedOpenCodeServerBaseUrl({
         probeHealth,
         requireBrokerLoadNonce: requiresOpenCodeBrokerLoadNonce(env),
@@ -599,7 +691,6 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
   // Managed-server generation identity. The runtime uses this to detect mid-turn server replacement
   // (Lane E). It is tracked only in managed mode; explicit URL / override modes never emit changes.
   let managedServerIdentity: OpenCodeManagedServerIdentity | null = null;
-  let managedServerApiGeneration: 'auto' | 'v2' | null = null;
 
   const captureManagedServerIdentityFromState = (
     state: SharedManagedOpenCodeServerState | null,
@@ -610,7 +701,6 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
       return;
     }
     const nextIdentity = resolveOpenCodeManagedServerIdentity(state);
-    managedServerApiGeneration = nextIdentity.apiGeneration ?? null;
     if (isSameOpenCodeManagedServerGeneration(managedServerIdentity, nextIdentity)) {
       // Same process generation: refresh the normalized fields without surfacing a change.
       managedServerIdentity = nextIdentity;
@@ -658,7 +748,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
     allowEnsure: boolean;
     reason: OpenCodeManagedServerIdentityChangeReason;
   }>): Promise<void> => {
-    if (!usingManagedServer) return;
+    if (!usingManagedServer || disposed) return;
 
     const state = await readSharedManagedOpenCodeServerStateBestEffort().catch(() => null);
     applyManagedOpenCodeBrokerLoadNonce(env, state);
@@ -697,6 +787,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
       }
     }
 
+    if (disposed) return;
     try {
       baseUrl = normalizeBaseUrl(
         await ensureSharedManagedOpenCodeServerBaseUrl({
@@ -717,14 +808,15 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
   };
 
   const waitForManagedServerHealthAfterRefreshBestEffort = async (): Promise<void> => {
-    if (!usingManagedServer) return;
+    if (!usingManagedServer || disposed) return;
     try {
-      await waitForOpenCodeServerHealth({
+      await trackRequest(waitForOpenCodeServerHealth({
         baseUrl,
         timeoutMs: 2_000,
         pollIntervalMs: 100,
         headers,
-      });
+        signal: commandAbort.signal,
+      }));
     } catch {
       // best-effort only; caller will decide whether to propagate the original error
     }
@@ -753,10 +845,8 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
         return null;
       }
     };
-    if (managedServerApiGeneration === 'v2') {
-      return rememberDetectedGeneration({ kind: 'v2' });
-    }
-    const v2Health = await probe('/api/health');
+    // Persisted readiness hints may come from older clients that mistook stable
+    // /api/health for V2. Resolve routes from the authenticated server contract.
     const legacy = await probe('/global/health');
     const legacyRecord = legacy && typeof legacy === 'object' && !Array.isArray(legacy) ? legacy as Record<string, unknown> : null;
     if (legacyRecord?.healthy === true
@@ -764,6 +854,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
       && normalizeOpenCodeCliGeneration(env.HAPPIER_OPENCODE_CLI_GENERATION) !== 'v2') {
       return rememberDetectedGeneration({ kind: 'v1' });
     }
+    const v2Health = await probe('/api/health');
     const v2Info = isOpenCodeServerReadyResponse('/api/health', v2Health)
       ? null
       : await probe('/api/info');
@@ -819,7 +910,6 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
   let subscriptionLoop: Promise<void> | null = null;
   let subscriptionLoopAbort: AbortController | null = null;
   let connectionGeneration = 0;
-  let disposed = false;
 
   const rememberRequestSessions = (items: unknown[], target: Map<string, string>): void => {
     for (const item of items) {
@@ -872,7 +962,49 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
     })
   );
 
+  async function resolveOpenCodeV2SkillParts(parts: unknown[]): Promise<unknown[]> {
+    const unresolved = parts.filter((part) => {
+      const record = part && typeof part === 'object' && !Array.isArray(part) ? part as Record<string, unknown> : null;
+      return record?.type === 'skill' && (typeof record.id !== 'string' || !record.id.trim());
+    });
+    if (unresolved.length === 0) return parts;
+    // Released older UI selections carry name/path instead of the native opaque ID. Resolve
+    // only at this V2 compatibility seam, using the same catalog reader and canonical parser.
+    const catalog = normalizeOpenCodeAppSkills(await client.appSkills());
+    return parts.map((part) => {
+      if (!unresolved.includes(part)) return part;
+      const record = part as Record<string, unknown>;
+      const matches = catalog.filter((skill) => skill.name === record.name
+        && (record.path === undefined || skill.path === record.path));
+      const match = matches.length === 1 ? matches[0] : undefined;
+      if (!match?.id || !match.id.trim()) throw new OpenCodeSkillIdentityError();
+      return { ...record, id: match.id };
+    });
+  }
+
+  const readAppCatalog = async (path: '/command' | '/skill'): Promise<unknown[]> => {
+    const api = await ensureApiGeneration();
+    const directory = resolveDirectory();
+    // Activation and inventory must use the same server and credential despite managed refresh.
+    const catalogBaseUrl = baseUrl;
+    const catalogHeaders = { ...headers };
+    const query = api.kind === 'v2' ? { 'location[directory]': directory } : { directory };
+    const read = (route: string) => fetchJson<unknown>({
+      url: buildUrl(catalogBaseUrl, route, query), method: 'GET', headers: catalogHeaders,
+      timeoutMs: httpTimeoutMs, signal: commandAbort.signal,
+    });
+    if (api.kind === 'v2') {
+      // OpenCode 2.0.15/2.0.20 integration.list awaits Plugin.awaitActivation;
+      // command.list and skill.list otherwise expose the cold, empty registry.
+      await read('/api/integration');
+    }
+    const raw = await read(api.kind === 'v2' ? `/api${path}` : path);
+    const items = api.kind === 'v2' ? readWrappedOpenCodeV2Data(raw) : raw;
+    return Array.isArray(items) ? items : [];
+  };
+
   const client: OpenCodeServerRuntimeClient = {
+    getApiGeneration: async () => (await ensureApiGeneration()).kind,
     supportsInFlightSteer: () => apiGeneration?.kind === 'v2',
     setDirectoryOverride: (directory) => {
       const previousDirectory = resolveDirectory();
@@ -1084,17 +1216,8 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
       const agents = api.kind === 'v2' ? readWrappedOpenCodeV2Data(raw) : raw;
       return Array.isArray(agents) ? agents as Array<{ id?: string; name: string; description?: string }> : [];
     },
-    appSkills: async () => {
-      const api = await ensureApiGeneration();
-      const raw = await fetchJson<unknown>({
-        url: buildUrl(baseUrl, api.kind === 'v2' ? '/api/skill' : '/skill', api.kind === 'v2' ? { 'location[directory]': resolveDirectory() } : { directory: resolveDirectory() }),
-        method: 'GET',
-        headers,
-        timeoutMs: httpTimeoutMs,
-      });
-      const skills = api.kind === 'v2' ? readWrappedOpenCodeV2Data(raw) : raw;
-      return Array.isArray(skills) ? skills : [];
-    },
+    appCommands: () => readAppCatalog('/command'),
+    appSkills: () => readAppCatalog('/skill'),
     providersList: async () => {
       const api = await ensureApiGeneration();
       if (api.kind !== 'v2') {
@@ -1272,6 +1395,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
     sessionPromptAsync: async ({ sessionId, messageId, parts, agent, model, variant, config, delivery }) => {
       const api = await ensureApiGeneration();
       const normalizedVariant = typeof variant === 'string' ? variant.trim() : '';
+      const prompt = api.kind === 'v2' ? buildOpenCodeV2Prompt(await resolveOpenCodeV2SkillParts(parts)) : null;
       if (api.kind === 'v2') {
         if (config) {
           throw new Error('OpenCode V2 prompt does not support legacy config fields');
@@ -1296,7 +1420,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
         headers,
         body: api.kind === 'v2' ? {
           ...(messageId ? { id: messageId } : {}),
-          ...buildOpenCodeV2Prompt(parts),
+          ...prompt,
           ...(delivery ? { delivery } : {}),
         } : {
           ...(messageId ? { messageID: messageId } : {}),
@@ -1304,9 +1428,50 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
           ...(model ? { model } : {}),
           ...(normalizedVariant ? { variant: normalizedVariant } : {}),
           ...(config ? { config } : {}),
-          parts,
+          parts: projectOpenCodeV1PromptParts(parts),
         },
         timeoutMs: httpTimeoutMs,
+      });
+    },
+    sessionCommand: async ({ sessionId, command, arguments: commandArguments, messageId, parts, agent, model, variant, delivery }) => {
+      const api = await ensureApiGeneration();
+      const normalizedVariant = typeof variant === 'string' ? variant.trim() : '';
+      let body: Record<string, unknown>;
+      if (api.kind === 'v2') {
+        // Validate the attachments before changing native selections. Unlike session.prompt,
+        // session.command has no caller-minted message id or resume field.
+        body = {
+          name: command,
+          ...buildOpenCodeV2Prompt(await resolveOpenCodeV2SkillParts([{ type: 'text', text: commandArguments }, ...(parts ?? [])])),
+          ...(delivery ? { delivery } : {}),
+        };
+        if (normalizedVariant && !model) {
+          throw new Error('OpenCode V2 command variant requires an explicit model');
+        }
+        if (agent) await client.sessionSetAgent({ sessionId, agent });
+        if (model) await client.sessionSetModel({ sessionId, model, variant: normalizedVariant });
+      } else {
+        if (delivery) throw new OpenCodeServerCommandUnsupportedError('delivery');
+        if (parts?.some((part) => !part || typeof part !== 'object' || Array.isArray(part)
+          || (part as Record<string, unknown>).type !== 'file')) {
+          throw new OpenCodeServerCommandUnsupportedError('attachments');
+        }
+        body = {
+          command,
+          arguments: commandArguments,
+          ...(messageId ? { messageID: messageId } : {}),
+          ...(agent ? { agent } : {}),
+          ...(model ? { model: `${model.providerID}/${model.modelID}` } : {}),
+          ...(normalizedVariant ? { variant: normalizedVariant } : {}),
+          ...(parts && parts.length > 0 ? { parts } : {}),
+        };
+      }
+      // A callback can already have run when transport fails. Surface that ambiguity without
+      // replaying the command; the runtime owns completion and native message correlation.
+      await fetchJson<void>({
+        url: buildUrl(baseUrl, `${api.kind === 'v2' ? '/api' : ''}/session/${encodeURIComponent(sessionId)}/command`, api.kind === 'v2' ? undefined : { directory: resolveDirectory() }),
+        // V1 waits for inference and V2 waits for its callback; neither is a control read.
+        method: 'POST', headers, body, signal: commandAbort.signal,
       });
     },
     sessionSummarize: async ({ sessionId, model, auto }) => {
@@ -1612,6 +1777,7 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
     getManagedServerIdentity: () => managedServerIdentity,
     dispose: async () => {
       disposed = true;
+      commandAbort.abort();
       if (subscriptionLoopAbort) {
         try {
           subscriptionLoopAbort.abort();
@@ -1637,8 +1803,9 @@ export async function createOpenCodeServerRuntimeClient(params: Readonly<{
         subscriptionLoop = null;
       }
       subscriptionLoopAbort = null;
+      await Promise.allSettled([...pendingRequests]);
     },
   };
 
-  return client;
+  return { client, baseUrl };
 }

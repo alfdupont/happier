@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger'
+import { buildSessionEventContent } from './sessionEventContent';
 import { EventEmitter } from 'node:events'
 import axios from 'axios';
 import { Socket } from 'socket.io-client'
@@ -18,6 +19,7 @@ import {
 import { inferAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { configuration } from '@/configuration';
 import type { RawJSONLines } from '@/backends/claude/types';
+import { persistClaudeToolResultMedia } from '@/backends/claude/attachments/persistClaudeToolResultMedia';
 import {
     buildClaudeJsonlLocalId,
     buildClaudeJsonlLocalIdFromMessageKey,
@@ -27,6 +29,16 @@ import {
     type CommittedClaudeJsonlMessageBaseline,
 } from '@/backends/claude/utils/claudeJsonlMessageKey';
 import { randomUUID } from 'node:crypto';
+import {
+    openAgentStateRequestSettlement,
+    sealAgentStateRequestSettlement,
+    type AgentStateRequestSettlementEncryptionScope,
+} from './agentStateRequestSettlementEncryption';
+import {
+    AgentStateRequestSettlementSchema,
+    applyAgentStateRequestSettlement,
+    buildAgentStateRequestSettlement,
+} from './agentStateRequestSettlement';
 import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from '../rpc/RpcHandlerManager';
 import { registerSessionHandlers } from '@/rpc/handlers/registerSessionHandlers';
@@ -47,15 +59,17 @@ import {
 import { createExecutionRunBackend } from '@/agent/executionRuns/runtime/createExecutionRunBackend';
 import { CodexLikePermissionHandler } from '@/agent/permissions/CodexLikePermissionHandler';
 import type { PermissionRequestPushSender } from '@/agent/permissions/BasePermissionHandler';
-import { SessionPermissionRpcRouter } from '@/agent/permissions/sessionPermissionRpcRouter';
+import { getOrCreateSessionPermissionRpcRouter, type SessionPermissionRpcRouter } from '@/agent/permissions/sessionPermissionRpcRouter';
 import { ExecutionBudgetRegistry } from '@/daemon/executionBudget/ExecutionBudgetRegistry';
 import { readCredentials, readAccountChangesCursor } from '@/persistence';
+import { RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { callMachineRpc } from '@/session/transport/rpc/machineRpc';
 import {
     applyAccountSettingsV2Update,
     bootstrapAccountSettingsContext,
     refreshActiveAccountSettingsFromServer,
 } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
-import { AccountSettingsV2GetResponseSchema } from '@happier-dev/protocol';
+import { AccountSettingsV2GetResponseSchema, readClaudePeerMessage } from '@happier-dev/protocol';
 import {
     getActiveAccountSettingsSnapshot,
     subscribeActiveAccountSettingsSnapshot,
@@ -188,7 +202,9 @@ import { buildUsageReportFromAcpTokenCount } from './acpTokenCountUsageReport';
 import {
     fetchLatestUserPermissionIntentFromEncryptedTranscript,
     fetchRecentTranscriptTextItemsForAcpImportFromServer,
+    type CommittedTranscriptIdentitySnapshot,
 } from './transcriptQueries';
+import { extractSemanticTranscriptItemFromDecryptedPayload } from '@/session/services/transcript/extractSemanticTranscriptItem';
 import {
     discardPendingQueueV2Messages,
     enqueuePendingQueueV2MessageViaHttp,
@@ -253,6 +269,7 @@ import {
 import { createLoopbackReadinessProbe } from '@/api/connection/createLoopbackReadinessProbe';
 import { createSessionSocketTransport } from './connection/createSessionSocketTransport';
 import { ensureSessionConnectionSupervisionActive } from './connection/ensureSessionConnectionSupervisionActive';
+import { SESSION_CONNECTION_STATE_EVENT } from './connection/sessionConnectionStateEvent';
 import { connectionState } from '@/api/offline/serverConnectionErrors';
 import {
     createAuthenticationHttpStatusError,
@@ -279,7 +296,7 @@ import {
 import { normalizeExecutionRunWaitTimeoutMs } from '@/session/services/executionRunWaitTiming';
 import { createEventShapeLoggerForLog } from '@/diagnostics/eventShapeForLog';
 import { runSupervisedRequest } from '@/api/connection/requestSupervision/runSupervisedRequest';
-import { updateAgentStateBestEffort, updateMetadataBestEffort } from './sessionWritesBestEffort';
+import { updateAgentStateBestEffort, updateMetadataBestEffort, type AgentStateWriteOptions } from './sessionWritesBestEffort';
 import { readCliClientUpgradeRequired } from '@/api/clientCompatibility/cliClientCompatibility';
 import { normalizeAgentPromptPayload } from '@/agent/core/AgentPromptPayload';
 import type {
@@ -294,6 +311,7 @@ import {
 } from './committedUserMessageSeqTracker';
 import {
     createSessionMutationOutbox,
+    SessionMutationJournalAdmissionBlockedError,
     type RuntimeActivitySnapshotTail,
     type SessionMutationOutbox,
 } from './mutations/createSessionMutationOutbox';
@@ -305,6 +323,7 @@ import {
     createTranscriptMessageAppendMutation,
 } from './mutations/sessionMutationTypes';
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import { createSessionUsageLimitRecoveryRuntime } from '@/session/usageLimitRecoveryControls/createSessionUsageLimitRecoveryRuntime';
 import { observeAcpLifecycleMarker } from '@/agent/runtime/session/turn/lifecycleMarkerAdapter';
 import type { SessionTurnLifecycleControllerWithActiveTurnWitness } from '@/agent/runtime/session/turn/types';
 import { createSessionTurnMutationWriter } from '@/agent/runtime/session/turn/writer';
@@ -316,7 +335,6 @@ import {
 import {
     applyKnownPendingQueueState,
     countMaterializablePendingRows,
-    derivePendingQueueStateAfterMaterializeResult,
     readKnownPendingQueueState,
     UNKNOWN_PENDING_QUEUE_STATE,
     type KnownPendingQueueState,
@@ -397,6 +415,7 @@ function isSessionProviderInputRejectedBeforeEffectReason(
 export type SessionProviderInputOutcome =
     | (SessionProviderInputOutcomeIdentity & Readonly<{
         kind: 'accepted';
+        delivery?: Readonly<{ kind: 'primary_turn' | 'command' }>;
         providerRequestId?: string;
         providerTurnId?: string;
         /** Model captured for this new provider prompt before dispatch. Omitted for in-flight steer. */
@@ -423,8 +442,9 @@ const STALE_LOCAL_ACTIVE_TURN_RECONCILE_MS = 5 * 60 * 1000;
 
 function isProviderProgressTranscriptBody(value: unknown): boolean {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-    const role = (value as { role?: unknown }).role;
-    return role !== 'user';
+    const body = value as { role?: unknown; content?: { type?: unknown; data?: { type?: unknown } } };
+    return body.role !== 'user'
+        && !(body.role === 'agent' && body.content?.type === 'event' && body.content.data?.type === 'message');
 }
 
 function readPlannedServerRestartRetryAfterMs(payload: unknown): number | undefined {
@@ -515,7 +535,6 @@ function logSessionConnectionState(state: ManagedConnectionState): void {
     });
 }
 
-const SESSION_CONNECTION_STATE_EVENT = 'session-connection-state';
 const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 // How long a `thinking=true` keepalive may persist against an already-terminal turn status
 // before the publisher self-heals it to idle. Comfortably longer than a new turn's
@@ -574,6 +593,7 @@ export class ApiSessionClient extends EventEmitter {
     private static readonly STARTUP_MESSAGE_CATCH_UP_RETRY_DELAYS_MS = [250, 1_000, 2_500] as const;
 
     private readonly token: string;
+    private readonly requestSettlementEncryptionScope: AgentStateRequestSettlementEncryptionScope;
     readonly sessionId: string;
     private metadata: Metadata | null;
     private runtimeWorkingDirectory: string | null = null;
@@ -587,10 +607,11 @@ export class ApiSessionClient extends EventEmitter {
     private readonly bufferedPendingMessageDeliveryInfoByLocalId = new Map<string, SessionUserMessageDeliveryInfo>();
     private pendingMessageCallback: ((message: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>) | null = null;
     readonly rpcHandlerManager: RpcHandlerManager;
-    private sessionPermissionRpcRouter: SessionPermissionRpcRouter | null = null;
     private executionRunPermissionHandler: CodexLikePermissionHandler | null = null;
     private readonly rpcLifecycleRegistrations: RpcLifecycleRegistration[] = [];
+    private executionRunLifecycleRegistration: RpcLifecycleRegistration | null = null;
     private agentStateLock = new AsyncLock();
+    private requestSettlementAdmissionLock = new AsyncLock();
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
@@ -625,6 +646,11 @@ export class ApiSessionClient extends EventEmitter {
         state: PendingMaterializationDeliveryState;
         requestedAction?: PendingRequestedActionV1;
         providerAction?: import('@happier-dev/protocol').PendingProviderAction;
+        acceptedDeliveryKind?: 'primary_turn' | 'command';
+        turnPublication?: {
+            turnId: string | null;
+            published: boolean;
+        };
     }>>();
     // Generic reversible provider-path blocks retain identity so exact late provider evidence can
     // still settle the row. A proven pre-provider lifecycle failure retires it after durable block.
@@ -736,12 +762,14 @@ export class ApiSessionClient extends EventEmitter {
         },
     });
     private daemonTurnLifecycleNotifyTail: Promise<void> = Promise.resolve();
-    private readonly pendingSessionTurnWrites = new Set<Promise<void>>();
+    private readonly pendingDurableSessionWrites = new Set<Promise<void>>();
     private readonly committedUserMessageSeqTracker = new CommittedUserMessageSeqTracker();
     private readonly sessionMutationOutbox: SessionMutationOutbox;
     private readonly runtimeActivitySnapshotPublisher: RuntimeActivitySnapshotSessionMutationPublisher;
     readonly sessionTurnLifecycle: SessionTurnLifecycleControllerWithActiveTurnWitness;
     private readonly sessionRuntimeControls: Partial<SessionRuntimeControls> = {};
+    private usageLimitRecoveryRuntime: ReturnType<typeof createSessionUsageLimitRecoveryRuntime> | null = null;
+    private providerUsageLimitRecoveryCheckNow: SessionRuntimeControls['checkUsageLimitRecoveryNow'];
     private readonly baseSessionRuntimeControls: Partial<SessionRuntimeControls> = {};
     private readonly sessionRuntimeControlRegistrations = new Set<Partial<SessionRuntimeControls>>();
     private providerOwnedUserMessageEchoClassifier: ProviderOwnedUserMessageEchoClassifier | null = null;
@@ -835,6 +863,11 @@ export class ApiSessionClient extends EventEmitter {
             `[API] Socket not connected; queueing ${context} until supervised reconnect.`,
             details
         );
+    }
+
+    subscribeToSessionConnectionState(listener: (state: ManagedConnectionState) => void): () => void {
+        this.on(SESSION_CONNECTION_STATE_EVENT, listener);
+        return () => { this.off(SESSION_CONNECTION_STATE_EVENT, listener); };
     }
 
     private isSessionSocketOnlineForAckWrite(): boolean {
@@ -942,6 +975,10 @@ export class ApiSessionClient extends EventEmitter {
 	        super()
 	        this.token = token;
 	        this.sessionId = session.id;
+            this.requestSettlementEncryptionScope = {
+                token, sessionId: session.id, serverId: configuration.activeServerId,
+                installationIdentityPath: configuration.installationIdentityFile,
+            };
 	        this.metadata = normalizeSessionMetadataForRead(session.metadata);
 	        this.metadataVersion = session.metadataVersion;
             this.sessionSocketMachineId = resolveSessionSocketMachineIdForBootstrap(session.metadata);
@@ -1012,6 +1049,7 @@ export class ApiSessionClient extends EventEmitter {
         this.executionRunPermissionHandler = new CodexLikePermissionHandler({
             session: this,
             logPrefix: '[ExecutionRun]',
+            requestScope: 'execution_run',
             pushSender: permissionNotifications?.permissionRequestPushSender ?? null,
             getAccountSettings: () => getActiveAccountSettingsSnapshot()?.settings ?? null,
             getAccountSettingsSecretsReadKeys: () =>
@@ -1019,6 +1057,16 @@ export class ApiSessionClient extends EventEmitter {
         });
         const parentProvider = resolveSessionCatalogAgentId(this.metadata);
 
+        this.usageLimitRecoveryRuntime = createSessionUsageLimitRecoveryRuntime({
+            sessionId: this.sessionId,
+            getMetadata: () => this.getMetadataSnapshot(),
+            updateMetadata: async (update) => { await this.updateMetadata(update); },
+            getCredentials: async () => {
+                const credentials = await readCredentials();
+                return credentials?.token === this.token ? credentials : null;
+            },
+            getAccountSettings: () => getActiveAccountSettingsSnapshot()?.settings ?? null,
+        });
         this.rebuildSessionRuntimeControls();
         this.rpcLifecycleRegistrations.push(registerSessionHandlers(this.rpcHandlerManager, this.metadata?.path, {
             getSessionMetadata: () => this.getMetadataSnapshot(),
@@ -1033,6 +1081,7 @@ export class ApiSessionClient extends EventEmitter {
                 return { status: 'ready' };
             },
             sessionRuntimeControls: this.sessionRuntimeControls,
+            getUsageLimitRecoveryCheckNow: () => this.resolveUsageLimitRecoveryCheckNow(),
             // QAE-1: a user "Stop waiting" handled session-side (provider runtime
             // control or metadata fallback) must also cancel the daemon's durable
             // recovery wait state, or it resumes the session involuntarily later.
@@ -1081,6 +1130,33 @@ export class ApiSessionClient extends EventEmitter {
             sessionId: this.sessionId,
             getSocket: () => this.socket as any,
             requestReconnect: (reason) => this.kickSessionSocketReconnectForDurableMutation(reason),
+            onSessionTurnDelivered: (mutation) => {
+                if (mutation.action !== 'begin') return;
+                let changed = false;
+                for (const claim of this.canonicalPendingDeliveryByLocalId.values()) {
+                    if (claim.turnPublication?.turnId === mutation.turnId && !claim.turnPublication.published) {
+                        claim.turnPublication.published = true;
+                        changed = true;
+                    }
+                }
+                if (changed) this.publishPendingEligibilityWake();
+            },
+            deliverAgentStateRequestSettlement: async (mutation) => {
+                const decrypted = await openAgentStateRequestSettlement(this.requestSettlementEncryptionScope, mutation.content);
+                // The crypto boundary also returns null for a wrong key. Retain that
+                // ciphertext for recovery rather than permanently quarantining it.
+                if (decrypted === null) throw new Error('Request settlement recovery could not decrypt payload');
+                const settlement = AgentStateRequestSettlementSchema.safeParse(decrypted);
+                if (!settlement.success) {
+                    logger.infoFile('[API] Invalid durable request settlement payload', {
+                        sessionId: this.sessionId,
+                        mutationId: mutation.mutationId,
+                    });
+                    return { status: 'permanent_invalid_payload', reason: 'invalid_agent_state_request_settlement' };
+                }
+                await this.updateAgentState((state) => applyAgentStateRequestSettlement(state, settlement.data));
+                return { status: 'delivered', path: 'socket' };
+            },
         });
         this.runtimeActivitySnapshotPublisher = createRuntimeActivitySnapshotSessionMutationPublisher({
             sessionId: this.sessionId,
@@ -1089,6 +1165,8 @@ export class ApiSessionClient extends EventEmitter {
         // Always register execution-run RPC methods so callers never see "RPC method not available".
         // Feature gating is enforced inside the handler implementations.
         const streamedTranscriptSession = {
+            subscribeToSessionConnectionState: (listener: (state: ManagedConnectionState) => void) =>
+                this.subscribeToSessionConnectionState(listener),
             enqueueAgentMessageCommitted: (provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown>; provenance: SessionTranscriptObservationProvenanceV1 }) =>
                 this.enqueueAgentMessageCommitted(provider, body, opts),
             sendAgentMessageCommitted: (provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown> }) =>
@@ -1103,7 +1181,7 @@ export class ApiSessionClient extends EventEmitter {
             getEphemeralStreamConnectionEpoch: () => this.getEphemeralStreamConnectionEpoch(),
         };
 
-        registerExecutionRunHandlers(this.rpcHandlerManager, {
+        this.executionRunLifecycleRegistration = registerExecutionRunHandlers(this.rpcHandlerManager, {
             sessionId: this.sessionId,
             cwd: this.resolveWorkingDirectory(),
             resolveCwd: () => this.resolveWorkingDirectory(),
@@ -1163,6 +1241,8 @@ export class ApiSessionClient extends EventEmitter {
             },
         });
 
+        this.rpcLifecycleRegistrations.push(this.executionRunLifecycleRegistration);
+
         registerEphemeralTaskHandlers(this.rpcHandlerManager, {
           workingDirectory: this.resolveWorkingDirectory(),
           resolveWorkingDirectory: () => this.resolveWorkingDirectory(),
@@ -1184,11 +1264,34 @@ export class ApiSessionClient extends EventEmitter {
         this.sessionTurnLifecycle = createSessionTurnLifecycle({
             sessionId: this.sessionId,
             enqueueSessionTurn: createSessionTurnMutationWriter(this.sessionMutationOutbox).enqueueSessionTurn,
+            onTurnInputBound: ({ turnId, localIds }) => {
+                for (const localId of this.normalizeProviderAcceptedUserMessageLocalIds(localIds)) {
+                    const publication = this.ensureCanonicalPendingTurnPublication(localId);
+                    if (!publication) continue;
+                    if (publication.turnId !== null && publication.turnId !== turnId) {
+                        // A provider continuation may reuse delivery attribution after exact acceptance.
+                        // That acceptance still belongs to the original turn. Before acceptance, an
+                        // authorized retry instead owns its newly admitted turn's publication.
+                        if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') continue;
+                        publication.published = false;
+                    }
+                    publication.turnId = turnId;
+                }
+            },
+            onTurnFailure: (issue) => {
+                const recovery = this.usageLimitRecoveryRuntime;
+                if (recovery) void recovery.observeFailure(issue).catch(recovery.reportError);
+            },
             onTurnLifecycleEvent: (event, terminalStatus, turnId) => {
+                if (event !== 'assistant_message_end' || terminalStatus !== 'failed') {
+                    const recovery = this.usageLimitRecoveryRuntime;
+                    if (recovery) void recovery.observeSupersession().catch(recovery.reportError);
+                }
                 this.observeTurnLifecycleForPendingDrain(event, terminalStatus);
                 void this.notifyDaemonConnectedServiceTurnLifecycle(event, terminalStatus, turnId);
             },
         });
+        void this.usageLimitRecoveryRuntime.restore().catch(this.usageLimitRecoveryRuntime.reportError);
 
         //
         // Handlers
@@ -1428,6 +1531,8 @@ export class ApiSessionClient extends EventEmitter {
         for (const registration of this.sessionRuntimeControlRegistrations) {
             copyCallableSessionRuntimeControls(this.sessionRuntimeControls, registration);
         }
+        this.providerUsageLimitRecoveryCheckNow = this.sessionRuntimeControls.checkUsageLimitRecoveryNow;
+        copyCallableSessionRuntimeControls(this.sessionRuntimeControls, this.usageLimitRecoveryRuntime?.controls);
         this.sessionRuntimeControls.wakePendingMaterialization = () => this.wakePendingMaterialization();
         this.sessionRuntimeControls.isPendingMaterializationAvailable = () => (
             !this.closed && !this.runtimeTerminationStarted
@@ -1640,7 +1745,25 @@ export class ApiSessionClient extends EventEmitter {
         if (this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.has(localId)) return;
         this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.add(localId);
         try {
-            for (let attempt = 0; attempt < 2; attempt += 1) {
+            const claim = this.canonicalPendingDeliveryByLocalId.get(localId);
+            if (!claim) return;
+            if (claim.acceptedDeliveryKind === 'primary_turn') {
+                const publication = this.ensureCanonicalPendingTurnPublication(localId);
+                if (!publication) return;
+                if (publication.turnId === null) {
+                    logger.infoFile('[pendingQueue] accepted input awaits canonical turn correlation', {
+                        sessionId: this.sessionId, localId,
+                    });
+                }
+                while (!publication.published) {
+                    if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
+                        || !this.canonicalPendingDeliveryByLocalId.has(localId)) return;
+                    if (!await this.waitForPendingEligibilityUpdate(authority.abortSignal)) return;
+                }
+            }
+            // Retain one settlement operation for the accepted localId until it commits or its
+            // existing session/runtime authority ends. Retrying settlement never invokes input.
+            for (let attempt = 0; ; attempt += 1) {
                 if (
                     !this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
                     || !this.canonicalPendingDeliveryByLocalId.has(localId)
@@ -1706,7 +1829,9 @@ export class ApiSessionClient extends EventEmitter {
                         && 'retryable' in error
                         && (error as { retryable?: unknown }).retryable === true,
                     );
-                    if ((!retryDirective && !isResponseLoss) || attempt > 0) {
+                    const isInternalFailure = error instanceof PendingQueueAcceptedSettlementError
+                        && error.settlementError === 'internal';
+                    if (!retryDirective && !isResponseLoss && !isInternalFailure) {
                         logger.infoFile('[pendingQueue] accepted provider delivery remains unresolved', {
                             sessionId: this.sessionId,
                             localId,
@@ -1719,6 +1844,13 @@ export class ApiSessionClient extends EventEmitter {
                     const retryAfterMs = retryDirective
                         ? Math.min(60_000, Math.max(250, retryDirective.retryAfterMs))
                         : 1_000;
+                    logger.infoFile('[pendingQueue] accepted provider delivery settlement retry scheduled', {
+                        sessionId: this.sessionId,
+                        localId,
+                        attempt: attempt + 1,
+                        retryAfterMs,
+                        error: serializedError,
+                    });
                     await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
                 } else {
                     return;
@@ -2435,6 +2567,15 @@ export class ApiSessionClient extends EventEmitter {
         this.explicitUserRecoveryCheckedLocalIdCleanupTimers.set(localId, timer);
     }
 
+    private resolveUsageLimitRecoveryCheckNow(): SessionRuntimeControls['checkUsageLimitRecoveryNow'] {
+        const coreCheck = this.sessionRuntimeControls.checkUsageLimitRecoveryNow;
+        const providerCheck = this.providerUsageLimitRecoveryCheckNow;
+        return async (request) => {
+            const check = request.operation && request.operation !== 'check_now' ? providerCheck ?? coreCheck : coreCheck;
+            return check ? await check(request) : { ok: false, errorCode: 'unsupported_session_runtime_method' };
+        };
+    }
+
     private async revalidateUsageLimitRecoveryForExplicitUserPrompt(localId: string): Promise<ExplicitUserRecoveryDecision> {
         const existing = this.explicitUserRecoveryDecisionsByLocalId.get(localId);
         if (existing) return await existing;
@@ -2443,7 +2584,22 @@ export class ApiSessionClient extends EventEmitter {
             if (hasClearedConnectedServiceTransitionConstraint(this.metadata)) {
                 return { status: 'ready' };
             }
-            const checkNow = this.sessionRuntimeControls.checkUsageLimitRecoveryNow;
+            const recovery = SessionUsageLimitRecoveryV1Schema.safeParse(
+                this.metadata?.[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY],
+            );
+            if (recovery.success && recovery.data.runtimeAuthRecoveryAttemptId) {
+                // Explicit input belongs in Pending before the daemon can decide
+                // whether an automatic continuation still has work to resume.
+                // Waking recovery here can enqueue old work and reject the new input.
+                return { status: 'ready' };
+            }
+            if (this.sessionRuntimeControls.checkUsageLimitRecoveryNow
+                === this.usageLimitRecoveryRuntime?.controls.checkUsageLimitRecoveryNow) {
+                // Explicit input takes ordinary Pending custody before an automatic
+                // continuation can compete with it; readiness checks never replay old work here.
+                return { status: 'ready' };
+            }
+            const checkNow = this.resolveUsageLimitRecoveryCheckNow();
             if (typeof checkNow !== 'function') {
                 return hasBlockingExplicitUserRecoveryEvidence(this.metadata)
                     ? {
@@ -3292,20 +3448,16 @@ export class ApiSessionClient extends EventEmitter {
             this.markAgentQueueEchoSuppressedLocalId(localId);
             this.markAgentQueueDeliveredLocalId(localId);
         }
+        const deliveryInfo: SessionUserMessageDeliveryInfo = {
+            seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
+            ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
+            ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
+            ...(message?.requestedAction ? { pendingRequestedAction: message.requestedAction } : {}),
+        };
         if (this.pendingMessageCallback) {
-            await this.pendingMessageCallback(userMessage, {
-                seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-            });
+            await this.pendingMessageCallback(userMessage, deliveryInfo);
         } else {
-            if (localId) {
-                this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, {
-                    seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                    ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                    ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-                });
-            }
+            if (localId) this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, deliveryInfo);
             this.pendingMessages.push(userMessage);
         }
         return true;
@@ -4031,11 +4183,14 @@ export class ApiSessionClient extends EventEmitter {
             : await request();
     }
 
-    private prepareClaudeSessionMessage(body: RawJSONLines, meta?: Record<string, unknown>): {
+    private async prepareClaudeSessionMessage(body: RawJSONLines, meta?: Record<string, unknown>): Promise<{
         content: MessageContent;
         localId: string;
         sidechainId: string | null;
-    } {
+    }> {
+        ({ body, meta } = await persistClaudeToolResultMedia({
+            body, meta, workingDirectory: this.resolveWorkingDirectory(), sessionId: this.sessionId,
+        }));
         this.outboundShapeLogger.log('claude:raw-jsonl', body);
 
         const sidechainId = (() => {
@@ -4050,7 +4205,9 @@ export class ApiSessionClient extends EventEmitter {
             body.type === 'user' &&
             typeof body.message.content === 'string' &&
             body.isSidechain !== true &&
-            body.isMeta !== true
+            body.isMeta !== true &&
+            // Peer deliveries keep their sender provenance in the raw output envelope.
+            !readClaudePeerMessage(body)
         ) {
             content = this.buildUserTextMessageContent(body.message.content, meta);
         } else {
@@ -4114,23 +4271,23 @@ export class ApiSessionClient extends EventEmitter {
         if (isToolTraceEnabled()) {
             recordClaudeToolTraceEvents({ sessionId: this.sessionId, body });
         }
-        const { content, localId, sidechainId } = this.prepareClaudeSessionMessage(body, meta);
-
-        this.logSendWhileDisconnected('Claude session message', { type: body.type });
-
-        const payload = this.buildOutboundSessionMessagePayload(content);
-        this.observeTurnAssistantTextFromSessionContent(content, {
-            source: 'ephemeral',
-            localId,
-            sidechainId,
-            provider: 'claude',
-        });
-        this.commitSessionMessageBestEffort({
-            message: payload,
-            localId,
-            sidechainId,
-            messageRole: resolveClaudeSessionMessageRole(body),
-            logErrorMessage: '[SOCKET] Failed to commit Claude session message (non-fatal)',
+        const localId = buildClaudeJsonlLocalId(body);
+        void this.enqueueMessageCommit('best-effort', {
+            operation: 'claude-message-commit', details: { localId, messageType: body.type },
+        }, async () => {
+            const { content, sidechainId } = await this.prepareClaudeSessionMessage(body, meta);
+            this.logSendWhileDisconnected('Claude session message', { type: body.type });
+            this.observeTurnAssistantTextFromSessionContent(content, {
+                source: 'ephemeral', localId, sidechainId, provider: 'claude',
+            });
+            return this.commitSessionMessage({
+                message: this.buildOutboundSessionMessagePayload(content), localId, sidechainId,
+                messageRole: resolveClaudeSessionMessageRole(body), requireCommit: false,
+            });
+        }).catch((error) => {
+            logger.debug('[SOCKET] Failed to commit Claude session message (non-fatal)', {
+                localId, error: serializeAxiosErrorForLog(error),
+            });
         });
 
         this.applyClaudeSessionMessageAuxiliaryEffects(body);
@@ -4143,36 +4300,23 @@ export class ApiSessionClient extends EventEmitter {
         if (isToolTraceEnabled()) {
             recordClaudeToolTraceEvents({ sessionId: this.sessionId, body });
         }
-        const { content, localId, sidechainId } = this.prepareClaudeSessionMessage(body, meta);
+        const localId = buildClaudeJsonlLocalId(body);
         requireExactCommitLocalId(localId);
-
-        this.logSendWhileDisconnected('Claude session message', { type: body.type });
-        const commitResult = await this.enqueueMessageCommit('required', {
+        await this.enqueueMessageCommit('required', {
             operation: 'claude-message-exact-commit',
-            details: {
-                localId,
-                messageType: body.type,
-                requireCommit: true,
-                connectionEpoch: this.userSocketSettingsConnectionEpoch,
-            },
-        }, () =>
-            this.commitSessionMessage({
-                message: this.buildOutboundSessionMessagePayload(content),
-                localId,
-                sidechainId,
-                messageRole: resolveClaudeSessionMessageRole(body),
-                requireCommit: true,
-                requireWriteDisposition: true,
-            }),
-        );
-        this.observeTurnAssistantTextFromSessionContent(content, {
-            source: 'committed',
-            seq: commitResult?.seq ?? null,
-            localId,
-            sidechainId,
-            provider: 'claude',
+            details: { localId, messageType: body.type, requireCommit: true, connectionEpoch: this.userSocketSettingsConnectionEpoch },
+        }, async () => {
+            const { content, sidechainId } = await this.prepareClaudeSessionMessage(body, meta);
+            this.logSendWhileDisconnected('Claude session message', { type: body.type });
+            const commitResult = await this.commitSessionMessage({
+                message: this.buildOutboundSessionMessagePayload(content), localId, sidechainId,
+                messageRole: resolveClaudeSessionMessageRole(body), requireCommit: true, requireWriteDisposition: true,
+            });
+            this.observeTurnAssistantTextFromSessionContent(content, {
+                source: 'committed', seq: commitResult?.seq ?? null, localId, sidechainId, provider: 'claude',
+            });
+            this.applyClaudeSessionMessageAuxiliaryEffects(body);
         });
-        this.applyClaudeSessionMessageAuxiliaryEffects(body);
     }
 
     async sendClaudeSessionMessageCommitted(
@@ -4184,7 +4328,7 @@ export class ApiSessionClient extends EventEmitter {
             meta?: Record<string, unknown>;
         }>,
     ): Promise<Readonly<{ persisted: boolean; delivered: boolean }>> {
-        const { content, localId, sidechainId } = this.prepareClaudeSessionMessage(body, opts.meta);
+        const { content, localId, sidechainId } = await this.prepareClaudeSessionMessage(body, opts.meta);
         requireExactCommitLocalId(localId);
 
         this.logSendWhileDisconnected('Claude session message', { type: body.type });
@@ -4370,7 +4514,7 @@ export class ApiSessionClient extends EventEmitter {
     /**
      * Send a generic agent message to the session using ACP (Agent Communication Protocol) format.
      * Works for any agent type (Gemini, Codex, Claude, etc.) - CLI normalizes to unified ACP format.
-     * 
+     *
      * @param provider - The agent provider sending the message (e.g., 'gemini', 'codex', 'claude')
      * @param body - The message payload (type: 'message' | 'reasoning' | 'tool-call' | 'tool-result')
      */
@@ -4615,6 +4759,20 @@ export class ApiSessionClient extends EventEmitter {
     ): Promise<void> {
         const content = this.buildUserTextMessageContent(text, opts.meta);
         const payload = this.buildOutboundSessionMessagePayload(content);
+        if (opts.provenance !== undefined) {
+            const result = await this.sessionMutationOutbox.enqueueTranscriptMessage(createTranscriptMessageAppendMutation({
+                sessionId: this.sessionId,
+                localId: opts.localId,
+                content: payload,
+                sidechainId: null,
+                messageRole: 'user',
+                provenance: opts.provenance,
+            }));
+            if (!result.persisted) {
+                throw new SessionMutationJournalAdmissionBlockedError(new Error('Session transcript journal is closed'));
+            }
+            return;
+        }
         await this.enqueueMessageCommit('required', {
             operation: 'user-message-commit',
             details: {
@@ -4793,8 +4951,17 @@ export class ApiSessionClient extends EventEmitter {
     async sendAgentMessageCommitted(
         provider: ACPProvider,
         body: ACPMessageData,
-        opts: { localId: string; meta?: Record<string, unknown> },
+        opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 },
     ): Promise<void> {
+        // Explicit observation provenance opts into durable journal custody. Callers without
+        // provenance retain the required remote-acknowledgement contract below.
+        if (opts.provenance !== undefined) {
+            const result = await this.enqueueAgentMessageCommitted(provider, body, { ...opts, provenance: opts.provenance });
+            if (!result.persisted) {
+                throw new SessionMutationJournalAdmissionBlockedError(new Error('Session transcript journal is closed'));
+            }
+            return;
+        }
         const { normalizedBody, content, localId, sidechainId } = this.prepareAcpAgentMessage({
             provider,
             body,
@@ -4892,6 +5059,54 @@ export class ApiSessionClient extends EventEmitter {
             requireOnline: false,
             request,
         });
+    }
+
+    async fetchCommittedTranscriptIdentitySnapshot(opts?: { sidechainId: string }): Promise<CommittedTranscriptIdentitySnapshot> {
+        const request = async (): Promise<CommittedTranscriptIdentitySnapshot> => {
+            const rows: Array<CommittedTranscriptIdentitySnapshot['rows'][number]> = [];
+            let complete = true;
+            let beforeSeq: number | undefined;
+            for (;;) {
+                const page = await fetchEncryptedTranscriptMessagesPage({
+                    token: this.token, sessionId: this.sessionId, limit: 500,
+                    ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+                    scope: opts ? 'all' : 'main', roles: ['user', 'agent'],
+                });
+                for (const row of page.messages) {
+                    const stored = SessionMessageContentSchema.safeParse(row.content);
+                    if (!stored.success) { complete = false; continue; }
+                    let decoded: unknown;
+                    try { decoded = this.decodeStoredSessionMessageContent(stored.data); }
+                    catch { complete = false; continue; }
+                    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) { complete = false; continue; }
+                    const item = extractSemanticTranscriptItemFromDecryptedPayload({
+                        decrypted: decoded, row, index: rows.length,
+                        options: { mode: 'transcript', transcriptRoles: ['user', 'assistant'] },
+                    }).item;
+                    if (!item || (item.role !== 'user' && item.role !== 'assistant')) continue;
+                    const payload = decoded as Record<string, unknown>;
+                    const meta = payload.meta && typeof payload.meta === 'object' && !Array.isArray(payload.meta)
+                        ? payload.meta as Record<string, unknown> : null;
+                    // Released imported user rows can carry sidechain identity only in metadata.
+                    // Read both forms rather than assuming the relay materialized the column.
+                    if (opts ? (row.sidechainId ?? meta?.sidechainId) !== opts.sidechainId
+                        : row.sidechainId || meta?.sidechainId) continue;
+                    rows.push({ localId: readNonBlankOpaqueIdentifier(row.localId), role: item.role === 'user' ? 'user' : 'agent',
+                        ...(item.provider ? { provider: item.provider } : {}), meta });
+                }
+                if (!page.hasMore) break;
+                if (page.messages.length === 0 || page.nextBeforeSeq === null
+                    || (beforeSeq !== undefined && page.nextBeforeSeq >= beforeSeq)) {
+                    complete = false;
+                    break;
+                }
+                beforeSeq = page.nextBeforeSeq;
+            }
+            return { rows, complete };
+        };
+        return this.sessionConnectionSupervisor
+            ? runSupervisedRequest({ supervisor: this.sessionConnectionSupervisor, requireAuth: true, requireOnline: false, request })
+            : request();
     }
 
     async fetchCommittedClaudeJsonlMessageBaseline(opts?: { take?: number }): Promise<CommittedClaudeJsonlMessageBaseline> {
@@ -4992,19 +5207,8 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
-    private buildSessionEventContent(event: SessionEventMessage, id: string) {
-        return {
-            role: 'agent',
-            content: {
-                id,
-                type: 'event',
-                data: event
-            }
-        };
-    }
-
     sendSessionEvent(event: SessionEventMessage, id?: string) {
-        const content = this.buildSessionEventContent(event, id ?? randomUUID());
+        const content = buildSessionEventContent(event, id ?? randomUUID());
 
         this.logSendWhileDisconnected('session event', { eventType: event.type });
 
@@ -5027,7 +5231,7 @@ export class ApiSessionClient extends EventEmitter {
         opts: { localId: string },
     ): Promise<SessionMessageCommitResult> {
         const localId = requireExactCommitLocalId(opts?.localId);
-        const content = this.buildSessionEventContent(event, localId);
+        const content = buildSessionEventContent(event, localId);
 
         this.logSendWhileDisconnected('session event', { eventType: event.type });
 
@@ -5296,6 +5500,15 @@ export class ApiSessionClient extends EventEmitter {
         return normalized;
     }
 
+    private ensureCanonicalPendingTurnPublication(localId: string) {
+        const claim = this.canonicalPendingDeliveryByLocalId.get(localId);
+        if (!claim) return null;
+        if (claim.turnPublication) return claim.turnPublication;
+        const turnPublication = { turnId: null as string | null, published: false };
+        this.canonicalPendingDeliveryByLocalId.set(localId, { ...claim, turnPublication });
+        return turnPublication;
+    }
+
     /**
      * Bind one provider-owned exact-input evidence producer to this live session generation.
      * Rebinding fences every older observer, so a replaced runtime cannot settle current Queue
@@ -5437,6 +5650,17 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         if (!this.canonicalPendingDeliveryByLocalId.has(localId)) return;
+        if (outcome.kind === 'accepted') {
+            const claim = this.canonicalPendingDeliveryByLocalId.get(localId)!;
+            this.canonicalPendingDeliveryByLocalId.set(localId, { ...claim, acceptedDeliveryKind: outcome.delivery?.kind });
+            if (!outcome.delivery) {
+                // Released producers report exact custody without a corresponding primary-turn witness.
+                // Preserve their settlement contract until each producer can supply that witness.
+                logger.infoFile('[pendingQueue] accepted input uses opaque producer delivery contract', {
+                    sessionId: this.sessionId, localId, providerId: producer.providerId, providerMode: producer.mode,
+                });
+            }
+        }
         this.providerInputUncertainLocalIds.delete(localId);
         this.providerInputTerminalOutcomeByLocalId.set(localId, terminalOutcome);
 
@@ -5474,7 +5698,8 @@ export class ApiSessionClient extends EventEmitter {
         return this.metadataLock.inLock(async () => {
             await this.waitForSessionSocketOnlineForAckWrite('update-metadata');
             await updateSessionMetadataWithAck({
-                socket: this.socket as any,
+                socket: this.socket,
+                getSocket: () => this.socket,
                 sessionId: this.sessionId,
                 sessionEncryptionMode: this.sessionEncryptionMode,
                 encryptionKey: this.encryptionKey,
@@ -5501,7 +5726,8 @@ export class ApiSessionClient extends EventEmitter {
         return this.metadataLock.inLock(async () => {
             await this.waitForSessionSocketOnlineForAckWrite('update-metadata');
             return await updateSessionMetadataWithAckResult({
-                socket: this.socket as any,
+                socket: this.socket,
+                getSocket: () => this.socket,
                 sessionId: this.sessionId,
                 sessionEncryptionMode: this.sessionEncryptionMode,
                 encryptionKey: this.encryptionKey,
@@ -5621,29 +5847,110 @@ export class ApiSessionClient extends EventEmitter {
      * Update session agent state
      * @param handler - Handler function that returns the updated agent state
      */
-    updateAgentState(handler: (metadata: AgentState) => AgentState): Promise<void> {
+    updateAgentState(handler: (state: AgentState) => AgentState, options?: AgentStateWriteOptions): Promise<void> {
         logger.debugLargeJson('Updating agent state', this.agentState);
-        return this.agentStateLock.inLock(async () => {
-            await this.waitForSessionSocketOnlineForAckWrite('update-state');
-            await updateSessionAgentStateWithAck({
-                socket: this.socket as any,
-                sessionId: this.sessionId,
-                sessionEncryptionMode: this.sessionEncryptionMode,
-                encryptionKey: this.encryptionKey,
-                encryptionVariant: this.encryptionVariant,
-                getAgentState: () => this.agentState,
-                setAgentState: (agentState) => {
-                    this.agentState = agentState;
-                },
-                getAgentStateVersion: () => this.agentStateVersion,
-                setAgentStateVersion: (version) => {
-                    this.agentStateVersion = version;
-                },
-                syncSessionSnapshotFromServer: async () => {
-                    await this.syncSessionSnapshotFromServer({ reason: 'waitForMetadataUpdate' });
-                },
-                handler,
+        let retentionAdmission: Promise<void> | undefined;
+        const update = this.agentStateLock.inLock(async () => {
+            let captured: ReturnType<typeof buildAgentStateRequestSettlement> = { v: 1, entries: [] };
+            let handlerInvoked = false;
+            const capture = (state: AgentState) => {
+                handlerInvoked = true;
+                const updated = handler(state);
+                if (options?.retainPermissionCompletionsOnFailure) {
+                    captured = buildAgentStateRequestSettlement(state, updated, { automaticHistory: true });
+                }
+                return updated;
+            };
+            try {
+                await this.waitForSessionSocketOnlineForAckWrite('update-state');
+                await updateSessionAgentStateWithAck({
+                    socket: this.socket,
+                    getSocket: () => this.socket,
+                    sessionId: this.sessionId,
+                    sessionEncryptionMode: this.sessionEncryptionMode,
+                    encryptionKey: this.encryptionKey,
+                    encryptionVariant: this.encryptionVariant,
+                    getAgentState: () => this.agentState,
+                    setAgentState: (agentState) => { this.agentState = agentState; },
+                    getAgentStateVersion: () => this.agentStateVersion,
+                    setAgentStateVersion: (version) => { this.agentStateVersion = version; },
+                    syncSessionSnapshotFromServer: async () => {
+                        await this.syncSessionSnapshotFromServer({ reason: 'waitForMetadataUpdate' });
+                    },
+                    handler: capture,
+                });
+            } catch (error) {
+                if (options?.retainPermissionCompletionsOnFailure) {
+                    retentionAdmission = (async () => {
+                        // Capture and reserve admission under the state lock; await sealing and
+                        // disk persistence only after releasing it so ordinary ACK writes can proceed.
+                        if (!handlerInvoked) capture(this.agentState ?? {});
+                        if (captured.entries.length > 0) {
+                            await this.enqueueAgentStateRequestSettlement(captured);
+                            logger.infoFile('[API] session_permission_completion_deferred', {
+                                sessionId: this.sessionId, operation: 'update-state',
+                            });
+                        }
+                    })();
+                }
+                throw error;
+            }
+        }).catch(async (error) => {
+            if (retentionAdmission) {
+                try {
+                    await retentionAdmission;
+                } catch (retentionError) {
+                    logger.infoFile('[API] session_permission_completion_retention_failed', {
+                        sessionId: this.sessionId, operation: 'journal-agent-state-completion',
+                    });
+                    throw retentionError;
+                }
+            }
+            throw error;
+        });
+        if (options?.retainPermissionCompletionsOnFailure) {
+            // The caller still observes the normal write failure. Close drains the
+            // retention attempt, whose failure is reported above in the default log.
+            const tracked = update.catch(() => undefined);
+            this.pendingDurableSessionWrites.add(tracked);
+            void tracked.then(() => this.pendingDurableSessionWrites.delete(tracked));
+        }
+        return update;
+    }
+
+    /** Durable exact request completion; publication and unrelated state updates retain their owner. */
+    updateAgentStateRequestSettlement(
+        handler: (state: AgentState) => AgentState,
+    ): Promise<void> {
+        const admission = this.admitAgentStateRequestSettlement(handler);
+        const tracked = admission.catch(() => undefined);
+        this.pendingDurableSessionWrites.add(tracked);
+        void tracked.then(() => this.pendingDurableSessionWrites.delete(tracked));
+        return admission;
+    }
+
+    private async admitAgentStateRequestSettlement(handler: (state: AgentState) => AgentState): Promise<void> {
+        const { admission } = await this.agentStateLock.inLock(() => {
+            const state = this.agentState ?? {};
+            const settlement = buildAgentStateRequestSettlement(state, handler(state));
+            // Reserve admission in capture order without holding the state lock over disk I/O.
+            return { admission: this.enqueueAgentStateRequestSettlement(settlement) };
+        });
+        await admission;
+    }
+
+    private async enqueueAgentStateRequestSettlement(
+        settlement: ReturnType<typeof buildAgentStateRequestSettlement>,
+    ): Promise<void> {
+        if (settlement.entries.length === 0) return;
+        await this.requestSettlementAdmissionLock.inLock(async () => {
+            const content = await sealAgentStateRequestSettlement(this.requestSettlementEncryptionScope, settlement);
+            const result = await this.sessionMutationOutbox.enqueueAgentStateRequestSettlement({
+                v: 1, source: 'agent_state_request_settlement', sessionId: this.sessionId,
+                mutationId: randomUUID(),
+                content,
             });
+            if (!result.persisted) throw new Error('Request settlement was not durably admitted');
         });
     }
 
@@ -5660,9 +5967,9 @@ export class ApiSessionClient extends EventEmitter {
                 error: serializeAxiosErrorForLog(error),
             });
         });
-        this.pendingSessionTurnWrites.add(tracked);
+        this.pendingDurableSessionWrites.add(tracked);
         void tracked.finally(() => {
-            this.pendingSessionTurnWrites.delete(tracked);
+            this.pendingDurableSessionWrites.delete(tracked);
         });
     }
 
@@ -5695,7 +6002,7 @@ export class ApiSessionClient extends EventEmitter {
         await Promise.all([
             this.messageCommitQueueTail.catch(() => undefined),
             this.sessionMutationOutbox.flush('flush').catch(() => undefined),
-            ...[...this.pendingSessionTurnWrites].map((update) => update.catch(() => undefined)),
+            ...this.pendingDurableSessionWrites,
         ]);
     }
 
@@ -5761,10 +6068,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     getOrCreatePermissionRpcRouter(): SessionPermissionRpcRouter {
-        if (!this.sessionPermissionRpcRouter) {
-            this.sessionPermissionRpcRouter = new SessionPermissionRpcRouter(this.rpcHandlerManager);
-        }
-        return this.sessionPermissionRpcRouter;
+        return getOrCreateSessionPermissionRpcRouter(this.rpcHandlerManager);
     }
 
     getLastObservedUserMessageSeq(): number {
@@ -5784,6 +6088,8 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.sessionTurnLifecycle.dispose();
+        this.startExecutionRunDisposal();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;
         this.pendingInputReadinessAbortController?.abort();
@@ -5792,6 +6098,7 @@ export class ApiSessionClient extends EventEmitter {
         // Disposing only stops future retry timers; it never cancels a commit already in flight,
         // which the drain below still settles.
         this.sessionMessageCommitRetry.dispose();
+        this.usageLimitRecoveryRuntime?.dispose();
         if (this.startupMessageCatchUpRetryTimer) {
             clearTimeout(this.startupMessageCatchUpRetryTimer);
             this.startupMessageCatchUpRetryTimer = null;
@@ -5862,6 +6169,17 @@ export class ApiSessionClient extends EventEmitter {
         this.runtimeTerminationStarted = true;
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();
+        this.startExecutionRunDisposal();
+    }
+
+    private startExecutionRunDisposal(): void {
+        // Child processes must not wait behind parent provider or transport shutdown.
+        // The retained registration joins this same idempotent disposal during close().
+        void this.executionRunLifecycleRegistration?.dispose().catch((error: unknown) => {
+            logger.infoFile('[API] Failed to dispose execution runs', {
+                error: serializeAxiosErrorForLog(error),
+            });
+        });
     }
 
     hasRuntimeTerminationStarted(): boolean {
@@ -6295,14 +6613,10 @@ export class ApiSessionClient extends EventEmitter {
                 },
             };
         }
-        const pendingStateUpdate = derivePendingQueueStateAfterMaterializeResult({
-            current: this.pendingQueueState,
-            didMaterialize: materializeResult.didMaterialize,
-            authoritativeState: materializeResult.pendingQueueState ?? null,
-        });
-        this.pendingQueueState = pendingStateUpdate.state;
-        if (pendingStateUpdate.changed) {
-            this.pendingWakeSeq += 1;
+        // Released-server acknowledgements omit the projection. Its post-commit hint may
+        // already be applied, so only the server can advance these counters and version.
+        if (materializeResult.pendingQueueState) {
+            this.applyPendingQueueState(materializeResult.pendingQueueState);
         }
         if (this.closed || this.runtimeTerminationStarted) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };

@@ -220,7 +220,8 @@ vi.mock('@/daemon/ownership/daemonServiceInventory', () => ({
     evaluateDaemonStartupServiceConflict: vi.fn(async () => ({ kind: 'none' })),
 }));
 
-vi.mock('./controlServer', () => ({
+vi.mock('./controlServer', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./controlServer')>(),
     startDaemonControlServer: vi.fn(async () => ({
         port: 43210,
         stop: vi.fn(async () => {}),
@@ -390,7 +391,7 @@ vi.mock('./connectedServices/quotas/resolveConnectedServicesQuotasDaemonEnabled'
 }));
 
 vi.mock('./connectedServices/quotas/startConnectedServiceQuotasLoop', () => ({
-    startConnectedServiceQuotasLoop: vi.fn(() => ({ stop: vi.fn(), pause: vi.fn(), resume: vi.fn() })),
+    startConnectedServiceQuotasLoop: vi.fn(() => ({ stop: vi.fn(), pause: vi.fn(), resume: vi.fn(), wake: vi.fn() })),
 }));
 
 vi.mock('@/terminal/attachment/terminalAttachmentInfo', () => ({

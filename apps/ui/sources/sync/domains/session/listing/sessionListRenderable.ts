@@ -1,4 +1,5 @@
 import type { Metadata, Session } from '@/sync/domains/state/storageTypes';
+import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { computeHasUnreadActivity } from '@/sync/domains/messages/unread';
 import type {
     PrimaryTurnStatusV1,
@@ -20,7 +21,10 @@ import {
 } from '@/sync/domains/messages/transcriptRenderableAggregate';
 import { resolveLastViewedSessionSeq } from '@/sync/domains/session/readCursor/resolveLastViewedSessionSeq';
 import { resolveSessionReadableSeq } from '@/sync/domains/session/readCursor/resolveSessionReadableSeq';
-import { countSessionAgentActivityFromMetadata } from '@/sync/domains/session/agentActivity/countSessionAgentActivityFromMetadata';
+import { deriveAgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
+import { toAgentActivityCountable } from '@/sync/domains/session/agentActivity/deriveAgentActivityEntries';
+import type { AgentActivityEntry } from '@/sync/domains/session/agentActivity/types';
+import { readSessionAgentActivityEntriesFromMetadata } from '@/sync/domains/session/agentActivity/countSessionAgentActivityFromMetadata';
 import type { AgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
 import { resolveSessionProjectGroupingKeyParts } from './sessionListProjectGroupingKeys';
 import { deriveSessionListMeaningfulActivityAt } from './deriveSessionListActivity';
@@ -31,6 +35,7 @@ import {
     resolveSessionListUnreadEntryActivityAt,
 } from './placement/sessionListPlacementProjection';
 import { didSessionListWorkingRetentionInputsChange } from './placement/sessionListWorkingRetention';
+import { reconcileSessionSnapshot } from '../sessionLifecycleProjection';
 import {
     deriveSessionRuntimePresentationState,
     resolveSessionRuntimePresenceFields,
@@ -45,6 +50,7 @@ export interface SessionListRenderableMetadata {
     homeDir?: string | null;
     host?: string | null;
     machineId?: string | null;
+    /** Canonical Agent identity resolved before discarding full metadata evidence. */
     flavor?: string | null;
     directSessionV1?: {
         v: 1;
@@ -71,6 +77,8 @@ export interface SessionListRenderableMetadata {
      * while the chip named the workflow.
      */
     agentActivityCounts?: AgentActivityCounts;
+    /** Bounded headline evidence, retained so runtime loss can reconcile counts without transcript reads. */
+    agentActivityEntries?: readonly AgentActivityEntry[];
     hiddenSystemSession?: boolean;
     terminalControlServiceabilityV1?: {
         v: 1;
@@ -132,6 +140,11 @@ export interface SessionListRenderableSession {
      */
     unreadSince?: number | null;
     keepVisibleWhenInactive?: boolean;
+    /**
+     * Derived local presentation of the canonical server-scoped archive operation.
+     * Never persisted or server-materialized.
+     */
+    archiving?: boolean;
     metadataUnavailable?: boolean;
 }
 
@@ -204,33 +217,28 @@ export function deriveSessionListRenderableHasUnreadMessagesFromPatch(params: Re
         && Number.isFinite(params.explicitReadableSeq)
         ? Math.max(0, Math.trunc(params.explicitReadableSeq))
         : null;
+    const lastViewedSessionSeq = resolveLastViewedSessionSeq({
+        metadata: nextMetadata, lastViewedSessionSeq: nextLastViewedSessionSeq,
+    });
+    // A compact row can lack the transcript activity that proved it unread. Without
+    // that evidence, keep the known unread state until the accepted read cursor advances.
+    if (explicitReadableSeq === null && renderable.hasUnreadMessages === true
+        && (lastViewedSessionSeq ?? 0) < (patch.seq ?? renderable.seq)
+        && (lastViewedSessionSeq ?? 0) <= (resolveLastViewedSessionSeq(renderable) ?? 0)) return true;
 
     return computeHasUnreadActivity({
         sessionSeq: explicitReadableSeq === null
             ? projectedReadableSeq
             : Math.max(projectedReadableSeq, explicitReadableSeq),
         pendingActivityAt: 0,
-        lastViewedSessionSeq: resolveLastViewedSessionSeq({
-            metadata: nextMetadata,
-            lastViewedSessionSeq: nextLastViewedSessionSeq,
-        }),
+        lastViewedSessionSeq,
         lastViewedPendingActivityAt: nextMetadata?.readStateV1?.pendingActivityAt,
     });
 }
 
-/**
- * Work still open in this session — the same tally the session header's glyph, the composer chip
- * and the Agents tab badge read. One counter, one grouping rule, one description (R-8).
- *
- * An agent stopped on a permission prompt is open work and is already inside `live`, so there is no
- * second tally to add here and no way for the two to drift.
- */
-function readAgentActivityCounts(metadata: Metadata): AgentActivityCounts {
-    return countSessionAgentActivityFromMetadata(metadata);
-}
-
 export function buildSessionListRenderableMetadata(metadata: Metadata | null | undefined): SessionListRenderableMetadata | null {
     if (!metadata) return null;
+    const agentActivityEntries = readSessionAgentActivityEntriesFromMetadata(metadata);
     const directSessionV1 = (() : DirectSessionRenderableMetadata | null => {
         const candidate = metadata.directSessionV1;
         if (!candidate || typeof candidate !== 'object') return null;
@@ -271,10 +279,11 @@ export function buildSessionListRenderableMetadata(metadata: Metadata | null | u
         homeDir: typeof metadata.homeDir === 'string' ? metadata.homeDir : null,
         host: typeof metadata.host === 'string' ? metadata.host : null,
         machineId: typeof metadata.machineId === 'string' ? metadata.machineId : null,
-        flavor: typeof metadata.flavor === 'string' ? metadata.flavor : null,
+        flavor: resolveAgentIdFromSessionMetadata(metadata),
         directSessionV1,
         readStateV1,
-        agentActivityCounts: readAgentActivityCounts(metadata),
+        agentActivityCounts: deriveAgentActivityCounts(agentActivityEntries.map(toAgentActivityCountable)),
+        agentActivityEntries,
         hiddenSystemSession: metadata.systemSessionV1?.hidden === true,
         terminalControlServiceabilityV1: metadata.terminal?.controlServiceabilityV1 ?? null,
     };
@@ -435,10 +444,46 @@ function shouldPreserveSessionListRenderablePendingFlags(
     );
 }
 
+function preserveSessionListRenderableMissingPendingFlags(
+    previous: SessionListRenderableSession | undefined,
+    next: SessionListRenderableSession,
+): SessionListRenderableSession {
+    if (!shouldPreserveSessionListRenderablePendingFlags(next, previous)) return next;
+    return {
+        ...next,
+        agentStateVersion: previous.agentStateVersion,
+        hasPendingPermissionRequests: previous.hasPendingPermissionRequests,
+        hasPendingUserActionRequests: previous.hasPendingUserActionRequests,
+        pendingRequestObservedAt: previous.pendingRequestObservedAt ?? null,
+    };
+}
+
+function reconcileSessionListRenderableSnapshot(
+    previous: SessionListRenderableSession | undefined,
+    incoming: SessionListRenderableSession,
+    options?: Readonly<{ preserveUnversionedFields?: boolean }>,
+): SessionListRenderableSession {
+    const next = reconcileSessionSnapshot(previous, incoming, options);
+    if (!previous) return next;
+    const unreadInputsChanged = (left: SessionListRenderableSession, right: SessionListRenderableSession) =>
+        left.metadata !== right.metadata || left.seq !== right.seq
+        || (left.latestReadyEventSeq ?? null) !== (right.latestReadyEventSeq ?? null)
+        || (left.latestTurnStatus ?? null) !== (right.latestTurnStatus ?? null)
+        || (left.lastViewedSessionSeq ?? null) !== (right.lastViewedSessionSeq ?? null);
+    if (!unreadInputsChanged(incoming, next)
+        && !(options?.preserveUnversionedFields && unreadInputsChanged(previous, next))) return next;
+    const reconciled = { ...next, hasUnreadMessages: deriveSessionListRenderableHasUnreadMessagesFromPatch({
+        renderable: previous, patch: next, recomputeUnread: true,
+    }) };
+    reconciled.unreadSince = resolveSessionListRenderableUnreadSince(previous, reconciled);
+    return reconciled;
+}
+
 export function preserveSessionListRenderableStaleFields(
     previous: SessionListRenderableSession | undefined,
     next: SessionListRenderableSession,
 ): SessionListRenderableSession {
+    next = preserveSessionListRenderableMissingPendingFlags(previous, reconcileSessionListRenderableSnapshot(previous, next));
     // A projection pass re-derives every renderable, so an unchanged session still arrives as a
     // fresh object. Handing that object on defeats identity all the way up the session list: the
     // row is rebuilt around it, then the array, then the whole list re-renders. Returning the
@@ -454,7 +499,6 @@ export function preserveSessionListRenderableStaleFields(
         && next.metadata == null
         && previous?.metadata == null
         && previous?.metadataUnavailable === true;
-    const preservePendingFlags = shouldPreserveSessionListRenderablePendingFlags(next, previous);
     const preserveDirectSessionClassification =
         previous?.metadata?.directSessionV1 != null
         && next.metadata != null
@@ -463,7 +507,7 @@ export function preserveSessionListRenderableStaleFields(
 
     if (
         previous == null
-        || (!preserveMetadata && !preserveMetadataUnavailable && !preservePendingFlags && !preserveDirectSessionClassification)
+        || (!preserveMetadata && !preserveMetadataUnavailable && !preserveDirectSessionClassification)
     ) {
         return next;
     }
@@ -480,22 +524,12 @@ export function preserveSessionListRenderableStaleFields(
     return {
         ...next,
         metadataVersion: preserveMetadata ? previous.metadataVersion : next.metadataVersion,
-        agentStateVersion: preservePendingFlags ? previous.agentStateVersion : next.agentStateVersion,
         metadata: nextMetadata,
         metadataUnavailable: preserveMetadata
             ? false
             : preserveMetadataUnavailable
                 ? true
                 : next.metadataUnavailable,
-        hasPendingPermissionRequests: preservePendingFlags
-            ? previous.hasPendingPermissionRequests
-            : next.hasPendingPermissionRequests,
-        hasPendingUserActionRequests: preservePendingFlags
-            ? previous.hasPendingUserActionRequests
-            : next.hasPendingUserActionRequests,
-        pendingRequestObservedAt: preservePendingFlags
-            ? previous.pendingRequestObservedAt ?? null
-            : next.pendingRequestObservedAt ?? null,
     };
 }
 
@@ -575,6 +609,7 @@ export function areSessionListRenderablesEqual(
 export function applySessionListRenderablePatch(
     renderable: SessionListRenderableSession,
     patch: SessionListRenderablePatchFields,
+    options?: Readonly<{ preserveUnversionedFields?: boolean }>,
 ): SessionListRenderableSession {
     const patched = {
         ...renderable,
@@ -585,7 +620,7 @@ export function applySessionListRenderablePatch(
     // entry fact is re-stamped from the latest activity; keep the row's
     // existing entry time so an unread row does not move on every message.
     patched.unreadSince = resolveSessionListRenderableUnreadSince(renderable, patched);
-    return patched;
+    return preserveSessionListRenderableMissingPendingFlags(renderable, reconcileSessionListRenderableSnapshot(renderable, patched, options));
 }
 
 export function isSessionListRenderablePatchNoop(

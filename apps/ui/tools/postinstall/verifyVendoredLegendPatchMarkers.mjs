@@ -54,6 +54,16 @@ export const LEGEND_NATIVE_RUNTIME_BUILDS = Object.freeze(['react-native.mjs', '
  */
 export const LEGEND_PATCH_MARKERS = Object.freeze([
     {
+        id: 'physical-reader-mvcp-baseline',
+        marker: 'getCachedVisibleRange(ctx, scroll, scroll + state.scrollLength)',
+        minOccurrences: 1,
+        builds: ['react-native.web.mjs', 'react-native.web.js', 'react.mjs', 'react.js'],
+        defect: 'Browser user scrolling can advance before its throttled scroll event. Applying '
+            + 'row measurement deltas to the stale modeled offset rolls the physical reader backward.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx (preserves physical user scroll progress when measurements precede its scroll event); real-account cold transcript reproduced on 2026-10-08',
+        removeWhen: 'upstream bases DOM MVCP measurement adjustment on current physical reader position before changing geometry',
+    },
+    {
         id: 'settled-geometry-tail-maintenance',
         marker: 'if (getContentSize(ctx) !== previousContentSize) {\n    doMaintainScrollAtEnd(ctx);',
         minOccurrences: 1,
@@ -77,10 +87,11 @@ export const LEGEND_PATCH_MARKERS = Object.freeze([
     },
     {
         id: 'maintained-end-commit-anchor',
-        marker: 'HAPPIER-MVCP-END-ANCHOR',
+        marker: 'if (shouldAdjustMaintainedEnd && !(positionDiff > MVCP_POSITION_EPSILON)) {',
         minOccurrences: 1,
-        defect: 'Suppressing MVCP while following the tail exposed prepended geometry before the deferred end-maintenance scroll. Nonanimated maintenance now anchors the end through the same commit, without taking over an explicit command.',
-        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.native.real.integration.test.tsx',
+        defect: 'Suppressing MVCP while following the tail exposed prepended geometry before the deferred end-maintenance scroll. Nonanimated maintenance now anchors the end through the same commit, without taking over an explicit command. '
+            + 'Content the same commit inserted above the reader\'s anchor keeps the anchor-preserving correction, so stale end ownership cannot throw a parked reader to the tail.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.native.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendEndAnchorPrependWhileParked.real.integration.test.tsx',
         removeWhen: 'upstream preserves nonanimated held-end geometry through MVCP commits and respects explicit scrolling authority',
     },
     {

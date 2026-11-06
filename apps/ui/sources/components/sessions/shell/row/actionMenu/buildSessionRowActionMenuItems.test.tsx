@@ -1,10 +1,10 @@
-import * as React from 'react';
 import { describe, expect, it } from 'vitest';
 
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
 import {
     SESSION_ACTION_ARCHIVE_ID,
+    SESSION_ACTION_DELETE_ID,
     SESSION_ACTION_SET_ATTENTION_STANDING_ID,
     SESSION_ACTION_MARK_UNREAD_ID,
     SESSION_ACTION_MOVE_TO_FOLDER_ID,
@@ -15,6 +15,18 @@ import {
 import { buildSessionRowMoreMenuItems } from './buildSessionRowActionMenuItems';
 
 describe('buildSessionRowMoreMenuItems', () => {
+    it('allows an on-demand move picker without precomputed destination menu items', () => {
+        const target = createSessionActionTarget({
+            session: { id: 'session_1', active: false, createdAt: 1, metadata: null,
+                seq: 0, updatedAt: 1, activeAt: 1, metadataVersion: 1, agentStateVersion: 1,
+                thinking: false, thinkingAt: 0, presence: 1 },
+            serverId: 'server_1', currentUserId: null, isConnected: true, isPinned: false,
+        });
+        const move = buildSessionRowMoreMenuItems({ target, iconColor: '#999', canMoveToFolder: true })
+            .find((item) => item.id === SESSION_ACTION_MOVE_TO_FOLDER_ID);
+        expect(move).toMatchObject({ disabled: false });
+    });
+
     it('composes shared session actions with the row move-to-folder action', () => {
         const session: SessionListRenderableSession = {
             id: 'session_1',
@@ -46,10 +58,7 @@ describe('buildSessionRowMoreMenuItems', () => {
         const items = buildSessionRowMoreMenuItems({
             target,
             iconColor: '#999',
-            canMoveToFolder: false,
-            folderMoveMenuItems: [
-                { id: 'move-to-folder:null', title: 'Workspace root', icon: React.createElement('Icon') },
-            ],
+            canMoveToFolder: true,
         });
 
         expect(items.map((item) => item.id)).toEqual([
@@ -57,9 +66,10 @@ describe('buildSessionRowMoreMenuItems', () => {
             SESSION_ACTION_MARK_UNREAD_ID,
             SESSION_ACTION_STOP_ID,
             SESSION_ACTION_ARCHIVE_ID,
+            SESSION_ACTION_DELETE_ID,
             SESSION_ACTION_MOVE_TO_FOLDER_ID,
         ]);
-        expect(items.at(-1)?.submenu?.items).toHaveLength(1);
+        expect(items.at(-1)?.disabled).toBe(false);
     });
 
     it('places contextual items after frequent session actions', () => {
@@ -104,6 +114,7 @@ describe('buildSessionRowMoreMenuItems', () => {
             SESSION_ACTION_MARK_UNREAD_ID,
             'session.copyDebugInformation',
             SESSION_ACTION_ARCHIVE_ID,
+            SESSION_ACTION_DELETE_ID,
         ]);
     });
 
@@ -154,6 +165,7 @@ describe('buildSessionRowMoreMenuItems', () => {
             'session.fork',
             SESSION_ACTION_STOP_ID,
             SESSION_ACTION_ARCHIVE_ID,
+            SESSION_ACTION_DELETE_ID,
         ]);
         const reminder = items.find((item) => item.id === 'attention-reminder');
         expect(reminder?.subtitle).toBeUndefined();

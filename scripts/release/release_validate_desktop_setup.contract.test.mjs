@@ -92,17 +92,18 @@ test('build-tauri gates the production desktop publish on desktop-setup against 
   assert.match(job.if, /!cancelled\(\)/);
   assert.ok(job.if.includes("needs.resolve_source.result == 'success'"));
   assert.ok(job.if.includes("needs.finalize.result == 'success'"), 'it consumes the finalized (signed) Linux bundle');
-  const admitsSetup = (finalizeNeeded, reuseNeeded, finalizeResult, reuseResult) => {
+  const admitsSetup = (finalizeNeeded, reuseNeeded, finalizeResult, reuseResult, preparationOnly = false) => {
     const expression = job.if.replace(/^\$\{\{\s*|\s*\}\}$/g, '');
-    return Function('needs', 'cancelled', `return Boolean(${expression});`)({
+    return Function('needs', 'cancelled', 'inputs', `return Boolean(${expression});`)({
       resolve_source: { result: 'success', outputs: { finalize_needed: finalizeNeeded, reuse_needed: reuseNeeded } },
       finalize: { result: finalizeResult },
       reuse_finalized: { result: reuseResult },
-    }, () => false);
+    }, () => false, { preparation_only: preparationOnly });
   };
   assert.equal(admitsSetup('true', 'false', 'success', 'skipped'), true, 'new signed artifacts need no restore job');
   assert.equal(admitsSetup('false', 'true', 'skipped', 'success'), true, 'a fully restored signed candidate still runs the setup gate');
   assert.equal(admitsSetup('true', 'true', 'success', 'success'), true, 'mixed candidates require both artifact producers');
+  assert.equal(admitsSetup('true', 'false', 'success', 'skipped', true), false, 'preparation does not run the final setup gate');
   for (const [finalizeNeeded, reuseNeeded, finalizeResult, reuseResult] of [
     ['true', 'false', 'failure', 'skipped'],
     ['false', 'true', 'skipped', 'failure'],
@@ -115,7 +116,7 @@ test('build-tauri gates the production desktop publish on desktop-setup against 
   }
   assert.deepEqual(job.needs, ['resolve_source', 'finalize', 'reuse_finalized']);
   // Linux desktop bundles ship for x86_64 only; hosted ubuntu runners are x86_64 with Docker.
-  assert.equal(job['runs-on'], 'ubuntu-latest');
+  assert.equal(job['runs-on'], 'ubuntu-24.04');
   assert.deepEqual(job.permissions, { contents: 'read' });
   assert.equal(job.environment, undefined, 'the gate must not enter the secret-bearing release environment');
   assert.doesNotMatch(JSON.stringify(job), /secrets\./, 'the gate needs no secrets');
@@ -185,7 +186,7 @@ test('build-tauri gates the production desktop publish on desktop-setup against 
 });
 
 test('every desktop release caller passes its CLI candidate to the build-tauri gate', async () => {
-  const release = await loadWorkflow('release.yml');
+  const release = await loadWorkflow('release-channel.yml');
   assert.ok(release.jobs.deploy_ui.needs.includes('publish_cli_binaries'));
   assert.equal(
     release.jobs.deploy_ui.with.candidate_cli_version,

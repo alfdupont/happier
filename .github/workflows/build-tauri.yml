@@ -37,7 +37,21 @@ on:
         default: ""
         type: string
       resume_run_id:
-        description: "Completed nightly run — Reuse its unsigned desktop candidates for the exact source"
+        description: "Completed origin run — Reuse its admitted desktop artifacts for the exact source"
+        required: false
+        default: ""
+        type: string
+      resume_workflow:
+        description: "Recovery — Workflow that produced the origin's desktop artifacts"
+        required: false
+        default: nightly-dev.yml
+        type: choice
+        options:
+          - nightly-dev.yml
+          - release.yml
+          - release-preview-and-production.yml
+      resume_operation_id:
+        description: "Recovery — Exact conductor operation ID for a release origin (empty for nightly)"
         required: false
         default: ""
         type: string
@@ -53,6 +67,16 @@ on:
         type: string
   workflow_call:
     inputs:
+      preparation_only:
+        description: "Build unsigned same-run candidates without finalizing or publishing"
+        required: false
+        default: false
+        type: boolean
+      use_prepared:
+        description: "Consume unsigned candidates already prepared in this workflow run"
+        required: false
+        default: false
+        type: boolean
       environment:
         required: true
         type: string
@@ -113,7 +137,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "22.x"
   UI_REPO: ${{ github.repository }}
 
 jobs:
@@ -121,7 +144,7 @@ jobs:
     name: Trusted workflow ref guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Admit trusted workflow control ref
@@ -145,7 +168,7 @@ jobs:
     name: Release actor guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout trusted workflow control bytes
@@ -168,13 +191,15 @@ jobs:
     uses: ./.github/workflows/resolve-release-resume.yml
     with:
       origin_run_id: ${{ inputs.resume_run_id }}
-      expected_workflow: .github/workflows/nightly-dev.yml
+      expected_workflow: ${{ format('.github/workflows/{0}', inputs.resume_workflow || 'nightly-dev.yml') }}
       expected_channel: ${{ inputs.environment }}
       expected_source_sha: ${{ inputs.source_ref }}
+      expected_operation_id: ${{ inputs.resume_operation_id || '' }}
+      status_artifact_name: ""
 
   resolve_source:
     name: Resolve source ref to SHA
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [release_actor_guard, resolve_resume]
     if: ${{ !cancelled() && needs.release_actor_guard.result == 'success' && (needs.resolve_resume.result == 'success' || needs.resolve_resume.result == 'skipped') }}
@@ -204,7 +229,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Checkout trusted candidate planning control
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -219,6 +244,8 @@ jobs:
         id: resolve
         env:
           SOURCE_REF: ${{ inputs.source_ref }}
+          PREPARATION_ONLY: ${{ inputs.preparation_only }}
+          USE_PREPARED: ${{ inputs.use_prepared }}
           RELEASE_ENVIRONMENT: ${{ inputs.environment }}
           RETRY_VERSION: ${{ inputs.retry_version }}
           RESUME_RUN_ID: ${{ inputs.resume_run_id }}
@@ -228,6 +255,12 @@ jobs:
           RELEASE_NOTES_ID: ${{ inputs.release_notes_id }}
         run: |
           set -euo pipefail
+          if [ "${PREPARATION_ONLY:-false}" = true ] || [ "${USE_PREPARED:-false}" = true ]; then
+            if [[ ! "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]] || [ -n "${RETRY_VERSION:-}" ] || { [ "${PREPARATION_ONLY:-false}" = true ] && [ "${USE_PREPARED:-false}" = true ]; }; then
+              echo "Same-run desktop preparation requires an exact SHA and one phase without retry_version." >&2
+              exit 1
+            fi
+          fi
           source_sha="$(git rev-parse HEAD)"
           if [[ ! "${source_sha}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Unable to resolve a canonical source SHA from ref '${SOURCE_REF}'" >&2
@@ -339,7 +372,7 @@ jobs:
 
   build:
     name: Build desktop candidate (${{ matrix.platform_key }})
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.build_needed == 'true' }}
+    if: ${{ !cancelled() && !inputs.use_prepared && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.build_needed == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     needs: [resolve_source]
@@ -387,14 +420,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.4
 
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
@@ -501,7 +532,7 @@ jobs:
 
   finalize:
     name: Finalize desktop artifacts (${{ matrix.platform_key }})
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.finalize_needed == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.finalize_needed == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     needs: [resolve_source, build]
@@ -530,17 +561,21 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.4
 
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
+
+      - name: Install Linux system dependencies (Tauri)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-tauri-linux-dependencies
+        with:
+          bundled-webkit: 'true'
 
       - name: Install trusted finalizer dependencies
         env:
@@ -558,10 +593,6 @@ jobs:
           RUSTUP_MAX_RETRIES: "10"
         with:
           targets: ${{ matrix.tauri_target }}
-
-      - name: Install Linux system dependencies (Tauri)
-        if: runner.os == 'Linux'
-        uses: ./.github/actions/install-tauri-linux-dependencies
 
       - name: Download desktop candidate
         if: ${{ matrix.artifact_id == '' }}
@@ -776,9 +807,9 @@ jobs:
 
   reuse_finalized:
     name: Restore finalized desktop artifacts (${{ matrix.platform_key }})
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.reuse_needed == 'true' }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && needs.resolve_source.outputs.retry_version == '' && needs.resolve_source.outputs.reuse_needed == 'true' }}
     needs: [resolve_source]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Reuse the desktop artifact-consumer budget; download retries alone can exceed 30 minutes.
     timeout-minutes: 45
     permissions:
@@ -799,7 +830,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Download and verify admitted finalized desktop assets
         env:
@@ -826,8 +857,8 @@ jobs:
 
   prepare_assets:
     name: Prepare latest.json + publish assets
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && (needs.finalize.result == 'success' || (needs.resolve_source.outputs.finalize_needed == 'false' && needs.finalize.result == 'skipped')) && (needs.reuse_finalized.result == 'success' || (needs.resolve_source.outputs.reuse_needed == 'false' && needs.reuse_finalized.result == 'skipped')) }}
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && (needs.finalize.result == 'success' || (needs.resolve_source.outputs.finalize_needed == 'false' && needs.finalize.result == 'skipped')) && (needs.reuse_finalized.result == 'success' || (needs.resolve_source.outputs.reuse_needed == 'false' && needs.reuse_finalized.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [resolve_source, finalize, reuse_finalized]
     permissions:
@@ -848,7 +879,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Install minisign
         uses: ./.github/actions/bootstrap-minisign
@@ -900,10 +931,10 @@ jobs:
     # publish. The release-validation registry decides whether it applies (a production desktop)
     # and which CLI it installs (the candidate, else the published channel CLI); otherwise it
     # reports the skip reason and succeeds without running.
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && (needs.finalize.result == 'success' || (needs.resolve_source.outputs.finalize_needed == 'false' && needs.finalize.result == 'skipped')) && (needs.reuse_finalized.result == 'success' || (needs.resolve_source.outputs.reuse_needed == 'false' && needs.reuse_finalized.result == 'skipped')) }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && (needs.finalize.result == 'success' || (needs.resolve_source.outputs.finalize_needed == 'false' && needs.finalize.result == 'skipped')) && (needs.reuse_finalized.result == 'success' || (needs.resolve_source.outputs.reuse_needed == 'false' && needs.reuse_finalized.result == 'skipped')) }}
     needs: [resolve_source, finalize, reuse_finalized]
     # Linux desktop bundles ship for x86_64 only; hosted ubuntu runners are x86_64 with Docker.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Setup (checkout, install, bundle download) plus the suite's registry-derived hard stop.
     timeout-minutes: 45
     permissions:
@@ -922,7 +953,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Resolve desktop-setup applicability
         id: plan
@@ -997,7 +1028,7 @@ jobs:
           if-no-files-found: ignore
 
   publish_preview:
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && inputs.publish_release == true && inputs.environment == 'preview' }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && inputs.publish_release == true && inputs.environment == 'preview' }}
     needs: [prepare_assets, resolve_source]
     uses: ./.github/workflows/publish-ui-release.yml
     secrets: inherit
@@ -1015,7 +1046,7 @@ jobs:
       clobber: true
 
   publish_dev:
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && inputs.publish_release == true && inputs.environment == 'dev' }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && inputs.publish_release == true && inputs.environment == 'dev' }}
     needs: [prepare_assets, resolve_source]
     uses: ./.github/workflows/publish-ui-release.yml
     secrets: inherit
@@ -1033,7 +1064,7 @@ jobs:
       clobber: true
 
   publish_stable_release:
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && needs.desktop_setup.result == 'success' && inputs.publish_release == true && inputs.environment == 'production' && needs.resolve_source.outputs.retry_version == '' }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && needs.prepare_assets.result == 'success' && needs.desktop_setup.result == 'success' && inputs.publish_release == true && inputs.environment == 'production' && needs.resolve_source.outputs.retry_version == '' }}
     needs: [prepare_assets, resolve_source, desktop_setup]
     uses: ./.github/workflows/publish-ui-release.yml
     secrets: inherit
@@ -1056,9 +1087,9 @@ jobs:
   # publication; those bytes were gated when publish_stable_release first published them.
   promote_stable_feed:
     name: Promote immutable desktop release to stable feed
-    if: ${{ !cancelled() && needs.resolve_source.result == 'success' && inputs.publish_release == true && inputs.environment == 'production' && (needs.publish_stable_release.result == 'success' || needs.resolve_source.outputs.retry_version != '') }}
+    if: ${{ !cancelled() && !inputs.preparation_only && needs.resolve_source.result == 'success' && inputs.publish_release == true && inputs.environment == 'production' && (needs.publish_stable_release.result == 'success' || needs.resolve_source.outputs.retry_version != '') }}
     needs: [resolve_source, publish_stable_release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: write
@@ -1075,7 +1106,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Enable trusted control Yarn
         uses: ./.github/actions/enable-corepack-yarn
@@ -1119,7 +1150,7 @@ jobs:
             --title "Happier UI Desktop Stable" \
             --target-sha "$TARGET_SHA" \
             --prerelease false \
-            --notes "$RELEASE_MESSAGE" \
-            --release-message "$RELEASE_MESSAGE" \
+            --notes="$RELEASE_MESSAGE" \
+            --release-message="$RELEASE_MESSAGE" \
             --repo "$GH_REPO" \
             --public-key scripts/release/installers/happier-release.pub

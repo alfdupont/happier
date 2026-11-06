@@ -91,6 +91,7 @@ describe('connectedServiceSchemas', () => {
         expect(ConnectedServiceIdSchema.parse('anthropic')).toBe('anthropic');
         expect(ConnectedServiceIdSchema.parse('claude-subscription')).toBe('claude-subscription');
         expect(ConnectedServiceIdSchema.parse('gemini')).toBe('gemini');
+        expect(ConnectedServiceIdSchema.parse('antigravity')).toBe('antigravity');
         expect(ConnectedServiceIdSchema.parse('github')).toBe('github');
     });
 
@@ -140,6 +141,23 @@ describe('connectedServiceSchemas', () => {
         });
         expect(rec.kind).toBe('token');
         expect(rec.serviceId).toBe('github');
+    });
+
+    it.each(['oauth', 'token'] as const)('preserves omitted raw metadata in %s credential records', (kind) => {
+        const payload = kind === 'oauth'
+            ? { accessToken: 'at', refreshToken: 'rt', idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null }
+            : { token: 'setup-token', providerAccountId: null, providerEmail: null };
+        const record = {
+            v: 1, serviceId: 'github', profileId: 'default', kind,
+            createdAt: 1, updatedAt: 1, expiresAt: null,
+            oauth: kind === 'oauth' ? payload : null,
+            token: kind === 'token' ? payload : null,
+        };
+        expect(ConnectedServiceCredentialRecordV1Schema.parse(record)).toEqual(record);
+        for (const raw of [null, { providerMetadata: 'retained' }]) {
+            const withRaw = { ...record, [kind]: { ...payload, raw } };
+            expect(ConnectedServiceCredentialRecordV1Schema.parse(withRaw)).toEqual(withRaw);
+        }
     });
 
     it('parses sealed credential payloads', () => {
@@ -637,12 +655,12 @@ describe('connectedServiceSchemas', () => {
             .appendConnectedServiceAuthGroupReaderCapabilities;
         expect(typeof appendReaderCapabilities).toBe('function');
         expect((appendReaderCapabilities as (path: string) => string)('/v3/connect/openai-codex/groups')).toBe(
-            '/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1',
+            '/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
         );
         expect((appendReaderCapabilities as (path: string) => string)(
             '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4',
         )).toBe(
-            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1',
+            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
         );
     });
 
@@ -650,7 +668,7 @@ describe('connectedServiceSchemas', () => {
         const ConnectedServiceAuthGroupPolicyV1Schema = expectSchema('ConnectedServiceAuthGroupPolicyV1Schema');
         expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1 })).toEqual({
             v: 1,
-            strategy: 'least_limited',
+            strategy: 'expiry_first',
             autoSwitch: false,
             switchOn: {
                 usageLimit: true,
@@ -680,6 +698,7 @@ describe('connectedServiceSchemas', () => {
         expect(ConnectedServiceAuthGroupPolicyV1Schema.safeParse({ v: 1, strategy: 'round_robin' }).success).toBe(false);
         // Existing pools that persisted an explicit `priority` strategy must NOT be silently migrated.
         expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'priority' }).strategy).toBe('priority');
+        expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'least_limited' }).strategy).toBe('least_limited');
         // Removed no-op fields are dropped, not carried, on the parsed policy.
         const parsedPolicy = ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1 });
         expect(parsedPolicy).not.toHaveProperty('recoveryPromptMode');
@@ -716,6 +735,7 @@ describe('connectedServiceSchemas', () => {
             validationBlockedUntilMs: 46,
             lastFailureKind: 'usage_limit',
             lastFailureCode: 'usage_limit_reached',
+            lastFailureProviderLimitId: ' five_hour ',
             lastObservedPlanType: 'team',
             lastObservedAtMs: 50,
             providerResetsAtMs: 60,
@@ -731,6 +751,7 @@ describe('connectedServiceSchemas', () => {
             validationBlockedUntilMs: 46,
             lastFailureKind: 'usage_limit',
             lastFailureCode: 'usage_limit_reached',
+            lastFailureProviderLimitId: 'five_hour',
             lastObservedPlanType: 'team',
             lastObservedAtMs: 50,
             providerResetsAtMs: 60,
@@ -885,6 +906,9 @@ describe('connectedServiceSchemas', () => {
         });
 
         expect(parsed.bindingsByServiceId['openai-codex']?.selection).toBe('group');
+        expect(ConnectedServiceBindingSelectionV1Schema.safeParse({
+            source: 'connected', selection: 'group', groupId: 'codex-main', appliedProfileId: 42,
+        }).success).toBe(false);
         expect(parsed.bindingsByServiceId['openai-codex']).toEqual({
             source: 'connected',
             selection: 'group',

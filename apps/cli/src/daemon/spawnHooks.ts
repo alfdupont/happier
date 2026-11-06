@@ -8,6 +8,7 @@ import type { AccountSettings } from '@happier-dev/protocol';
 
 import { resolveCanonicalCodexBackendMode } from '@/rpc/handlers/codexBackendMode';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
+import { validateProviderCliSpawn } from '@/runtime/managedTools/validateProviderCliSpawn';
 
 export function buildTrackedSpawnOptions(params: Readonly<{
   options: SpawnSessionOptions;
@@ -40,6 +41,8 @@ export type DaemonSpawnRuntimeSelection = Readonly<{
   agentRuntimeDescriptorV1?: AgentRuntimeDescriptorV1;
   directory?: string;
   environmentVariables?: NodeJS.ProcessEnv;
+  /** Preflight queries may observe prerequisites without installing or updating them. */
+  readinessOnly?: boolean;
 }>;
 
 export function resolveDaemonSpawnRuntimeCodexBackendMode(selection: DaemonSpawnRuntimeSelection): CodexBackendMode | undefined {
@@ -51,7 +54,8 @@ export type DaemonSpawnValidationResult =
   | Readonly<{ ok: false; errorMessage: string; reasonCode?: string }>;
 
 export type DaemonTerminalPresentation = Readonly<{
-  kind: 'runner' | 'provider' | 'none';
+  /** provider hosts a session-bearing process; provider_attach hosts only an optional native client. */
+  kind: 'runner' | 'provider' | 'provider_attach' | 'none';
   startingMode?: 'local' | 'remote';
   childEnv?: Readonly<Record<string, string>>;
 }>;
@@ -80,3 +84,39 @@ export type DaemonSpawnHooks = Readonly<{
     processEnv: NodeJS.ProcessEnv;
   }>) => DaemonTerminalPresentation;
 }>;
+
+/**
+ * Launch admission for a built-in provider: its hook owns the requirement when the session does
+ * not launch the base provider CLI; otherwise the resolvable base CLI is required.
+ */
+export async function validateDaemonSpawn(params: Readonly<{
+  hooks: DaemonSpawnHooks | null | undefined;
+  agentId: AgentId | null;
+  runtimeSelection: DaemonSpawnRuntimeSelection;
+}>): Promise<DaemonSpawnValidationResult> {
+  if (params.hooks?.validateSpawn) return await params.hooks.validateSpawn(params.runtimeSelection);
+  if (!params.agentId || params.agentId === 'customAcp') return { ok: true };
+  return await validateProviderCliSpawn({
+    agentId: params.agentId,
+    processEnv: params.runtimeSelection.environmentVariables,
+  });
+}
+
+export function resolveDaemonTerminalPresentation(params: Readonly<{
+  hooks: DaemonSpawnHooks | null | undefined;
+  host: 'tmux' | 'zellij' | 'herdr';
+  agentId: AgentId;
+  configuredAcpBackend: boolean;
+  accountSettings: AccountSettings | null;
+  runtimeSelection: DaemonSpawnRuntimeSelection;
+  processEnv: NodeJS.ProcessEnv;
+  existingSessionId?: string;
+}>): DaemonTerminalPresentation {
+  const selected = params.hooks?.resolveTerminalPresentation?.(params)
+    ?? resolveDefaultDaemonTerminalPresentation(params);
+  // Recover the existing shared controller without silently recreating an optional client.
+  // Explicit Attach remains the same live runner's local-mode operation.
+  return selected.kind === 'provider_attach' && params.existingSessionId?.trim()
+    ? { ...selected, startingMode: 'remote' }
+    : selected;
+}

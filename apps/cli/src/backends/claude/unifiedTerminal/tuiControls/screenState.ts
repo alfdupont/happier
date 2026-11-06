@@ -1,6 +1,8 @@
 import { normalizeCapturedScreen, stripTerminalControlSequences } from '@/integrations/terminalHost/controlCapture';
 
 import { hasComposerLineStyleEvidence, SGR_SEQUENCE_PREFIX } from './composerStyleEvidence';
+import { parseClaudeNativeQuestionScreen, type ClaudeNativeQuestionPresentation } from './nativeQuestionScreen';
+import { parseClaudeNativePermissionScreen } from './nativePermissionScreen';
 import type { ClaudeTuiModeMarker } from './types';
 
 export type ClaudeUnifiedSafeguardPauseChoice = 'switch_model' | 'edit_prompt_and_retry';
@@ -52,6 +54,8 @@ export type ClaudeScreenState = Readonly<{
   visibleNumberedDialog: ClaudeUnifiedGenericNumberedDialog | null;
   /** Current provider-rendered selection mechanics, used to derive answers at send time. */
   visibleDialogSelection: ClaudeUnifiedDialogSelectionPresentation | null;
+  /** Hook-owned AskUserQuestion presentation; tab and checkbox progress are not completion. */
+  nativeQuestionPresentation: ClaudeNativeQuestionPresentation | null;
   /** Heavy-session startup interstitial: "Resume from summary" / "Resume full session". */
   resumeChoiceDialogVisible: boolean;
   /** Proven option order for the heavy-session resume interstitial. */
@@ -100,8 +104,15 @@ export type ClaudeScreenState = Readonly<{
    * submits `/effort medium/effort medium` (incident cmq7pyqkj, U1).
   */
   composerContent: string | null;
+  /**
+   * Content of the bash-mode prompt line (`!  echo hi`, footer `! for shell mode`), null outside
+   * bash mode. Kept apart from `composerContent` on purpose: a bash-mode prompt is not a message
+   * composer, so it must not satisfy any readiness, steering or clearing check. Only delivery of a
+   * message that itself starts with `!` reads it, to see that message staged before pressing Enter.
+   */
+  shellComposerContent: string | null;
   composerCursorRelation: 'at_content_start' | 'inside_or_after_content' | null;
-  modeMarker: ClaudeTuiModeMarker;
+  modeMarker: ClaudeTuiModeMarker | null;
   visibleModel: string | null;
   visibleEffort: string | null;
 }>;
@@ -143,7 +154,7 @@ const SAFEGUARD_PAUSE_RETRY_OPTION = /\bedit prompt and retry(?:\s+with\s+(.+?))
 // The provider changes the paid alternatives across plans and releases. Recognize the stable
 // failure + chooser + wait semantics, then require the shared strict numbered-dialog parser below.
 // This stays tolerant of labels and option count without matching arbitrary numbered dialogs.
-const USAGE_LIMIT_DIALOG = /(?:\byou(?:['’]ve| have)\s+(?:hit|reached)\s+your\s+(?:session|usage)\s+limit\b|\/rate-limit-options)[\s\S]{0,1200}\bwhat do you want to do\?[\s\S]{0,700}\bwait\b[^\n]{0,120}\blimit\b[^\n]{0,120}\breset(?:s)?\b/i;
+const USAGE_LIMIT_DIALOG = /(?:\byou(?:['’]ve| have)\s+(?:hit|reached)\s+your\s+(?:session|usage|weekly)\s+limit\b|\/rate-limit-options)[\s\S]{0,1200}\bwhat do you want to do\?[\s\S]{0,700}\bwait\b[^\n]{0,120}\blimit\b[^\n]{0,120}\breset(?:s)?\b/i;
 const CROPPED_USAGE_LIMIT_DIALOG = /\bwhat do you want to do\?[\s\S]{0,400}(?:❯|>)\s*1\.\s*[^\n]{0,120}\bwait\b[^\n]{0,120}\blimit\b[^\n]{0,120}\breset(?:s)?\b/i;
 // Live probe 2026-06-11 (Claude Code 2.1.173, tmux): `/effort <level>` on a conversation cached at a
 // different effort opens "Change effort level? … ❯ 1. Yes, switch to <level>  2. No, go back".
@@ -200,11 +211,14 @@ const EFFORT_CONFIRMATION = /set (?:reasoning )?effort (?:level )?to\s+([a-z]+)\
 const EFFORT_KEPT_NOTICE = /kept effort level as\s+([a-z]+)\b/gim;
 const EFFORT_STATUS_LINE = /\beffort:\s*([a-z]+)\b/im;
 
-// Composer prompt line: `>`, `›` (U+203A), or `❯` (U+276F, the real 2.1.170 glyph) followed by
+// Input prompt line: `>`, `›` (U+203A), `❯` (U+276F), or the shell-mode `!`, followed by
 // optional content (inside an optional box border). The negative lookahead excludes menu-selection
 // lines (`❯ 1. Yes`) — the same `❯` glyph marks dialog choices — so a dialog never reads as an
 // interactive composer (fail-closed: an ambiguous numbered line is treated as not-a-composer).
-const COMPOSER_LINE = /(?:^|\n)[^\S\n]*(?:[│|][^\S\n]*)?(?:>|›|❯)(?![^\S\n]*(?:\d+\.|[◯◉○●◐◑]))[^\S\n]*(.*?)[^\S\n]*(?:[│|][^\S\n]*)?(?:\n|$)/;
+// Shell recognition needs its following footer so the hint cannot match itself. Both prompt kinds
+// participate in the SAME last-input selection: an old shell capture cannot outrank a newer normal
+// draft, and an old normal composer cannot make the active shell prompt ready for ordinary input.
+const COMPOSER_LINE = /(?:^|\n)[^\S\n]*(?:[│|][^\S\n]*)?((?:>|›|❯)(?![^\S\n]*(?:\d+\.|[◯◉○●◐◑]))|!(?=[\s\S]*\n[^\S\n]*! for shell mode(?:\s|$)))[^\S\n]*(.*?)[^\S\n]*(?:[│|][^\S\n]*)?(?:\n|$)/;
 const SLASH_SUGGESTION_LINE = /(?:^|\n)[^\S\n]*\/[a-z][a-z0-9-]*\b/i;
 // Agents/selection panel (live capture 2026-06-12 11:50, runner pid 58731): the selector header
 // renders `↑/↓ to select` and the focus cursor renders as `❯ ◯ <agent-type> <title>` rows. The
@@ -423,35 +437,45 @@ function cursorProvesPlainPlaceholder(params: Readonly<{
 function readComposerState(
   text: string,
   rawText: string,
+  match: RegExpExecArray | null,
   context?: ClaudeScreenParseContext | undefined,
-): Readonly<{ content: string | null; cursorRelation: ClaudeScreenState['composerCursorRelation'] }> {
+): Readonly<{ content: string | null; shellContent: string | null; cursorRelation: ClaudeScreenState['composerCursorRelation'] }> {
   // Executed prompts echo as `❯ <prompt>` transcript rows (live capture 2026-06-11); the REAL
   // composer is the LAST composer-shaped line on screen (the input box renders at the bottom).
-  const match = lastMatch(new RegExp(COMPOSER_LINE.source, `${COMPOSER_LINE.flags}g`), text);
-  if (!match) return { content: null, cursorRelation: null };
-  const content = (match[1] ?? '').trim();
-  const cursorRelation = readCursorComposerRelation({ text, match, content, context });
-  if (content.length === 0) return { content, cursorRelation };
+  if (!match) return { content: null, shellContent: null, cursorRelation: null };
+  const content = (match[2] ?? '').trim();
   const continuation = readComposerContinuationLines(text, match.index + match[0].length);
+  if (match[1] === '!') {
+    return {
+      content: null,
+      shellContent: continuation.length === 0 ? content : [content, ...continuation].join('\n'),
+      cursorRelation: null,
+    };
+  }
+  const cursorRelation = readCursorComposerRelation({ text, match, content, context });
+  if (content.length === 0) return { content, shellContent: null, cursorRelation };
   if (continuation.length === 0 && composerContentIsDimPlaceholder(rawText, content, cursorRelation)) {
-    return { content: '', cursorRelation };
+    return { content: '', shellContent: null, cursorRelation };
   }
   if (cursorProvesPlainPlaceholder({ rawText, content, continuation, cursorRelation })) {
-    return { content: '', cursorRelation };
+    return { content: '', shellContent: null, cursorRelation };
   }
   return {
     content: continuation.length === 0 ? content : [content, ...continuation].join('\n'),
+    shellContent: null,
     cursorRelation,
   };
 }
 
-function resolveModeMarker(text: string): ClaudeTuiModeMarker {
-  // Order matters only for disambiguation; markers are mutually exclusive in practice.
-  if (ACCEPT_EDITS_MARKER.test(text)) return 'acceptEdits';
-  if (PLAN_MODE_MARKER.test(text)) return 'plan';
-  if (BYPASS_MARKER.test(text)) return 'bypassPermissions';
-  if (AUTO_MODE_MARKER.test(text)) return 'auto';
-  return 'default';
+function resolveModeMarker(footer: string): ClaudeTuiModeMarker | null {
+  // Only the current footer proves the active mode. Transcript echoes and clipped
+  // footers must not turn an unknown mode into default (2.1.289, short tmux panes).
+  if (ACCEPT_EDITS_MARKER.test(footer) || /(?:^|\n)\s*⏵⏵\s+accept edits\b/i.test(footer)) return 'acceptEdits';
+  if (PLAN_MODE_MARKER.test(footer) || /(?:^|\n)\s*⏸\s+plan\b/i.test(footer)) return 'plan';
+  if (BYPASS_MARKER.test(footer) || /(?:^|\n)\s*⏵⏵\s+bypass permissions\b/i.test(footer)) return 'bypassPermissions';
+  if (AUTO_MODE_MARKER.test(footer) || /(?:^|\n)\s*⏵⏵\s+auto\b/i.test(footer)) return 'auto';
+  if (/(?:^|\n)\s*⏸\s+manual\b/i.test(footer) || /\? for shortcuts\b/i.test(footer)) return 'default';
+  return null;
 }
 
 function resolveVisibleModel(text: string): string | null {
@@ -554,7 +578,10 @@ function resolveVisibleEffort(text: string): string | null {
 function resolveGenericNumberedDialog(
   text: string,
   minimumOptionCount = 2,
-): ClaudeUnifiedGenericNumberedDialog | null {
+): Readonly<{
+  dialog: ClaudeUnifiedGenericNumberedDialog;
+  presentation: ClaudeUnifiedDialogSelectionPresentation;
+}> | null {
   const lines = text.split('\n');
   const blocks: Array<Array<{ index: number; number: number; label: string; focused: boolean }>> = [];
   let current: Array<{ index: number; number: number; label: string; focused: boolean }> = [];
@@ -574,8 +601,11 @@ function resolveGenericNumberedDialog(
     });
   }
   if (current.length > 0) blocks.push(current);
-  if (blocks.length !== 1) return null;
-  const block = blocks[0];
+  // Ignore ordinary transcript lists, while keeping competing focused menus ambiguous.
+  // The selected block owns both the options and the cursor.
+  const focusedBlocks = blocks.filter((candidate) => candidate.some((option) => option.focused));
+  if (focusedBlocks.length !== 1) return null;
+  const block = focusedBlocks[0];
   if (!block || block.length < minimumOptionCount || block.length > 9) return null;
   if (block.filter((candidate) => candidate.focused).length !== 1) return null;
   if (block.some((candidate, index) => candidate.number !== index + 1)) return null;
@@ -595,9 +625,17 @@ function resolveGenericNumberedDialog(
   });
   if (signature.length > 1_024) return null;
   return {
-    context,
-    options: block.map((candidate) => ({ choice: String(candidate.number), label: candidate.label })),
-    signature,
+    dialog: {
+      context,
+      options: block.map((candidate) => ({ choice: String(candidate.number), label: candidate.label })),
+      signature,
+    },
+    presentation: {
+      kind: 'indexed',
+      options: block.map((candidate) => ({
+        label: candidate.label, shortcut: String(candidate.number), focused: candidate.focused,
+      })),
+    },
   };
 }
 
@@ -678,26 +716,9 @@ function resolveGenericSelectionDialog(
 
 function resolveDialogSelectionPresentation(
   text: string,
-  numbered: ClaudeUnifiedGenericNumberedDialog | null,
+  numbered: ReturnType<typeof resolveGenericNumberedDialog>,
 ): ClaudeUnifiedDialogSelectionPresentation | null {
-  if (numbered) {
-    const lines = text.split('\n');
-    return {
-      kind: 'indexed',
-      options: numbered.options.map((option) => {
-        const pattern = new RegExp(
-          `^[^\\S\\n]*(?:${SELECTION_FOCUS_GLYPH_SOURCE}[^\\S\\n]*)?${option.choice}\\.[^\\S\\n]+`,
-          'u',
-        );
-        const row = lines.find((line) => pattern.test(line));
-        return {
-          label: option.label,
-          shortcut: option.choice,
-          focused: row ? FOCUSED_SELECTION_LINE.test(row) : false,
-        };
-      }),
-    };
-  }
+  if (numbered) return numbered.presentation;
 
   const focused = resolveFocusedSelectionBlock(text);
   return focused ? { kind: 'focused', options: focused.options } : null;
@@ -713,14 +734,16 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
   const usageLimitDialogCandidate = usageLimitSemanticMatch
     ? resolveGenericNumberedDialog(visibleTail, 1)
     : null;
-  const visibleNumberedDialog = usageLimitDialogCandidate ?? resolveGenericNumberedDialog(visibleTail);
-  const visibleDialogSelection = resolveDialogSelectionPresentation(visibleTail, visibleNumberedDialog);
+  const numberedDialog = usageLimitDialogCandidate ?? resolveGenericNumberedDialog(visibleTail);
+  const visibleNumberedDialog = numberedDialog?.dialog ?? null;
+  const visibleDialogSelection = resolveDialogSelectionPresentation(visibleTail, numberedDialog);
   const rewindSelectionVisible = REWIND_SELECTION.test(visibleTail);
   const lastComposerMatch = lastMatch(new RegExp(COMPOSER_LINE.source, `${COMPOSER_LINE.flags}g`), text);
   // A notice above the current composer belongs to transcript history, not the active footer.
-  const usageLimitWaitVisible = USAGE_LIMIT_WAIT_FOOTER.test(lastComposerMatch
+  const currentFooter = lastComposerMatch
     ? text.slice(lastComposerMatch.index + lastComposerMatch[0].length)
-    : visibleTail);
+    : visibleTail;
+  const usageLimitWaitVisible = USAGE_LIMIT_WAIT_FOOTER.test(currentFooter);
 
   const switchModelDialogVisible = SWITCH_MODEL_DIALOG.test(text);
   const usageLimitDialogVisible = usageLimitSemanticMatch && visibleDialogSelection !== null;
@@ -733,7 +756,8 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     ? ((EFFORT_CHANGE_DIALOG_TARGET.exec(text)?.[1] ?? EFFORT_DEFAULT_NUDGE_DIALOG.exec(text)?.[1])?.toLowerCase() ?? null)
     : null;
   const trustFolderPromptVisible = TRUST_FOLDER_PROMPT.test(text) || TRUST_FOLDER_NUMBERED_CHOICES.test(text);
-  const permissionPromptVisible = !trustFolderPromptVisible && PERMISSION_PROMPT.test(text);
+  const permissionPromptVisible = !trustFolderPromptVisible
+    && (PERMISSION_PROMPT.test(text) || parseClaudeNativePermissionScreen(text) !== null);
   const permissionEditorOpen = PERMISSION_EDITOR.test(text) || PERMISSION_EDITOR_HEADER.test(text);
   const queuedMessageBannerVisible = QUEUED_MESSAGE_BANNER.test(text);
   const generating = ESC_TO_INTERRUPT.test(text) || GENERATING_SPINNER_LINE.test(text) || queuedMessageBannerVisible;
@@ -742,8 +766,8 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
   // confirmed focused-selection block owns the cursor, so it must win before composer parsing;
   // otherwise the selected row masquerades as a draft and suppresses the generic dialog path.
   const composerState = rewindSelectionVisible || visibleDialogSelection?.kind === 'focused'
-    ? { content: null, cursorRelation: null }
-    : readComposerState(text, rawText, context);
+    ? { content: null, shellContent: null, cursorRelation: null }
+    : readComposerState(text, rawText, lastComposerMatch, context);
   const composerContent = composerState.content;
   const hasComposer = composerContent !== null;
   // A host cursor on the parsed composer is direct evidence that the composer, not an older
@@ -757,6 +781,7 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     && !composerHasSlash
     && visibleDialogSelection?.kind !== 'focused';
 
+  const nativeQuestionPresentation = parseClaudeNativeQuestionScreen(text);
   const unrecognizedConfirmationDialogVisible =
     (NUMBERED_SELECTION_OPTION.test(text) || visibleDialogSelection?.kind === 'focused')
     && !activeComposerOwnsInput
@@ -767,13 +792,15 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     && !effortChangeDialogVisible
     && !trustFolderPromptVisible
     && !permissionPromptVisible
-    && !permissionEditorOpen;
+    && !permissionEditorOpen
+    && nativeQuestionPresentation === null;
   const genericNumberedDialog = unrecognizedConfirmationDialogVisible
     ? resolveGenericSelectionDialog(visibleTail, visibleNumberedDialog, visibleDialogSelection)
     : null;
 
   const anyDialog =
-    switchModelDialogVisible
+    nativeQuestionPresentation !== null
+    || switchModelDialogVisible
     || usageLimitDialogVisible
     || resumeChoiceDialogVisible
     || safeguardPauseDialogVisible
@@ -783,13 +810,13 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     || permissionPromptVisible
     || permissionEditorOpen;
 
-  const modeMarker = resolveModeMarker(text);
+  const modeMarker = resolveModeMarker(currentFooter);
   const latestEffort = resolveLatestEffortConfirmation(text);
 
   const inputBoxInteractive =
     !generating
     && !anyDialog
-    && (hasComposer || WORK_PROMPT.test(tailLines(text, 10)) || modeMarker !== 'default');
+    && (hasComposer || WORK_PROMPT.test(tailLines(text, 10)) || (modeMarker !== null && modeMarker !== 'default'));
 
   return {
     text,
@@ -804,6 +831,7 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     usageLimitWaitVisible,
     visibleNumberedDialog,
     visibleDialogSelection,
+    nativeQuestionPresentation,
     resumeChoiceDialogVisible,
     resumeChoiceDialogOptions,
     safeguardPauseDialogVisible,
@@ -818,6 +846,7 @@ export function parseClaudeScreenState(rawText: string, context?: ClaudeScreenPa
     userDraftPresent,
     selectionListVisible: rewindSelectionVisible || SELECTION_CURSOR_ROW.test(text) || (SELECTION_LIST_HINT.test(text) && !hasComposer),
     composerContent,
+    shellComposerContent: anyDialog ? null : composerState.shellContent,
     composerCursorRelation: composerState.cursorRelation,
     modeMarker,
     visibleModel: resolveVisibleModel(text),
@@ -847,6 +876,7 @@ function hasBlockingOverlay(state: ClaudeScreenState): boolean {
     || state.safeguardPauseDialogVisible
     || state.effortChangeDialogVisible
     || state.unrecognizedConfirmationDialogVisible
+    || state.nativeQuestionPresentation !== null
     || state.queuedMessageBannerVisible
     || state.userDraftPresent
     || state.selectionListVisible
@@ -892,6 +922,7 @@ export function isSafeWindowForModeCycle(state: ClaudeScreenState): boolean {
  * /heavy-resume renders) — those fail closed to the deferred path.
  */
 export function resolveClaudeScreenInFlightSteerVeto(state: ClaudeScreenState): string | null {
+  if (state.nativeQuestionPresentation !== null) return 'native_question';
   if (state.permissionPromptVisible) return 'permission_prompt';
   if (state.trustFolderPromptVisible) return 'trust_prompt';
   if (state.switchModelDialogVisible) return 'switch_model_dialog';

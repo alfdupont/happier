@@ -13,6 +13,7 @@ import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticate
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi';
 import { visibleNewSessionComposer } from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
+import { appendBrowserDiagnostics, collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
 
 const run = createRunDirs({ runLabel: 'ui-e2e' });
 
@@ -154,7 +155,7 @@ async function openNewSessionDraft(params: Readonly<{
 }>): Promise<Readonly<{ draftId: string; composer: ReturnType<Page['getByTestId']> }>> {
     const draftListHydration = params.draftId
         ? params.page.waitForResponse(
-            (response) => response.url().endsWith('/v1/account/session-drafts/list')
+            (response) => new URL(response.url()).pathname === '/v1/account/session-drafts/list'
                 && response.request().method() === 'POST'
                 && response.status() === 200,
             { timeout: 60_000 },
@@ -196,7 +197,7 @@ async function waitForDraftMutation(page: Page, action: () => Promise<void>): Pr
     // Match a request that starts after this action is armed. A response matcher can accidentally
     // consume a still-finishing mutation from the preceding test and return before this edit is durable.
     const mutation = page.waitForRequest(
-        (request) => request.url().endsWith('/v1/account/session-drafts/mutate')
+        (request) => new URL(request.url()).pathname === '/v1/account/session-drafts/mutate'
             && request.method() === 'POST',
         { timeout: 60_000 },
     );
@@ -215,7 +216,7 @@ async function holdNextDraftMutation(page: Page): Promise<Readonly<{
     release: () => void;
     dispose: () => Promise<void>;
 }>> {
-    const mutationUrl = '**/v1/account/session-drafts/mutate';
+    const mutationUrl = (url: URL) => url.pathname === '/v1/account/session-drafts/mutate';
     let markIntercepted!: () => void;
     const intercepted = new Promise<void>((resolve) => { markIntercepted = resolve; });
     let markCompleted!: () => void;
@@ -474,8 +475,8 @@ test.describe('ui e2e: session composer draft continuity', () => {
         await server?.stop().catch(() => {});
     });
 
-    test('restores long draft expansion and web scroll position after switching sessions', async ({ page }) => {
-        test.setTimeout(420_000);
+    test('restores long draft expansion and web scroll position after switching sessions', { tag: "@smoke" }, async ({ page }) => {
+        test.setTimeout(180_000);
         if (!uiBaseUrl || !sessionA || !sessionB) throw new Error('missing composer continuity fixtures');
 
         const longDraft = Array.from({ length: 36 }, (_, index) => `line ${index + 1} composer continuity ${run.runId}`).join('\n');
@@ -511,7 +512,7 @@ test.describe('ui e2e: session composer draft continuity', () => {
     });
 
     test('keeps stable UUID identities across reload/resume and preserves multiple new-session drafts', async ({ page }) => {
-        test.setTimeout(360_000);
+        test.setTimeout(180_000);
         if (!server || !token || !uiBaseUrl) throw new Error('missing draft continuity fixtures');
 
         const draftAText = `new-session draft A ${run.runId}`;
@@ -566,7 +567,7 @@ test.describe('ui e2e: session composer draft continuity', () => {
     });
 
     test('projects an existing-session draft and preserves edits made while the captured enqueue is in flight', async ({ page }) => {
-        test.setTimeout(360_000);
+        test.setTimeout(180_000);
         if (!server || !token || !uiBaseUrl) throw new Error('missing existing-session fixtures');
 
         const submitted = `captured send ${run.runId}`;
@@ -596,7 +597,7 @@ test.describe('ui e2e: session composer draft continuity', () => {
         let releaseResponse!: () => void;
         const mayRespond = new Promise<void>((resolve) => { releaseResponse = resolve; });
         let didIntercept = false;
-        const pendingEnqueueUrl = `**/v2/sessions/${session.id}/pending`;
+        const pendingEnqueueUrl = (url: URL) => url.pathname === `/v2/sessions/${session.id}/pending`;
         await page.route(pendingEnqueueUrl, async (route) => {
             if (route.request().method() !== 'POST') {
                 await route.fallback();
@@ -616,7 +617,7 @@ test.describe('ui e2e: session composer draft continuity', () => {
     });
 
     test('converges an existing-session clear across two contexts without lifecycle resurrection', async ({ page, browser }) => {
-        test.setTimeout(360_000);
+        test.setTimeout(180_000);
         if (!server || !token || !uiBaseUrl || !sessionB) throw new Error('missing existing-session draft fixtures');
 
         const seed = `existing-session shared draft ${run.runId}`;
@@ -658,8 +659,37 @@ test.describe('ui e2e: session composer draft continuity', () => {
         }
     });
 
+    test('removes a deleted new-session draft from another mounted composer and its sidebar', async ({ page, browser }) => {
+        test.setTimeout(180_000);
+        if (!server || !token || !uiBaseUrl) throw new Error('missing synchronized draft fixtures');
+
+        const seed = `delete shared draft ${run.runId}`;
+        const clientA = await openNewSessionDraft({ page, uiBaseUrl });
+        const address = { kind: 'newSession' as const, draftId: clientA.draftId };
+        await fillAndFlushDraft({ composer: clientA.composer, value: seed, baseUrl: server.baseUrl, token, address });
+        const clientB = await openSecondContext({ browser, sourcePage: page, uiBaseUrl, draftId: clientA.draftId, expectedText: seed });
+        const diagnostics = collectBrowserDiagnostics({ page: clientB.page });
+        try {
+            await expect(clientB.composer).toHaveValue(seed, { timeout: 60_000 });
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 120_000);
+            await page.getByTestId(`session-draft-delete:new-session:${clientA.draftId}`).click();
+            await page.getByTestId('web-modal-confirm').click();
+            await expect.poll(async () => (await readDraft({ baseUrl: server!.baseUrl, token: token!, address })).status,
+                { timeout: 60_000 }).toBe('deleted');
+            await expect(clientB.composer).toHaveValue('', { timeout: 60_000 });
+
+            await gotoDomContentLoadedWithRetries(clientB.page, `${uiBaseUrl}/?happier_hmr=0`, 120_000);
+            await expect(clientB.page.getByTestId(`session-draft-row:new-session:${clientA.draftId}`)).toHaveCount(0);
+            expect((await readDraft({ baseUrl: server.baseUrl, token, address })).status).toBe('deleted');
+        } catch (error) {
+            throw appendBrowserDiagnostics(error, diagnostics());
+        } finally {
+            await clientB.context.close();
+        }
+    });
+
     test('rebases distinct fields, exposes same-field conflict, and does not resurrect a deleted draft across two contexts', async ({ page, browser }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         if (!server || !token || !uiBaseUrl) throw new Error('missing synchronized draft fixtures');
 
         const seed = `two-context base ${run.runId}`;
@@ -752,7 +782,7 @@ test.describe('ui e2e: session composer draft continuity', () => {
     });
 
     test('cycles only current-session user messages with repeated ArrowUp in per-session history scope', async ({ page }) => {
-        test.setTimeout(300_000);
+        test.setTimeout(180_000);
         if (!uiBaseUrl || !sessionA || !sessionB) throw new Error('missing composer history fixtures');
 
         const composerA = await openSession({ page, uiBaseUrl, session: sessionA });

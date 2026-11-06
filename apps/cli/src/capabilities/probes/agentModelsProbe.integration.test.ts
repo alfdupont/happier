@@ -4,8 +4,11 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 
 import { AcpBackend, type AcpBackendOptions, type AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import type { AgentBackend } from '@/agent/core';
+import { logger } from '@/ui/logger';
 import { probeAgentModelsBestEffort, probeModelsFromAcpBackend } from './agentModelsProbe';
 import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
+import { createFx014SessionResponse, writeFx014AcpAgentScript } from '@/agent/acp/testkit/fx014';
+import { withTempDir } from '@/testkit/fs/tempDir';
 import {
   createProbeTempDir,
   resolveAcpSdkEntryFromCwd,
@@ -101,6 +104,61 @@ function reasoningEffortModelOption(levels: ReadonlyArray<string>, currentValue:
 }
 
 describe('probeModelsFromAcpBackend', () => {
+  it('uses an explicit opaque selector id and recursively grouped choices ahead of a model-labelled decoy', async () => {
+    await withTempDir('happier-acp-explicit-probe-', async (dir) => {
+      const [provider, model, ...controls] = createFx014SessionResponse().configOptions;
+      const selector = { ...model, id: ' vendor/selector ', name: 'Engine selection', options: [
+        { name: 'Outer', options: [{ name: 'Inner', options: model.options }] },
+      ] };
+      const backend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: [
+          provider, { ...provider, id: 'model', name: 'Model' }, selector, ...controls,
+        ] })],
+      });
+      try {
+        const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000, modelConfigOptionId: selector.id });
+        expect(models?.map((entry) => entry.id)).toEqual(['default', ...model.options.map((choice) => choice.value)]);
+        expect(models?.find((entry) => entry.id === model.currentValue)?.modelOptions?.map((option) => option.id)).toEqual(['effort', 'fast']);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
+  it('rejects an ambiguous category-only model projection', async () => {
+    await withTempDir('happier-acp-ambiguous-probe-', async (dir) => {
+      const backend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: createFx014SessionResponse().configOptions.filter((option) => option.id !== 'model') })],
+      });
+      try {
+        expect(await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 })).toBeNull();
+        expect(backend.getSessionConfigOptionsState()?.map((option) => option.id)).toContain('provider');
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
+  it.each([false, true])('selects FX models rather than providers or fast controls (reordered: %s)', async (reordered) => {
+    await withTempDir('happier-fx014-probe-', async (dir) => {
+      const response = createFx014SessionResponse();
+      const backend = new AcpBackend({
+        agentName: 'fx', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: reordered ? [...response.configOptions].reverse() : response.configOptions })],
+      });
+      try {
+        const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
+        expect(models?.map((model) => model.id)).toEqual(['default', ...response.configOptions[1].options.map((choice) => choice.value)]);
+        expect(models?.find((model) => model.id === 'gpt-6.1-sol')?.modelOptions?.map((option) => option.id).sort()).toEqual(['effort', 'fast']);
+        expect(models?.filter((model) => model.id !== 'gpt-6.1-sol').every((model) => !model.modelOptions)).toBe(true);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
   it('extracts available models from ACP session/new and normalizes Default', async () => {
     const fixture = await createProbeTempDir('happier-acp-model-probe');
     const sdkEntry = resolveAcpSdkEntryFromCwd(process.cwd());
@@ -413,19 +471,29 @@ describe('probeModelsFromAcpBackend', () => {
       },
     };
 
-    const models = await probeModelsFromAcpBackend({
-      backend: backend as unknown as AgentBackend,
-      timeoutMs: 250,
-      modelConfig: { acpModelOptionsScope: 'per_model', acpModelConfigOptionId: 'model' },
-    });
+    const warning = vi.spyOn(logger, 'warnFile').mockImplementation(() => undefined);
+    try {
+      const models = await probeModelsFromAcpBackend({
+        backend: backend as unknown as AgentBackend,
+        timeoutMs: 250,
+        modelConfig: { acpModelOptionsScope: 'per_model', acpModelConfigOptionId: 'model' },
+      });
 
-    expect(models).toEqual([
-      { id: 'default', name: 'Default' },
-      { id: 'model-a', name: 'model-a', modelOptions: [reasoningEffortModelOption(['low', 'high'], 'high')] },
-      { id: 'model-b', name: 'model-b' },
-      { id: 'model-c', name: 'model-c', modelOptions: [reasoningEffortModelOption(['low'], 'low')] },
-      { id: 'model-d', name: 'model-d' },
-    ]);
+      expect(models).toEqual([
+        { id: 'default', name: 'Default' },
+        { id: 'model-a', name: 'model-a', modelOptions: [reasoningEffortModelOption(['low', 'high'], 'high')] },
+        { id: 'model-b', name: 'model-b' },
+        { id: 'model-c', name: 'model-c', modelOptions: [reasoningEffortModelOption(['low'], 'low')] },
+        { id: 'model-d', name: 'model-d' },
+      ]);
+      expect(warning).toHaveBeenCalledWith('[agentModelsProbe] Per-model option discovery incomplete', {
+        modelConfigOptionId: 'model',
+        reason: 'model-selection-failed,probe-deadline',
+        unobservedModelCount: 2,
+      });
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 

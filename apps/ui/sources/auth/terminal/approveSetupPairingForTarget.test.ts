@@ -13,12 +13,18 @@ import { createServerUrlComparableKey } from '@/sync/domains/server/url/serverUr
 
 const mocks = vi.hoisted(() => ({
     serverFetch: vi.fn(),
+    accountMode: vi.fn(),
+    accountProfile: vi.fn(),
     getCredentialsForServerUrl: vi.fn(),
 }));
 
 // Network boundary: `serverFetch` is the only outward write in the flow.
 vi.mock('@/sync/http/client', () => ({
-    serverFetch: mocks.serverFetch,
+    serverFetch: (path: string, init?: RequestInit, options?: unknown) => {
+        if (path.endsWith('/v1/account/encryption')) return mocks.accountMode(path, init, options);
+        if (path.includes('/v1/user/')) return mocks.accountProfile(path, init, options);
+        return mocks.serverFetch(path, init, options);
+    },
 }));
 
 // Secure-storage boundary. Everything else in the module (credential shape checks, key
@@ -46,6 +52,7 @@ const RELAY_URL = 'https://relay.example.test';
 const RELAY_KEY = createServerUrlComparableKey(RELAY_URL);
 const SERVER_ID = 'custom-2';
 const ACCOUNT_ID = 'acct_app';
+const APP_TOKEN = `header.${Buffer.from(JSON.stringify({ sub: ACCOUNT_ID })).toString('base64')}.signature`;
 const TASK_ID = 'task_1';
 const CLI_COMMAND = '/home/dev/happier-stack/apps/cli/bin/happier.mjs';
 
@@ -135,9 +142,12 @@ async function run(params: Readonly<{
 
 beforeEach(() => {
     mocks.serverFetch.mockReset();
+    mocks.accountMode.mockReset();
+    mocks.accountProfile.mockReset();
+    mocks.accountMode.mockResolvedValue(jsonResponse({ mode: 'plain', updatedAt: 1 }));
     mocks.getCredentialsForServerUrl.mockReset();
     mocks.getCredentialsForServerUrl.mockResolvedValue({
-        token: 'app-token',
+        token: APP_TOKEN,
         encryption: {
             publicKey: encodeBase64(new Uint8Array(32).fill(1)),
             machineKey: encodeBase64(contentPrivateKey),
@@ -146,6 +156,63 @@ beforeEach(() => {
 });
 
 describe('approveSetupPairingForTarget refusals (INV2)', () => {
+    it.each([9, 11])('checks retained same-Account data-key custody against the first published E2EE key (%s)', async (currentKeyByte) => {
+        const signing = tweetnacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(6));
+        const currentContent = tweetnacl.box.keyPair.fromSecretKey(new Uint8Array(32).fill(currentKeyByte)).publicKey;
+        const prefix = new TextEncoder().encode('Happy content key v1\u0000');
+        const binding = new Uint8Array(prefix.length + currentContent.length);
+        binding.set(prefix); binding.set(currentContent, prefix.length);
+        mocks.serverFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+            if (path.endsWith('/v1/account/encryption')) return jsonResponse({ mode: 'e2ee', updatedAt: 1 });
+            if (path.endsWith(`/v1/user/${ACCOUNT_ID}`)) return jsonResponse({ user: {
+                id: ACCOUNT_ID, firstName: '', lastName: null, avatar: null, username: '', bio: null,
+                status: 'none', publicKey: Buffer.from(signing.publicKey).toString('hex'),
+                contentPublicKey: encodeBase64(currentContent),
+                contentPublicKeySig: encodeBase64(tweetnacl.sign.detached(binding, signing.secretKey)),
+            } });
+            if (path.includes('/v1/auth/request/status')) return jsonResponse({ status: 'pending', supportsV2: true });
+            if (path.endsWith('/v1/auth/response') && init?.method === 'POST') return jsonResponse({ success: true });
+            throw new Error(`Unexpected request ${path}`);
+        });
+        mocks.accountMode.mockImplementation((...args) => mocks.serverFetch(...args));
+        mocks.accountProfile.mockImplementation((...args) => mocks.serverFetch(...args));
+        const { outcome, answers } = await run({});
+        if (currentKeyByte === 11) {
+            expect(outcome).toEqual({ approved: false, reason: 'credentials_unusable' });
+            expect(answers).toEqual([{ approved: false, reason: 'credentials_unusable' }]);
+            expect(mocks.serverFetch.mock.calls.some((call) => call[0].endsWith('/v1/auth/response'))).toBe(false);
+        } else {
+            expect(outcome).toEqual({ approved: true, result: 'approved' });
+            const posted = mocks.serverFetch.mock.calls.find((call) => call[0].endsWith('/v1/auth/response'));
+            if (!posted) throw new Error('Missing pairing response');
+            const body = JSON.parse(String(posted[1]?.body));
+            expect(openTerminalProvisioningV2Payload({ payload: decodeBase64(body.response), recipientSecretKeyOrSeed: terminalSecretKey })).toEqual(contentPrivateKey);
+        }
+    });
+
+    it.each([
+        { token: `header.${Buffer.from(JSON.stringify({ sub: 'acct_after_sign_in' })).toString('base64')}.signature`, reason: 'account_mismatch' },
+        { token: 'unusable-token', reason: 'credentials_unusable' },
+    ] as const)('refuses retained pairing when the current target credentials cannot bind the original account: $reason', async ({ token, reason }) => {
+        // The delayed prompt still names the original account; the secure-storage read now
+        // returns credentials replaced by a later sign-in on this same relay profile.
+        mocks.getCredentialsForServerUrl.mockResolvedValue({
+            token,
+            encryption: {
+                publicKey: encodeBase64(new Uint8Array(32).fill(1)),
+                machineKey: encodeBase64(new Uint8Array(32).fill(12)),
+            },
+        });
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ status: 'pending', supportsV2: true }));
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+        const { outcome, answers } = await run({});
+
+        expect(outcome).toEqual({ approved: false, reason });
+        expect(answers).toEqual([{ approved: false, reason }]);
+        expect(mocks.serverFetch).not.toHaveBeenCalled();
+    });
+
     it('refuses when the prompt relay differs from the relay the app sent', async () => {
         const { outcome, answers } = await run({
             event: buildPromptEvent({ relayUrl: 'https://other.example.test' }),
@@ -270,7 +337,7 @@ describe('approveSetupPairingForTarget approval (R4)', () => {
 
         // The posted payload is a real v2 envelope the terminal can open with its ephemeral key.
         const init = responseCall?.[1] as RequestInit | undefined;
-        expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer app-token');
+        expect(new Headers(init?.headers).get('Authorization')).toBe(`Bearer ${APP_TOKEN}`);
         const body = JSON.parse(String(init?.body)) as { publicKey: string; response: string };
         expect(body.publicKey).toBe(encodeBase64(terminalPublicKey));
         const opened = openTerminalProvisioningV2Payload({
@@ -319,7 +386,7 @@ describe('approveSetupPairingForTarget approval (R4)', () => {
             for (const key of Object.keys(answer)) {
                 expect(key).not.toMatch(SENSITIVE_KEY_PATTERN);
             }
-            expect(JSON.stringify(answer)).not.toContain('app-token');
+            expect(JSON.stringify(answer)).not.toContain(APP_TOKEN);
         }
     });
 });

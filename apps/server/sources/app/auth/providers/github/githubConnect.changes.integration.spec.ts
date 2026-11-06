@@ -1,9 +1,18 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { db } from "@/storage/db";
+import { Context } from "@/context";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
 
+import type { GitHubProfile } from "./types";
 import { githubConnect } from "./githubConnect";
+
+const allowlistedProfile = {
+    id: 123,
+    login: "octocat",
+    name: "Octo Cat",
+    avatar_url: "",
+} satisfies GitHubProfile;
 
 describe("githubConnect (AccountChange integration)", () => {
     let harness: LightSqliteHarness;
@@ -93,5 +102,62 @@ describe("githubConnect (AccountChange integration)", () => {
 
         const updated = await db.account.findUnique({ where: { id: account.id }, select: { username: true } });
         expect(updated?.username).toBe("octocat");
+    });
+
+    it("allows a listed GitHub username to connect its identity", async () => {
+        harness.resetEnv({ AUTH_GITHUB_ALLOWED_USERS: "OctoCat" });
+        const account = await db.account.create({
+            data: { publicKey: "pk-gh-allowlisted-u1" },
+            select: { id: true },
+        });
+
+        await githubConnect(
+            Context.create(account.id),
+            allowlistedProfile,
+            "token",
+        );
+
+        const identity = await db.accountIdentity.findFirst({
+            where: { accountId: account.id, provider: "github" },
+            select: { providerUserId: true },
+        });
+        expect(identity).toEqual({ providerUserId: "123" });
+    });
+
+    it("rejects a GitHub username outside the configured allowlist before linking", async () => {
+        harness.resetEnv({ AUTH_GITHUB_ALLOWED_USERS: "someone-else" });
+        const account = await db.account.create({
+            data: { publicKey: "pk-gh-denied-u1" },
+            select: { id: true },
+        });
+
+        await expect(githubConnect(
+            Context.create(account.id),
+            allowlistedProfile,
+            "token",
+        )).rejects.toThrow("not-eligible");
+
+        const identities = await db.accountIdentity.findMany({ where: { accountId: account.id } });
+        expect(identities).toEqual([]);
+    });
+
+    it("keeps GitHub identity connection open when the allowlist is empty", async () => {
+        harness.resetEnv({ AUTH_GITHUB_ALLOWED_USERS: "" });
+        const account = await db.account.create({
+            data: { publicKey: "pk-gh-empty-allowlist-u1" },
+            select: { id: true },
+        });
+
+        await githubConnect(
+            Context.create(account.id),
+            allowlistedProfile,
+            "token",
+        );
+
+        const identity = await db.accountIdentity.findFirst({
+            where: { accountId: account.id, provider: "github" },
+            select: { providerUserId: true },
+        });
+        expect(identity).toEqual({ providerUserId: "123" });
     });
 });

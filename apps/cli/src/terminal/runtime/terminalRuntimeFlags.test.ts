@@ -2,12 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { parseAndStripTerminalRuntimeFlags } from './terminalRuntimeFlags';
 
 describe('parseAndStripTerminalRuntimeFlags', () => {
+  it('preserves literal text after the option terminator while extracting preceding runtime flags', () => {
+    const literal = ['--', '--happy-terminal-mode', 'tmux', '--happy-terminal-title', 'literal title'];
+    expect(parseAndStripTerminalRuntimeFlags([
+      'session', 'send', 'session-id', '--happy-terminal-mode', 'plain', ...literal,
+    ])).toEqual({ terminal: { mode: 'plain' }, argv: ['session', 'send', 'session-id', ...literal] });
+  });
+
   it('preserves Herdr and Zellij host selections for daemon-started runners', () => {
     expect(parseAndStripTerminalRuntimeFlags([
       'codex', '--happy-terminal-mode', 'herdr', '--happy-terminal-requested', 'herdr',
       '--happy-herdr-session-name', 'work terminals',
+      '--happy-herdr-socket-path', '/tmp/selected-herdr.sock',
     ])).toEqual({
-      terminal: { mode: 'herdr', requested: 'herdr', herdrSessionName: 'work terminals' },
+      terminal: { mode: 'herdr', requested: 'herdr', herdrSessionName: 'work terminals', herdrSocketPath: '/tmp/selected-herdr.sock' },
       argv: ['codex'],
     });
     expect(parseAndStripTerminalRuntimeFlags([
