@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createSessionModeOverrideSynchronizer } from './sessionModeOverrideSync';
+import { SessionControlApplyError } from './sessionControlApplyError';
 import { logger } from '@/ui/logger';
 import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 
@@ -224,5 +225,164 @@ describe('createSessionModeOverrideSynchronizer', () => {
 
     resolveFirst();
     await flushPromise;
+  });
+
+  it('backs off repeated failures of the same override instead of retrying on every sync', async () => {
+    let clock = 1_000_000;
+    const setSessionMode = vi.fn(async (_modeId: string) => {
+      throw new Error('transient failure');
+    });
+    const sync = createSessionModeOverrideSynchronizer({
+      session: {
+        getMetadataSnapshot: () => ({ sessionModeOverrideV1: { v: 1, updatedAt: 61, modeId: 'autopilot' } } as any),
+      },
+      runtime: { setSessionMode },
+      isStarted: () => true,
+      autoApplyFromMetadata: false,
+      now: () => clock,
+    });
+    const syncAndFlush = async (): Promise<boolean> => {
+      sync.syncFromMetadata();
+      return await sync.flushPendingAfterStartWithOutcome();
+    };
+
+    // The first retry is immediate; the backoff starts once the retry fails as well.
+    expect(await syncAndFlush()).toBe(false);
+    expect(await syncAndFlush()).toBe(false);
+    expect(setSessionMode).toHaveBeenCalledTimes(2);
+
+    // A burst of metadata wakes inside the backoff window makes no provider call.
+    for (let i = 0; i < 50; i += 1) expect(await syncAndFlush()).toBe(false);
+    expect(setSessionMode).toHaveBeenCalledTimes(2);
+
+    clock += 1_000;
+    await syncAndFlush();
+    expect(setSessionMode).toHaveBeenCalledTimes(3);
+
+    // The window doubles after each failure.
+    clock += 1_999;
+    await syncAndFlush();
+    expect(setSessionMode).toHaveBeenCalledTimes(3);
+    clock += 1;
+    await syncAndFlush();
+    expect(setSessionMode).toHaveBeenCalledTimes(4);
+
+    // The window never exceeds one minute.
+    for (let i = 0; i < 10; i += 1) {
+      clock += 60_000;
+      await syncAndFlush();
+    }
+    expect(setSessionMode).toHaveBeenCalledTimes(14);
+  });
+
+  it('applies a newer override at once even while an older one is backing off', async () => {
+    let clock = 1_000_000;
+    let metadata: any = { sessionModeOverrideV1: { v: 1, updatedAt: 91, modeId: 'autopilot' } };
+    const setSessionMode = vi.fn(async (modeId: string) => {
+      if (modeId === 'autopilot') throw new Error('transient failure');
+    });
+    const sync = createSessionModeOverrideSynchronizer({
+      session: { getMetadataSnapshot: () => metadata },
+      runtime: { setSessionMode },
+      isStarted: () => true,
+      autoApplyFromMetadata: false,
+      now: () => clock,
+    });
+
+    sync.syncFromMetadata();
+    await sync.flushPendingAfterStart();
+    sync.syncFromMetadata();
+    await sync.flushPendingAfterStart();
+    metadata = { sessionModeOverrideV1: { v: 1, updatedAt: 92, modeId: 'plan' } };
+    sync.syncFromMetadata();
+
+    expect(await sync.flushPendingAfterStartWithOutcome()).toBe(true);
+    expect(setSessionMode).toHaveBeenLastCalledWith('plan');
+  });
+
+  it('stops retrying a definitively rejected override and clears it from metadata', async () => {
+    vi.spyOn(logger, 'infoFile');
+    let metadata: any = { sessionModeOverrideV1: { v: 1, updatedAt: 71, modeId: 'autopilot' } };
+    let cleanupAttempts = 0;
+    const setSessionMode = vi.fn(async (_modeId: string) => {
+      throw SessionControlApplyError.definitive(new Error('rejected'));
+    });
+    const sync = createSessionModeOverrideSynchronizer({
+      session: {
+        getMetadataSnapshot: () => metadata,
+        updateMetadata: async (updater) => {
+          cleanupAttempts += 1;
+          if (cleanupAttempts === 1) throw new Error('offline');
+          metadata = updater(metadata);
+        },
+      },
+      runtime: { setSessionMode },
+      isStarted: () => true,
+    });
+
+    sync.syncFromMetadata();
+    expect(await sync.flushPendingAfterStartWithOutcome()).toBe(false);
+    sync.syncFromMetadata();
+    expect(await sync.flushPendingAfterStartWithOutcome()).toBe(true);
+    sync.syncFromMetadata();
+    await sync.flushPendingAfterStart();
+
+    expect(setSessionMode).toHaveBeenCalledTimes(1);
+    expect(cleanupAttempts).toBe(2);
+    expect(metadata.sessionModeOverrideV1).toEqual({ v: 1, updatedAt: 72, modeId: null });
+    expect(logger.infoFile).toHaveBeenCalledTimes(1);
+    expect(logger.infoFile).toHaveBeenCalledWith(
+      '[SessionModeOverrideSync] Provider rejected session mode override; not retrying',
+      { updatedAt: 71, attempt: 1 },
+    );
+  });
+
+  it('settles a definitively rejected clear without writing another clear', async () => {
+    const metadata: any = { sessionModeOverrideV1: { v: 1, updatedAt: 101, modeId: null } };
+    const updateMetadata = vi.fn(async () => {});
+    const clearSessionModeOverride = vi.fn(async () => {
+      throw SessionControlApplyError.definitive(new Error('rejected'));
+    });
+    const sync = createSessionModeOverrideSynchronizer({
+      session: { getMetadataSnapshot: () => metadata, updateMetadata },
+      runtime: { setSessionMode: vi.fn(async () => {}), clearSessionModeOverride },
+      isStarted: () => true,
+      autoApplyFromMetadata: false,
+    });
+
+    for (let i = 0; i < 5; i += 1) {
+      sync.syncFromMetadata();
+      await sync.flushPendingAfterStart();
+    }
+
+    expect(clearSessionModeOverride).toHaveBeenCalledTimes(1);
+    expect(updateMetadata).not.toHaveBeenCalled();
+  });
+
+  it('does not clear a newer mode choice after an older rejection settles', async () => {
+    let metadata: any = { sessionModeOverrideV1: { v: 1, updatedAt: 81, modeId: 'autopilot' } };
+    let reject!: (error: unknown) => void;
+    const applying = new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise; });
+    const setSessionMode = vi.fn()
+      .mockImplementationOnce(() => applying)
+      .mockResolvedValue(undefined);
+    const sync = createSessionModeOverrideSynchronizer({
+      session: {
+        getMetadataSnapshot: () => metadata,
+        updateMetadata: async (updater) => { metadata = updater(metadata); },
+      },
+      runtime: { setSessionMode },
+      isStarted: () => true,
+    });
+
+    sync.syncFromMetadata();
+    metadata = { sessionModeOverrideV1: { v: 1, updatedAt: 82, modeId: 'plan' } };
+    sync.syncFromMetadata();
+    reject(SessionControlApplyError.definitive(new Error('rejected')));
+    await sync.flushPendingAfterStart();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(metadata.sessionModeOverrideV1).toEqual({ v: 1, updatedAt: 82, modeId: 'plan' });
+    expect(setSessionMode).toHaveBeenLastCalledWith('plan');
   });
 });
