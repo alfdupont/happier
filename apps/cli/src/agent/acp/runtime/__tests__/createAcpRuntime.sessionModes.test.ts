@@ -636,4 +636,124 @@ describe('createAcpRuntime (session modes)', () => {
 
     await expect(runtime.setSessionMode('plan')).rejects.toThrow(/ACP session was not started/);
   });
+
+  describe('runtime metadata publication queueing', () => {
+    const codeAndPlan = [
+      { id: 'code', name: 'Code' },
+      { id: 'plan', name: 'Plan' },
+    ];
+    const publishedModes = (currentModeId: string) => {
+      const modes = { v: 1 as const, provider: 'codex', updatedAt: 1, currentModeId, availableModes: codeAndPlan };
+      return { sessionModesV1: modes, acpSessionModesV1: { ...modes } };
+    };
+
+    // Session boundary that queues writes like the real client's metadata lock: a write's
+    // handler only runs when the test drains it.
+    function createQueuedMetadataSession(initial: Metadata) {
+      let metadata = initial;
+      const queue: Array<{ handler: (current: Metadata) => Metadata; resolve: () => void; reject: (error: unknown) => void }> = [];
+      let writes = 0;
+      const session = createBasicSessionClientWithOverrides({
+        getMetadataSnapshot: () => metadata,
+        updateMetadata: (handler) => new Promise<void>((resolve, reject) => {
+          queue.push({ handler, resolve, reject });
+        }),
+      });
+      const drain = async () => {
+        while (queue.length > 0) {
+          const write = queue.shift()!;
+          metadata = write.handler(metadata);
+          writes += 1;
+          write.resolve();
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      };
+      return { session, queue, drain, getMetadata: () => metadata, getWrites: () => writes };
+    }
+
+    async function startRuntime(session: ReturnType<typeof createQueuedMetadataSession>['session']) {
+      const backend = createFakeAcpRuntimeBackend();
+      const runtime = createAcpRuntime({
+        provider: 'codex',
+        directory: '/tmp',
+        session,
+        messageBuffer: new MessageBuffer(),
+        mcpServers: {},
+        permissionHandler: createApprovedPermissionHandler(),
+        onThinkingChange: () => {},
+        ensureBackend: async () => backend,
+      });
+      await runtime.startOrLoad({ resumeId: null });
+      const emitMode = (currentModeId: string) => backend.emit({ type: 'event', name: 'current_mode_update', payload: { currentModeId } });
+      return { runtime, backend, emitMode };
+    }
+
+    it('coalesces a replayed burst of mode updates into a single metadata write', async () => {
+      const queued = createQueuedMetadataSession(createTestMetadata(publishedModes('code')));
+      const { emitMode } = await startRuntime(queued.session);
+
+      for (let i = 0; i < 10_000; i += 1) emitMode(i % 2 === 0 ? 'plan' : 'code');
+      emitMode('plan');
+
+      expect(queued.queue).toHaveLength(1);
+      await queued.drain();
+      expect(queued.getWrites()).toBe(1);
+      expect(queued.getMetadata().sessionModesV1).toMatchObject({ currentModeId: 'plan', availableModes: codeAndPlan });
+      expect(queued.getMetadata().acpSessionModesV1).toMatchObject({ currentModeId: 'plan', availableModes: codeAndPlan });
+    });
+
+    it('does not write when the provider repeats the published modes', async () => {
+      const queued = createQueuedMetadataSession(createTestMetadata(publishedModes('plan')));
+      const { backend, emitMode } = await startRuntime(queued.session);
+
+      for (let i = 0; i < 100; i += 1) emitMode('plan');
+      backend.emit({
+        type: 'event',
+        name: 'session_modes_state',
+        payload: { currentModeId: 'plan', availableModes: codeAndPlan },
+      });
+
+      expect(queued.queue).toHaveLength(0);
+      expect(queued.getMetadata().sessionModesV1?.updatedAt).toBe(1);
+    });
+
+    it('still publishes a changed mode list with the same current mode', async () => {
+      const queued = createQueuedMetadataSession(createTestMetadata(publishedModes('plan')));
+      const { backend } = await startRuntime(queued.session);
+      const withAsk = [...codeAndPlan, { id: 'ask', name: 'Ask' }];
+
+      backend.emit({ type: 'event', name: 'session_modes_state', payload: { currentModeId: 'plan', availableModes: withAsk } });
+      await queued.drain();
+
+      expect(queued.getMetadata().sessionModesV1).toMatchObject({ currentModeId: 'plan', availableModes: withAsk });
+    });
+
+    it('starts a new write when a queued write fails before running', async () => {
+      const queued = createQueuedMetadataSession(createTestMetadata(publishedModes('code')));
+      const { emitMode } = await startRuntime(queued.session);
+
+      emitMode('plan');
+      queued.queue.shift()!.reject(new Error('socket offline'));
+      await new Promise((r) => setTimeout(r, 0));
+      emitMode('plan');
+
+      expect(queued.queue).toHaveLength(1);
+      await queued.drain();
+      expect(queued.getMetadata().sessionModesV1).toMatchObject({ currentModeId: 'plan' });
+    });
+
+    it('does not join a new lifecycle publication to a write queued before reset', async () => {
+      const queued = createQueuedMetadataSession(createTestMetadata(publishedModes('code')));
+      const { runtime, emitMode } = await startRuntime(queued.session);
+
+      emitMode('plan');
+      await runtime.reset();
+      await runtime.startOrLoad({ resumeId: null });
+      emitMode('plan');
+
+      expect(queued.queue).toHaveLength(2);
+      await queued.drain();
+      expect(queued.getMetadata().sessionModesV1).toMatchObject({ currentModeId: 'plan' });
+    });
+  });
 });

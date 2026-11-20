@@ -467,6 +467,10 @@ export async function abortAcpRuntimeTurnIfNeeded(
   return true;
 }
 
+type RuntimeMetadataPublication = {
+  readonly updaters: Array<Readonly<{ generation: number; updater: (metadata: Metadata) => Metadata }>>;
+};
+
 /** Own transcript publication and turn settlement for both host prompts and provider-initiated continuations. */
 export function createAcpRuntime(params: {
   provider: string;
@@ -594,6 +598,10 @@ export function createAcpRuntime(params: {
   let stopObservingProviderTurnEvents: (() => void) | null = null;
   let sessionId: string | null = null;
   let runtimeMetadataPublicationGeneration = 0;
+  // Runtime metadata publications that wait in the session write queue together. While one is
+  // queued, later publications join it instead of queueing another full-metadata write, so a
+  // burst of provider notifications (a resumed session replays its whole history) costs one write.
+  let pendingRuntimeMetadataPublication: RuntimeMetadataPublication | null = null;
   let pendingProviderSessionInfo: Readonly<{
     update: { title?: string | null; updatedAt?: string | null };
     observedAt: number;
@@ -1497,15 +1505,47 @@ export function createAcpRuntime(params: {
     updater: (metadata: Metadata) => Metadata,
     reason: string,
   ): void => {
-    const publicationGeneration = runtimeMetadataPublicationGeneration;
-    updateMetadataBestEffort(
+    const entry = { generation: runtimeMetadataPublicationGeneration, updater };
+    const queued = pendingRuntimeMetadataPublication;
+    if (queued) {
+      queued.updaters.push(entry);
+      return;
+    }
+    // Nothing queued: skip a write that would not change the metadata this client already has.
+    const snapshot = params.session.getMetadataSnapshot?.() ?? null;
+    if (snapshot && updater(snapshot) === snapshot) return;
+
+    const publication: RuntimeMetadataPublication = { updaters: [entry] };
+    pendingRuntimeMetadataPublication = publication;
+    const release = () => {
+      if (pendingRuntimeMetadataPublication === publication) pendingRuntimeMetadataPublication = null;
+    };
+    void updateMetadataBestEffort(
       params.session,
-      (metadata) => publicationGeneration === runtimeMetadataPublicationGeneration
-        ? updater(metadata)
-        : metadata,
+      (metadata) => {
+        // From here on the write is in flight; later publications start the next write.
+        release();
+        let next = metadata;
+        for (const { generation, updater: apply } of publication.updaters) {
+          if (generation === runtimeMetadataPublicationGeneration) next = apply(next);
+        }
+        return next;
+      },
       `[${params.provider}]`,
       reason,
-    );
+    ).finally(release);
+  };
+
+  const isPublishedSessionModesCurrent = (
+    metadata: Metadata,
+    currentModeId: string,
+    availableModes?: ReadonlyArray<unknown>,
+  ): boolean => {
+    const published = metadata.sessionModesV1;
+    return published?.provider === params.provider
+      && published.currentModeId === currentModeId
+      && (availableModes === undefined || isDeepStrictEqual(published.availableModes, availableModes))
+      && isDeepStrictEqual(metadata.acpSessionModesV1, published);
   };
 
   const publishProviderSessionInfo = (
@@ -1946,6 +1986,7 @@ export function createAcpRuntime(params: {
               if (currentModeId && availableModes.length > 0) {
                 publishRuntimeMetadataBestEffort(
                   (metadata) => {
+                    if (isPublishedSessionModesCurrent(metadata, currentModeId, availableModes)) return metadata;
                     const sessionModes = {
                       v: 1 as const,
                       provider: params.provider,
@@ -2101,6 +2142,7 @@ export function createAcpRuntime(params: {
               if (currentModeId) {
                 publishRuntimeMetadataBestEffort(
                   (metadata) => {
+                    if (isPublishedSessionModesCurrent(metadata, currentModeId)) return metadata;
                     const prev = metadata.sessionModesV1 ?? metadata.acpSessionModesV1;
                     const availableModes = Array.isArray(prev?.availableModes) ? prev.availableModes : [];
                     const sessionModes = {
@@ -2530,6 +2572,7 @@ export function createAcpRuntime(params: {
         runtimeGeneration += 1;
         hostCallerTurn = null;
         runtimeMetadataPublicationGeneration += 1;
+        pendingRuntimeMetadataPublication = null;
         const identityReset = identityBinding.reset();
         startupDrainController?.abort('acp-runtime:generation-reset');
         postStartDrainController?.abort('acp-runtime:generation-reset');

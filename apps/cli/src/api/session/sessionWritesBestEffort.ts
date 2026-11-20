@@ -34,13 +34,14 @@ export function updateMetadataBestEffort(
   updater: (metadata: Metadata) => Metadata,
   logPrefix: string,
   reason: string,
-): void {
+): Promise<void> {
   try {
     const result = session.updateMetadata(updater);
-    void Promise.resolve(result).catch((error) => {
+    return Promise.resolve(result).catch((error) => {
       logBestEffortWriteFailure(`${logPrefix} Failed to update session metadata (${reason}) (non-fatal)`, error);
     });
   } catch (error) {
     logBestEffortWriteFailure(`${logPrefix} Failed to update session metadata (${reason}) (non-fatal)`, error);
+    return Promise.resolve();
   }
 }
