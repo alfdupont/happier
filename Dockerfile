@@ -5,6 +5,10 @@ ARG BUILDPLATFORM
 
 # Shared deps (alpine) for website/docs/webapp builds
 FROM node:${NODE_VERSION}-alpine AS deps-alpine
+# onnxruntime-node downloads CUDA binaries from GitHub on linux/x64 during install;
+# the images run on CPU, and that download source now returns 404. The CPU binaries
+# ship in the npm package, so skip the CUDA download.
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 WORKDIR /repo
 # Some workspace deps (e.g. node-pty) may not have prebuilt binaries for all architectures
 # and will fall back to node-gyp. Install the minimal toolchain + Python for reliable builds.
@@ -45,6 +49,10 @@ COPY packages/cli-common/workspaceBundleLock.mjs packages/cli-common/workspaceLo
 # We build the web export on the BUILDPLATFORM because the output is architecture-agnostic, and
 # running Node/Yarn under QEMU for linux/arm64 has proven unstable (SIGILL).
 FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine AS deps-alpine-build
+# onnxruntime-node downloads CUDA binaries from GitHub on linux/x64 during install;
+# the images run on CPU, and that download source now returns 404. The CPU binaries
+# ship in the npm package, so skip the CUDA download.
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 WORKDIR /repo
 RUN apk add --no-cache libc6-compat python3 build-base
 ENV REDISMS_DISABLE_POSTINSTALL=1
@@ -81,6 +89,10 @@ COPY packages/cli-common/workspaceBundleLock.mjs packages/cli-common/workspaceLo
 
 # Shared deps (debian) for server builds (needs toolchain for native deps)
 FROM node:${NODE_VERSION} AS deps-debian
+# onnxruntime-node downloads CUDA binaries from GitHub on linux/x64 during install;
+# the images run on CPU, and that download source now returns 404. The CPU binaries
+# ship in the npm package, so skip the CUDA download.
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 RUN apt-get update && apt-get install -y python3 ffmpeg make g++ build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 ENV REDISMS_DISABLE_POSTINSTALL=1
