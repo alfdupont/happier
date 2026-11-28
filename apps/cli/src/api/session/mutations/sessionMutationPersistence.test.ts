@@ -1,9 +1,16 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Fault injection stays at the filesystem boundary; other operations use real files.
+vi.mock('node:fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs/promises')>();
+    return { ...actual, readFile: vi.fn(actual.readFile) };
+});
 
 let tempHomeDir: string | null = null;
 const originalHappyHomeDir = process.env.HAPPIER_HOME_DIR;
@@ -39,6 +46,27 @@ async function readDeadLetterEntries(sessionId: string): Promise<unknown[]> {
 }
 
 describe('session mutation persistence', () => {
+    it('preserves a valid terminal core when the supplied failure issue is unusable, but rejects malformed terminal fields', async () => {
+        const { parseQueuedSessionMutation } = await import('./sessionMutationPersistence');
+        const payload = {
+            v: 1, sessionId: 's1', mutationId: 'failure-1', action: 'fail', turnId: 'turn-1',
+            observedAt: 1_000, issue: { source: 'invalid' },
+        };
+        const queued = { kind: 'session_turn', mutationId: 'failure-1', payload, createdAt: 1_000, attempts: 0, nextAttemptAt: 0 };
+        expect(parseQueuedSessionMutation(queued, 's1')).toEqual({
+            ok: true,
+            mutation: expect.objectContaining({ payload: expect.objectContaining({
+                action: 'fail', turnId: 'turn-1',
+                issue: expect.objectContaining({ code: 'provider_turn_failed', source: 'unknown', occurredAt: 1_000 }),
+            }) }),
+        });
+        for (const malformed of [{ ...payload, turnId: '' }, { ...payload, observedAt: 'invalid' }, { ...payload, unexpected: true }]) {
+            expect(parseQueuedSessionMutation({ ...queued, payload: malformed }, 's1')).toMatchObject({
+                ok: false, deadLetter: { reason: 'invalid_session_turn_payload' },
+            });
+        }
+    });
+
     it.each(['encrypted', 'installation_encrypted_v1'] as const)('readmits a %s settlement quarantined by the released CLI v0.2.15 reader', async (format) => {
         const { loadSessionMutationOutbox, recoverAuthoritativeSessionMutationDeadLetters } = await import('./sessionMutationPersistence');
         const context = await createRuntimePersistenceContext('rollback-settlement');
@@ -407,7 +435,49 @@ describe('session mutation persistence', () => {
         ]);
     });
 
-    it('quarantines unreadable outbox JSON instead of silently dropping it', async () => {
+    it.each(['runtime', 'daemon-terminal'] as const)('propagates %s journal read errors without quarantine', async (custody) => {
+        const persistence = await import('./sessionMutationPersistence');
+        const { configuration } = await import('@/configuration');
+        const context = persistence.createSessionMutationPersistenceContext({
+            activeServerDir: configuration.activeServerDir, custody, sessionId: 's-read-failure',
+            parseQueuedMutation: custody === 'runtime'
+                ? persistence.parseQueuedSessionMutation
+                : persistence.parseDaemonTerminalQueuedSessionMutation,
+        });
+        const readError = Object.assign(new Error('cannot read journal'), { code: 'EPERM' });
+        const readSpy = vi.spyOn(fsPromises, 'readFile').mockRejectedValueOnce(readError);
+        const onQuarantined = vi.fn();
+        try {
+            await expect(persistence.loadSessionMutationOutbox(context, onQuarantined)).rejects.toBe(readError);
+            expect(onQuarantined).not.toHaveBeenCalled();
+            await expect(readFile(context.paths.deadLetterPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+        } finally {
+            readSpy.mockRestore();
+        }
+    });
+
+    it('preserves existing dead letters when their read fails during append', async () => {
+        const { appendSessionMutationDeadLetters } = await import('./sessionMutationPersistence');
+        const context = await createRuntimePersistenceContext('s-dead-letter-read');
+        const entry = {
+            v: 1 as const, kind: 'outbox_file' as const, sessionId: context.sessionId,
+            reason: 'invalid_outbox_json', deadLetteredAt: 1, recoveryPayload: '{broken',
+        };
+        await appendSessionMutationDeadLetters(context, [entry]);
+        const originalBytes = await readFile(context.paths.deadLetterPath, 'utf8');
+        const readError = Object.assign(new Error('cannot read recovery entries'), { code: 'EMFILE' });
+        const readSpy = vi.spyOn(fsPromises, 'readFile').mockRejectedValueOnce(readError);
+        try {
+            await expect(appendSessionMutationDeadLetters(context, [{ ...entry, deadLetteredAt: 2 }])).rejects.toBe(readError);
+            await expect(readFile(context.paths.deadLetterPath, 'utf8')).resolves.toBe(originalBytes);
+        } finally {
+            readSpy.mockRestore();
+        }
+        await appendSessionMutationDeadLetters(context, [{ ...entry, deadLetteredAt: 2 }]);
+        await expect(readDeadLetterEntries(context.sessionId)).resolves.toEqual([entry, { ...entry, deadLetteredAt: 2 }]);
+    });
+
+    it('quarantines malformed outbox JSON instead of silently dropping it', async () => {
         const { loadSessionMutationOutbox } = await import('./sessionMutationPersistence');
         const outboxPath = await resolveOutboxFilePath('s1');
         await mkdir(join(outboxPath, '..'), { recursive: true });

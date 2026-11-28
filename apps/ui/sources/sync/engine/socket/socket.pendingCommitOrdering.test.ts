@@ -9,7 +9,7 @@ import { registerSessionRealtimeTranscriptConsumer } from '@/sync/runtime/sessio
 import { Encryption } from '@/sync/encryption/encryption';
 import { upsertServerProfile } from '@/sync/domains/server/serverProfiles';
 import { fetchAndApplyPendingMessagesV2 } from '@/sync/engine/pending/pendingQueueV2';
-import { handleUpdateContainer } from './socket';
+import { handleUpdateContainer, retireSessionSocketState } from './socket';
 
 /**
  * The pending -> committed handover ACROSS THE SOCKET, which is where its two halves actually race.
@@ -63,6 +63,19 @@ function durableServerPendingRow(): PendingMessage {
         updatedAt: 1_000,
         source: 'server_pending',
         pendingDeliveryStatus: 'server_delivering',
+        text: 'hello',
+        rawRecord: { role: 'user', content: { type: 'text', text: 'hello' } },
+    } as PendingMessage;
+}
+
+function localOutboundPendingRow(): PendingMessage {
+    return {
+        id: LOCAL_ID,
+        localId: LOCAL_ID,
+        createdAt: 1_000,
+        updatedAt: 1_000,
+        source: 'local_outbound',
+        deliveryStatus: 'accepted',
         text: 'hello',
         rawRecord: { role: 'user', content: { type: 'text', text: 'hello' } },
     } as PendingMessage;
@@ -123,6 +136,7 @@ function buildBaseParams(overrides: Partial<Omit<HandleUpdateContainerParams, 'u
             initializeMachines: vi.fn(async () => {}),
         } as unknown as HandleUpdateContainerParams['encryption'],
         artifactDataKeys: new Map(),
+        retireSession: retireSessionSocketState,
         applySessions: vi.fn(),
         fetchSessions: vi.fn(),
         applyMessages: (sessionId: string, messages: any) => storage.getState().applyMessages(sessionId, messages),
@@ -201,7 +215,8 @@ describe('socket pending -> committed ordering', () => {
 
     it('does not retire the pending row before the committed twin it is the receipt for', async () => {
         const framesWithoutTheUtterance = armSession({ enabled: false, windowMs: 0 });
-        const params = buildBaseParams();
+        const onPendingQueueSettled = vi.fn();
+        const params = buildBaseParams({ onPendingQueueSettled });
 
         // The socket dispatches handlers without awaiting the previous one.
         const committing = handleUpdateContainer({
@@ -214,6 +229,7 @@ describe('socket pending -> committed ordering', () => {
         expect(framesWithoutTheUtterance).toEqual([]);
         expect(storage.getState().sessionPending[SESSION_ID]?.messages ?? []).toHaveLength(0);
         expect(carriesTheUtterance(storage.getState())).toBe(true);
+        expect(onPendingQueueSettled).not.toHaveBeenCalled();
     });
 
     it('materializes messages queued in the apply coalescer before retiring the pending rows', async () => {
@@ -350,5 +366,18 @@ describe('socket pending -> committed ordering', () => {
         await handleUpdateContainer({ ...params, updateData: buildEmptyQueueUpdate(2) });
 
         expect(storage.getState().sessionPending[SESSION_ID]?.messages ?? []).toHaveLength(0);
+    });
+
+    it('requests transcript reconciliation when an empty queue receipt leaves a local projection without its committed twin', async () => {
+        armSession({ enabled: false, windowMs: 0 });
+        storage.getState().removePendingMessage(SESSION_ID, LOCAL_ID);
+        storage.getState().upsertPendingMessage(SESSION_ID, localOutboundPendingRow());
+        const onPendingQueueSettled = vi.fn();
+        const params = buildBaseParams({ onPendingQueueSettled });
+
+        await handleUpdateContainer({ ...params, updateData: buildEmptyQueueUpdate(2) });
+
+        expect(onPendingQueueSettled).toHaveBeenCalledWith(SESSION_ID);
+        expect(storage.getState().sessionPending[SESSION_ID]?.messages ?? []).toHaveLength(1);
     });
 });

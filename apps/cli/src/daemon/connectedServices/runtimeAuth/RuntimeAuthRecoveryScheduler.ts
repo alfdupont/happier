@@ -1,5 +1,10 @@
 import type { DaemonServerWorkErrorClassification, DaemonServerWorkErrorKind } from '@/daemon/serverWork/types';
 import { isDeepStrictEqual } from 'node:util';
+import { logger } from '@/ui/logger';
+import {
+  ConnectedServiceAuthGroupGenerationConflictError,
+  ConnectedServiceAuthGroupRuntimeStateRevisionConflictError,
+} from '@/api/connectedServices/connectedServiceCredentialApi';
 import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemonServerWorkError';
 import {
   DurableBackoffRecoveryScheduler,
@@ -717,6 +722,26 @@ function resolveRuntimeAuthRecoveryDisposition(input: Readonly<{
 }
 
 function classifyHandlerError(error: unknown): RetryDecision {
+  if (error && typeof error === 'object' && 'code' in error
+    && error.code === 'connected_service_continuation_turn_projection_pending') {
+    return {
+      retryable: true,
+      classification: { kind: 'dependency_unavailable', retryable: true },
+      failurePhase: 'handler',
+      failureReason: error.code,
+      lastError: error.code,
+    };
+  }
+  if (error instanceof ConnectedServiceAuthGroupRuntimeStateRevisionConflictError
+    || error instanceof ConnectedServiceAuthGroupGenerationConflictError) {
+    return {
+      retryable: true,
+      classification: { kind: 'dependency_unavailable', retryable: true },
+      failurePhase: 'handler',
+      failureReason: error.message,
+      lastError: error.message,
+    };
+  }
   if (error instanceof ConnectedServiceAuthGroupSwitchLeaseExpiredError) {
     return {
       retryable: true,
@@ -1421,9 +1446,17 @@ export class RuntimeAuthRecoveryScheduler {
             // additionally bounded by maxCoalescedReplays when the target profile
             // keeps changing under the same durable recovery.
             const coalescedReplayCount = intent.coalescedReplayCount ?? 0;
+            const untargetedProofRefresh = isUntargetedProviderOutcomeProofWaitRefresh({ intent, pendingTarget });
+            if (untargetedProofRefresh) {
+              logger.warnFile('[ConnectedServices] Local recovery repeated without a provider outcome producer proof', {
+                reason: 'untargeted_provider_outcome_proof_refresh', sessionId: intent.sessionId,
+                serviceId: intent.serviceId, groupId: intent.groupId, profileId: intent.profileId,
+                attemptId: intent.attemptId, attemptCount: intent.attemptCount,
+              });
+            }
             const rollbackAttempt = (awaitingContinuation && context.reason === 'manual')
               || (switchResultForHandoff?.status !== 'continuation_enqueued'
-                && (isUntargetedProviderOutcomeProofWaitRefresh({ intent, pendingTarget })
+                && (untargetedProofRefresh
                   || (coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays)));
             return {
               status: 'wait',

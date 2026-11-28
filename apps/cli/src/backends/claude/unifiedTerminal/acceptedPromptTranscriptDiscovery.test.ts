@@ -1266,6 +1266,47 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
     expect(completedPromptEvidenceIds).toEqual([acceptedPromptId]);
   });
 
+  it('settles /clear from the system stdout row Claude writes into the new transcript', () => {
+    const completedPromptEvidenceIds: string[] = [];
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+      acceptedPromptWindowMs: 5_000,
+      nowMs: () => 2_100,
+      onAttemptLocalCommandCompleted: ({ acceptedPromptId }) => {
+        completedPromptEvidenceIds.push(acceptedPromptId);
+      },
+    });
+    const acceptedPromptId = discovery.recordAcceptedPrompt({
+      message: '/clear',
+      acceptedAtMs: 2_000,
+      deliveryIdentity: { localIds: ['durable-clear'] },
+    });
+    // Row shapes captured from Claude Code 2.1.316: /clear fires no Stop hook, so this empty stdout is its only completion.
+    const commandRow = {
+      type: 'user',
+      uuid: 'clear-command',
+      timestamp: new Date(2_050).toISOString(),
+      message: {
+        role: 'user',
+        content: '<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>',
+      },
+    } satisfies RawJSONLines;
+    const stdoutRow = {
+      type: 'system',
+      subtype: 'local_command',
+      uuid: 'clear-stdout',
+      parentUuid: 'clear-command',
+      timestamp: new Date(2_060).toISOString(),
+      content: '<local-command-stdout></local-command-stdout>',
+    } as RawJSONLines;
+
+    expect(discovery.observeControlCommandTranscript(commandRow)).toBe(true);
+    const match = discovery.findMatchingTranscript([commandRow]);
+    expect(match).toEqual(expect.objectContaining({ acceptedPromptId }));
+    expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+    expect(discovery.findMatchingTranscript([stdoutRow])).toBeNull();
+    expect(completedPromptEvidenceIds).toEqual([acceptedPromptId]);
+  });
+
   it('keeps queued-command enqueue as custody and accepts only exact native main-chain consumption', () => {
     const prompt = 'Please continue the QA from the current checkpoint.';
     const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -1654,7 +1695,7 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
     } as unknown as RawJSONLines])).toBe(false);
   });
 
-  it('does not consume meta continuation transcript rows as provider-accepted input', () => {
+  it.each([{ isMeta: true }, { isSynthetic: true }])('does not consume provider-generated text as accepted input (%j)', provenance => {
     const prompt = GENERIC_CONTINUATION_RESUME_PROMPT;
     const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
       acceptedPromptWindowMs: 5_000,
@@ -1666,7 +1707,7 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
     expect(discovery.consumeMatchingTranscript([{
       type: 'user',
       uuid: 'meta-continuation-prompt',
-      isMeta: true,
+      ...provenance,
       timestamp: new Date(10_100).toISOString(),
       message: {
         role: 'user',

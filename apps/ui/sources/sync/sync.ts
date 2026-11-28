@@ -100,6 +100,8 @@ import {
 } from '@/sync/domains/session/organization';
 import { fetchAndApplySessionOrganizationSnapshot } from '@/sync/ops/sessionOrganization';
 import { createSessionListOrganizationSnapshotRequest } from '@/sync/engine/sessions/sessionListOrganizationSnapshotRequest';
+import { socketApplyFrame } from '@/sync/engine/sessions/socketApplyFrame';
+import { settleReceivedSessionMessages } from '@/sync/engine/sessions/sessionMessageMaterializationBarrier';
 import { ActivityUpdateAccumulator, type ActivityUpdateAccumulatorFlushOptions } from './reducer/activityUpdateAccumulator';
 import { MachineActivityAccumulator, type MachineActivityUpdate } from './reducer/machineActivityAccumulator';
 import { randomUUID } from '@/platform/randomUUID';
@@ -145,6 +147,7 @@ import {
     type ServerAccountScope,
 } from './domains/scope/serverAccountScope';
 import { getPendingQueueWakeResumeOptions } from './domains/pending/pendingQueueWake';
+import { hasUncommittedLocalOutboundProjection } from './store/domains/pending';
 import {
     areAccountSettingsScopesEqual,
     createAccountSettingsScope,
@@ -160,6 +163,7 @@ class PendingOutboxSessionNotHydratedError extends Error {}
 type ResolvedPendingQueueOwnerContext = Readonly<{
     outboxScope: ServerAccountScope;
     request: (path: string, init?: RequestInit) => Promise<Response>;
+    isCurrent: () => Promise<boolean>;
     enqueueEncryption: PendingQueueEncryption;
     readEncryption: PendingQueueReadEncryption;
 }>;
@@ -237,7 +241,7 @@ import { migratePendingTerminalConnectScopes } from './domains/pending/pendingTe
 import { migratePendingNotificationActionScopes } from './domains/pending/pendingNotificationAction';
 import { migratePendingNotificationNavScopes } from './domains/pending/pendingNotificationNav';
 import type { SettingsAnalyticsSource } from '@/track/settingsAnalytics/types';
-import { setActiveServerSessionListCache } from './store/sessionListCache';
+import { clearServerScopedEntries, setActiveServerSessionListCache } from './store/sessionListCache';
 import { config } from '@/config';
 import { log } from '@/log';
 import { t } from '@/text';
@@ -247,7 +251,6 @@ import { projectManager } from './runtime/orchestration/projectManager';
 import { clearMountedSessionRealtimeScmConsumerScopes } from './runtime/sessionRealtimeScmConsumers';
 import { voiceHooks } from '@/voice/context/voiceHooks';
 import { notifyActivityReady } from '@/activity/notifications/runtime/activityLocalNotificationBus';
-import { isBrowserNotificationDeliveryEnabled } from '@/activity/notifications/browserNotificationDelivery';
 import { Message } from './domains/messages/messageTypes';
 import { EncryptionCache } from './encryption/encryptionCache';
 import { nowServerMs } from './runtime/time';
@@ -380,7 +383,7 @@ import {
     resolveSessionRequestForServerAccountScope,
 } from '@/sync/runtime/orchestration/serverScopedRpc/createSessionRequestWithServerScope';
 import { resolveServerScopedSessionContext } from '@/sync/runtime/orchestration/serverScopedRpc/resolveServerScopedSessionContext';
-import { resolveScopedPendingSessionEncryption } from '@/sync/runtime/orchestration/serverScopedRpc/resolveScopedPendingSessionEncryption';
+import { prepareScopedPendingSessionEncryption } from '@/sync/runtime/orchestration/serverScopedRpc/resolveScopedPendingSessionEncryption';
 import { getServerFeaturesSnapshot } from '@/sync/api/capabilities/serverFeaturesClient';
 import { sessionRpcWithPreferredSessionScope } from '@/sync/runtime/orchestration/serverScopedRpc/sessionRpcWithPreferredSessionScope';
 import { sessionRpcWithServerAccountScope } from '@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc';
@@ -462,6 +465,7 @@ import {
     type SessionListFetchHydrationTelemetrySource,
 } from './engine/sessions/sessionListHydrationTelemetry';
 import { normalizeSessionListHydrationSessionIds } from './engine/sessions/sessionListHydrationPriority';
+import { isSessionListViewportRowDemanded, registerSessionListViewportDemand } from './domains/session/listing/sessionListViewportDemand';
 import {
     fetchUserMessageHistoryPage,
     USER_MESSAGE_HISTORY_REMOTE_PAGE_SIZE,
@@ -511,6 +515,7 @@ import {
     handleSocketUpdate,
     parseUpdateContainer,
     resetSocketSessionProjectionStateForServerScope,
+    retireSessionSocketState,
 } from './engine/socket/socket';
 import { actionOperationStore } from './domains/actionOperations/actionOperationStore';
 import { openActionOperationRevisionEphemeral } from './domains/actionOperations/actionOperationEphemeral';
@@ -602,7 +607,6 @@ export type SyncMessageTransport = Readonly<{
 type ReadyNotificationProgress = Readonly<{
     seq: number;
     transcriptNotified: boolean;
-    activityNotified: boolean;
 }>;
 
 function createDefaultMessageTransport(): SyncMessageTransport {
@@ -998,6 +1002,7 @@ class Sync {
     private sessionsSync: InvalidateSync;
     private fetchSessionsInFlight: { generation: number; promise: Promise<void> } | null = null;
     private fetchMoreSessionsInFlight: Promise<void> | null = null;
+    private sessionListViewportHydrationInFlight = new Set<string>();
     private sessionListNextCursor: string | null = null;
     private sessionListHasMore = false;
     private sessionListScrollActive = false;
@@ -1011,6 +1016,22 @@ class Sync {
     private activeServerSessionIds = new Set<string>();
     private hasFetchedSessionsSnapshotForActiveServer = false;
     private serverScopeGeneration = 0;
+    /** Which Account the store's retained per-Home data came from; see `admitAccountToActiveHome`. */
+    private retainedAccountIdByHomeId = new Map<string, string>();
+    private activePendingQueueOwnerContextBySession = new Map<string, {
+        snapshot: ReturnType<typeof getActiveServerSnapshot>;
+        credentials: AuthCredentials;
+        writeTimeoutMs: number;
+        context: ResolvedPendingQueueOwnerContext;
+    }>();
+    private scopedPendingQueueOwnerContextBySession = new Map<string, {
+        serverUrl: string;
+        credentialScopeKey: string;
+        writeTimeoutMs: number;
+        cryptoContext: Awaited<ReturnType<typeof prepareScopedPendingSessionEncryption>>['cryptoContext'] | null;
+        outboxScope: ServerAccountScope;
+        context: Promise<ResolvedPendingQueueOwnerContext>;
+    }>();
       private sessionByIdHydrationInFlight = new Map<string, Promise<EnsureSessionVisibleForRouteResult>>();
       private sessionReceivedMessages = new Map<string, Map<string, number>>();
       private sessionMessagesBeforeSeqByKey = new Map<string, number>();
@@ -1305,7 +1326,10 @@ class Sync {
             // first request is still running. Backoff sleeps occur outside the
             // permit because InvalidateSync invokes this wrapper per attempt.
             const limitSnapshotSyncAttempt = (command: () => Promise<void>) => (
-                () => this.snapshotSyncAttemptLimiter.run(command)
+                () => this.snapshotSyncAttemptLimiter.run(async () => {
+                    // Signed out: a queued refresh has no Account to read for.
+                    if (this.credentials) await command();
+                })
             );
 
             this.sessionsSync = new InvalidateSync(limitSnapshotSyncAttempt(async () => {
@@ -1350,7 +1374,7 @@ class Sync {
 
           // Listen for app state changes to pause sync + run a single centralized resume pipeline.
           AppState.addEventListener('change', (nextAppState) => {
-              if (nextAppState !== 'active' && this.keepsSyncConnectedWhileHidden()) {
+              if (this.usesPersistentDesktopSync && nextAppState !== 'active') {
                   this.clearNativeInactiveCheckpointTimer();
                   this.isForeground = true;
                   setServerReachabilityNetworkAllowed(true);
@@ -1396,9 +1420,6 @@ class Sync {
                       if (hardBoundary) {
                           this.userRequestLeases.clear();
                           this.deferredWebVisibilityTeardown = null;
-                      } else if (this.keepsSyncConnectedWhileHidden()) {
-                          // Page unload and freeze remain hard boundaries.
-                          return;
                       } else if (this.userRequestLeases.size > 0) {
                           this.deferredWebVisibilityTeardown = () => pauseForWebBackground(tag);
                           return;
@@ -1515,17 +1536,6 @@ class Sync {
                   }
               }
           }
-      }
-
-      /**
-       * Whether sync stays connected while the app or tab is hidden: always for the desktop app,
-       * and for a browser tab that shows notifications, since those are raised from live session
-       * events. react-native-web reports a hidden tab both as AppState 'background' and through
-       * the document visibility listener, so both pause paths consult this one rule.
-       */
-      private keepsSyncConnectedWhileHidden(): boolean {
-          return this.usesPersistentDesktopSync
-              || (Platform.OS === 'web' && isBrowserNotificationDeliveryEnabled());
       }
 
       public getSyncTuning(): SyncTuning {
@@ -1989,6 +1999,7 @@ class Sync {
         this.encryption = encryption;
         this.anonID = encryption.anonID;
         this.serverID = accountId;
+        this.admitAccountToActiveHome(accountId);
         setWarmCacheAccountScope(this.serverID);
         this.activateAccountSettingsScope(accountId);
         this.changesCursor = loadChangesCursor(this.getChangesCursorScope());
@@ -2026,6 +2037,7 @@ class Sync {
         this.encryption = encryption;
         this.anonID = encryption.anonID;
         this.serverID = accountId;
+        this.admitAccountToActiveHome(accountId);
         setWarmCacheAccountScope(this.serverID);
         this.activateAccountSettingsScope(accountId);
         this.changesCursor = loadChangesCursor(this.getChangesCursorScope());
@@ -2040,6 +2052,55 @@ class Sync {
         this.hydrateWarmCachesForActiveServer();
         this.syncJsThreadLagTelemetryRuntime();
         await this.#init();
+    }
+
+    /**
+     * Session rows, Machine lists and Session Organization stay in the store across a Home switch so
+     * that returning repaints at once, and their keys name the Home. Their content, and the
+     * organization version the snapshot guard compares, belong to one Account, so a different Account
+     * on that Home must not inherit them. A Home this process has not admitted yet counts as different:
+     * whatever it holds came from an unverified Account, and the warm cache repaints right after.
+     */
+    private admitAccountToActiveHome(accountId: string): void {
+        const homeId = String(getActiveServerSnapshot().serverId ?? '').trim();
+        if (!homeId) return;
+        let retainedAccountId: string | undefined;
+        for (const [knownHomeId, knownAccountId] of this.retainedAccountIdByHomeId) {
+            if (!areServerProfileIdentifiersEquivalent(knownHomeId, homeId)) continue;
+            retainedAccountId = knownAccountId;
+            this.retainedAccountIdByHomeId.delete(knownHomeId);
+        }
+        this.retainedAccountIdByHomeId.set(homeId, accountId);
+        if (retainedAccountId === accountId) return;
+
+        const state = storage.getState();
+        state.clearSessionOrganizationForServer(homeId);
+        for (const knownHomeId of Object.keys(state.sessionOrganizationSnapshotVersionByServerId)) {
+            if (knownHomeId !== homeId && areServerProfileIdentifiersEquivalent(knownHomeId, homeId)) {
+                state.clearSessionOrganizationForServer(knownHomeId);
+            }
+        }
+        storage.setState((current) => {
+            const sessionListViewDataByServerId = clearServerScopedEntries(current.sessionListViewDataByServerId, homeId);
+            const machineListByServerId = clearServerScopedEntries(current.machineListByServerId, homeId);
+            const machineListStatusByServerId = clearServerScopedEntries(current.machineListStatusByServerId, homeId);
+            if (sessionListViewDataByServerId === current.sessionListViewDataByServerId
+                && machineListByServerId === current.machineListByServerId
+                && machineListStatusByServerId === current.machineListStatusByServerId) return current;
+            return { ...current, sessionListViewDataByServerId, machineListByServerId, machineListStatusByServerId };
+        });
+    }
+
+    /** Logout removes every Home's credentials, so nothing retained for any Home has an owner left. */
+    public retireAccountDataForEveryHome(): void {
+        this.retainedAccountIdByHomeId.clear();
+        storage.getState().clearSessionOrganizationForAllServers();
+        storage.setState((current) => ({
+            ...current,
+            sessionListViewDataByServerId: {},
+            machineListByServerId: {},
+            machineListStatusByServerId: {},
+        }));
     }
 
     private hydrateWarmCachesForActiveServer(): void {
@@ -2086,6 +2147,9 @@ class Sync {
         this.deferredWebVisibilityTeardown = null;
         this.stopJsThreadLagTelemetryRuntime();
         this.serverScopeGeneration += 1;
+        this.sessionListViewportHydrationInFlight = new Set();
+        this.activePendingQueueOwnerContextBySession.clear();
+        this.scopedPendingQueueOwnerContextBySession.clear();
         this.flushPendingSettingsForCurrentScopeNow();
         this.flushSessionMaterializedMaxSeq();
         this.clearActiveAccountSettingsScope();
@@ -2226,6 +2290,10 @@ class Sync {
 
     public disconnectServer(): void {
         this.resetServerScopedRuntimeState();
+        // Back to the state before the first sign-in. Kept, a refresh still queued here would read
+        // as the Account that just left, under a generation the next sign-in does not bump.
+        // @ts-expect-error `credentials` is declared definite because 76 readers run signed in only.
+        this.credentials = undefined;
         clearWarmCacheAccountScope();
     }
 
@@ -2273,6 +2341,8 @@ class Sync {
 
 
         onSessionVisible = (sessionId: string) => {
+            // Entering a Session presents its current state, not the state one frame behind.
+            socketApplyFrame.flushNow();
             this.ensureSessionViewportHydrated();
             // Opening a session grows the hydrated working set; bound it (coalesced sweep).
             this.sessionTranscriptRetention.scheduleSweep();
@@ -2346,6 +2416,25 @@ class Sync {
                 ...(serverId ? { serverId } : {}),
             });
             return storage.getState().sessions[normalized] ?? null;
+        }
+
+        retireLocalSession(sessionId: string, serverId?: string | null): void {
+            const targetServerId = serverId ?? getActiveServerSnapshot().serverId;
+            const isActiveServer = areServerProfileIdentifiersEquivalent(targetServerId, getActiveServerSnapshot().serverId);
+            const retireSession = isActiveServer ? retireSessionSocketState : handleDeleteSessionSocketUpdate;
+            retireSession({
+                sessionId,
+                deleteSession: (id) => storage.getState().deleteSession(id, targetServerId),
+                removeSessionEncryption: (id) => { if (isActiveServer) this.encryption?.removeSessionEncryption(id); },
+                removeProjectManagerSession: (id) => { if (isActiveServer) projectManager.removeSession(id); },
+                clearScmStatusForSession: (id) => { if (isActiveServer) scmStatusSync.clearForSession(id); },
+                log,
+            });
+            if (isActiveServer) {
+                this.sessionDataKeys.delete(sessionId);
+                this.sessionDataKeyEnvelopes.delete(sessionId);
+                this.activeServerSessionIds.delete(sessionId);
+            }
         }
 
         /**
@@ -2463,6 +2552,7 @@ class Sync {
                         const code = typeof result.errorCode === 'string' ? result.errorCode : '';
                         const missingCause = mapSessionByIdTerminalCodeToMissingCause(code);
                         if (missingCause) {
+                            if (missingCause === 'not_found') this.retireLocalSession(normalized, scopedServerId);
                             if (missingCause === 'unauthorized') {
                                 recordTerminalAuthSyncError(new Error('Authentication required'), { serverId: scopedServerId });
                             }
@@ -2585,6 +2675,9 @@ class Sync {
             onLocalPendingProjectionCreated?: (event: Readonly<{ localId: string }>) => void;
         }>
     ) {
+        // The send reads the Session from the store: publish socket updates still waiting for
+        // their frame first, so it never builds on a frame-old snapshot.
+        socketApplyFrame.flushNow();
         let session = storage.getState().sessions[sessionId] ?? null;
         if (!session) {
             let hydration: EnsureSessionVisibleForRouteResult;
@@ -3356,13 +3449,15 @@ class Sync {
                 : null;
 
         const fetchLatestSession = async () => {
-            if (!this.credentials) {
+            const credentials = this.credentials;
+            if (!credentials) {
                 throw new Error('Sync credentials not available');
             }
+            const serverId = resolvedServerIdOverride ?? resolvePreferredServerIdForSessionId(sessionId);
             const hydrationResult = await fetchSessionByIdWithServerScope({
                 sessionId,
-                serverId: resolvedServerIdOverride ?? resolvePreferredServerIdForSessionId(sessionId),
-                activeCredentials: this.credentials,
+                serverId,
+                activeCredentials: credentials,
                 activeEncryption: this.encryption,
                 sessionDataKeys: this.sessionDataKeys,
                 sessionDataKeyEnvelopes: this.sessionDataKeyEnvelopes,
@@ -3371,6 +3466,10 @@ class Sync {
                 getExistingSession: (targetSessionId) => storage.getState().sessions[targetSessionId] ?? null,
                 log,
             });
+            if (!hydrationResult.ok && hydrationResult.errorCode === 'not_found'
+                && this.credentials === credentials && options?.shouldContinue?.() !== false) {
+                this.retireLocalSession(sessionId, serverId);
+            }
             throwForFailedSessionHydration(hydrationResult);
         };
 
@@ -3690,8 +3789,20 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
+        this.requestTranscriptReconciliationForUncommittedLocalOutbound(sessionId, 'pending_snapshot');
+    }
+
+    private requestTranscriptReconciliationForUncommittedLocalOutbound(
+        sessionId: string,
+        source: 'pending_snapshot' | 'socket_pending_changed',
+    ): void {
+        if (!hasUncommittedLocalOutboundProjection(storage.getState(), sessionId)) return;
+        syncReliabilityTelemetry.record('sync.pending.localOutboundTranscriptReconciliationRequested', {
+            source,
+        });
+        this.getOrCreateMessagesSync(sessionId).invalidateCoalesced();
     }
 
     private rearmPendingOutboxForActiveScope = (): Promise<void> => {
@@ -3813,12 +3924,13 @@ class Sync {
         }
     }
 
-    async updatePendingMessage(sessionId: string, pendingId: string, text: string): Promise<void> {
+    async updatePendingMessage(sessionId: string, pendingId: string, text: string, metaOverrides?: Record<string, unknown>): Promise<void> {
         const ownerContext = await this.resolvePendingQueueOwnerContext(sessionId);
         await updatePendingMessageV2({
             sessionId,
             pendingId,
             text,
+            metaOverrides,
             encryption: ownerContext.enqueueEncryption,
             fetchArtifactWithBody: (artifactId) => this.fetchArtifactWithBody(artifactId),
             updateArtifact: (artifact) => storage.getState().updateArtifact(artifact),
@@ -3850,7 +3962,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3862,7 +3974,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3879,10 +3991,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(
-                sessionId,
-                ownerContext.outboxScope,
-            ),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3894,7 +4003,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3906,7 +4015,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3918,7 +4027,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3930,7 +4039,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -3951,7 +4060,7 @@ class Sync {
             encryption: ownerContext.readEncryption,
             request: ownerContext.request,
             outboxScope: ownerContext.outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, ownerContext.outboxScope),
+            isOutboxScopeCurrent: ownerContext.isCurrent,
         });
     }
 
@@ -4179,6 +4288,8 @@ class Sync {
                     .catch(() => undefined);
             } else {
                 await organizationSnapshotRefresh;
+                // The key below was captured for this run's Account; the store may hold the next one's.
+                if (!shouldContinue()) return;
             }
         }
         const organizationProjection = isAppend || isRequiredScope
@@ -4341,21 +4452,7 @@ class Sync {
                 if (!shouldContinue()) return;
                 if (!exactResult.ok) {
                     if (exactResult.errorCode === 'not_found') {
-                        stagedSessionDataKeys.delete(sessionId);
-                        stagedSessionDataKeyEnvelopes.delete(sessionId);
-                        handleDeleteSessionSocketUpdate({
-                            sessionId,
-                            deleteSession: (targetSessionId) => storage.getState().deleteSession(targetSessionId),
-                            removeSessionEncryption: (targetSessionId) => activeEncryption.removeSessionEncryption(targetSessionId),
-                            removeProjectManagerSession: (targetSessionId) => projectManager.removeSession(targetSessionId),
-                            clearScmStatusForSession: (targetSessionId) => scmStatusSync.clearForSession(targetSessionId),
-                            log,
-                        });
-                        this.commitSessionDataKeyCacheEntry(
-                            sessionId,
-                            stagedSessionDataKeys,
-                            stagedSessionDataKeyEnvelopes,
-                        );
+                        this.retireLocalSession(sessionId, activeServerId);
                         return;
                     }
                     throw new Error(
@@ -4374,6 +4471,41 @@ class Sync {
         if (!isRequiredScope) {
             this.sessionListNextCursor = result.hasNext ? result.nextCursor : null;
             this.sessionListHasMore = result.hasNext;
+        }
+    }
+
+    public registerSessionListViewportRows = (rows: readonly { serverId: string | null; sessionId: string }[]): (() => void) => {
+        const release = registerSessionListViewportDemand(rows);
+        fireAndForget(this.hydrateColdSessionListViewportRows(rows), { tag: 'Sync.hydrateColdSessionListViewportRows' });
+        return release;
+    };
+
+    private async hydrateColdSessionListViewportRows(rows: readonly { serverId: string | null; sessionId: string }[]): Promise<void> {
+        const { serverId } = getActiveServerSnapshot();
+        const generation = this.serverScopeGeneration;
+        if (!this.credentials || !rows.some((row) => row.serverId === serverId)) return;
+        const snapshot = this.fetchSessionsInFlight;
+        if (snapshot?.generation === generation) await snapshot.promise;
+        if (generation !== this.serverScopeGeneration) return;
+
+        const pending = this.sessionListViewportHydrationInFlight;
+        const renderables = storage.getState().sessionListRenderables;
+        const ids: string[] = [];
+        for (const row of rows) {
+            const { sessionId } = row;
+            if (row.serverId !== serverId || pending.has(sessionId) || !isSessionListViewportRowDemanded(serverId, sessionId)) continue;
+            const renderable = renderables[sessionId];
+            if (!renderable || renderable.metadata != null || renderable.metadataUnavailable === true) continue;
+            pending.add(sessionId);
+            ids.push(sessionId);
+        }
+        if (ids.length === 0) return;
+        try {
+            // A viewport can be reported after the ordinary snapshot has scheduled its fixed budget.
+            // Ask the existing required-row path for just those now-visible cold rows.
+            await this.fetchSessions({ sessionListScope: 'required', requiredHydrationSessionIds: ids });
+        } finally {
+            for (const id of ids) pending.delete(id);
         }
     }
 
@@ -4491,75 +4623,128 @@ class Sync {
         return { context, outboxScope } as const;
     }
 
+    private resolveActivePendingQueueOwnerContext(
+        sessionId: string,
+        outboxScope: ServerAccountScope,
+    ): ResolvedPendingQueueOwnerContext {
+        const snapshot = getActiveServerSnapshot();
+        const writeTimeoutMs = readServerFetchWriteTimeoutMs();
+        const existing = this.activePendingQueueOwnerContextBySession.get(sessionId);
+        if (existing
+            && existing.snapshot === snapshot
+            && existing.credentials === this.credentials
+            && existing.writeTimeoutMs === writeTimeoutMs
+            && existing.context.readEncryption === this.encryption
+            && areServerAccountScopesEqual(existing.context.outboxScope, outboxScope)) {
+            return existing.context;
+        }
+
+        const generation = this.serverScopeGeneration;
+        const credentials = this.credentials;
+        const encryption = this.encryption;
+        const isActiveScopeCurrent = () =>
+            this.serverScopeGeneration === generation
+            && getActiveServerSnapshot().generation === snapshot.generation
+            && this.credentials === credentials
+            && this.encryption === encryption
+            && areServerAccountScopesEqual(getActiveServerAccountScope(), outboxScope);
+        const assertActiveScopeCurrent = () => {
+            if (!isActiveScopeCurrent()) throw new Error('Pending queue owner scope changed');
+        };
+        // The snapshot owner compares these callbacks by identity. Keep them stable for one
+        // active authority, while leaving versions, transcript changes, and local writes to it.
+        const context: ResolvedPendingQueueOwnerContext = {
+            outboxScope,
+            request: createPendingQueueRequest({
+                writeTimeoutMs,
+                request: async (path, init) => {
+                    assertActiveScopeCurrent();
+                    const response = await apiSocket.request(path, init);
+                    assertActiveScopeCurrent();
+                    return response;
+                },
+            }),
+            isCurrent: async () => isActiveScopeCurrent()
+                && await this.isPendingQueueOwnerScopeCurrent(sessionId, outboxScope)
+                && isActiveScopeCurrent(),
+            enqueueEncryption: encryption,
+            readEncryption: encryption,
+        };
+        this.activePendingQueueOwnerContextBySession.set(sessionId, {
+            snapshot, credentials, writeTimeoutMs, context,
+        });
+        return context;
+    }
+
     private async resolvePendingQueueOwnerContext(
         sessionId: string,
         expectedActiveScope?: ServerAccountScope,
     ): Promise<ResolvedPendingQueueOwnerContext> {
-        const ownPendingRequest = (
-            request: (path: string, init?: RequestInit) => Promise<Response>,
-        ) => createPendingQueueRequest({
-            request,
-            writeTimeoutMs: readServerFetchWriteTimeoutMs(),
-        });
         if (expectedActiveScope) {
-            const assertCapturedActiveScope = (): void => {
-                if (!areServerAccountScopesEqual(getActiveServerAccountScope(), expectedActiveScope)) {
-                    throw new Error('Pending queue owner scope changed');
-                }
-            };
-            return {
-                outboxScope: expectedActiveScope,
-                request: ownPendingRequest(async (path, init) => {
-                    assertCapturedActiveScope();
-                    const response = await apiSocket.request(path, init);
-                    assertCapturedActiveScope();
-                    return response;
-                }),
-                enqueueEncryption: this.encryption,
-                readEncryption: this.encryption,
-            };
+            return this.resolveActivePendingQueueOwnerContext(sessionId, expectedActiveScope);
         }
         const route = await this.resolvePendingQueueOwnerRoute(sessionId);
         if (route.context.scope === 'active') {
-            const assertCapturedActiveScope = (): void => {
-                if (!areServerAccountScopesEqual(getActiveServerAccountScope(), route.outboxScope)) {
-                    throw new Error('Pending queue owner scope changed');
-                }
-            };
-            return {
-                outboxScope: route.outboxScope,
-                request: ownPendingRequest(async (path, init) => {
-                    // apiSocket is dynamically bound to the active account. Fence immediately
-                    // before entering it, then fence again before any caller applies completion.
-                    assertCapturedActiveScope();
-                    const response = await apiSocket.request(path, init);
-                    assertCapturedActiveScope();
-                    return response;
-                }),
-                enqueueEncryption: this.encryption,
-                readEncryption: this.encryption,
-            };
+            return this.resolveActivePendingQueueOwnerContext(sessionId, route.outboxScope);
         }
 
-        const session = storage.getState().sessions[sessionId] ?? null;
-        const sessionEncryption = session?.encryptionMode === 'plain'
+        const context = route.context;
+        const preparedEncryption = storage.getState().sessions[sessionId]?.encryptionMode === 'plain'
             ? null
-            : await resolveScopedPendingSessionEncryption({ context: route.context, sessionId });
-        const ownerEncryption = {
-            getSessionEncryption: (candidateSessionId: string) =>
-                candidateSessionId === sessionId ? sessionEncryption : null,
-        } satisfies PendingQueueEncryption & PendingQueueReadEncryption;
-        return {
+            : await prepareScopedPendingSessionEncryption({ context, sessionId });
+        const cryptoContext = preparedEncryption?.cryptoContext ?? null;
+        const writeTimeoutMs = readServerFetchWriteTimeoutMs();
+        const existing = this.scopedPendingQueueOwnerContextBySession.get(sessionId);
+        if (existing
+            && existing.serverUrl === context.targetServerUrl
+            && existing.credentialScopeKey === context.credentialScopeKey
+            && existing.writeTimeoutMs === writeTimeoutMs
+            && existing.cryptoContext === cryptoContext
+            && areServerAccountScopesEqual(existing.outboxScope, route.outboxScope)) {
+            return await existing.context;
+        }
+
+        // Resolve credentials and crypto on every call; only equivalent captured owners
+        // share initialization. pendingQueueV2 remains the sole snapshot freshness owner.
+        const owner = Promise.resolve().then(async (): Promise<ResolvedPendingQueueOwnerContext> => {
+            const sessionEncryption = preparedEncryption ? await preparedEncryption.initialize() : null;
+            const ownerEncryption = {
+                getSessionEncryption: (candidateSessionId: string) =>
+                    candidateSessionId === sessionId ? sessionEncryption : null,
+            } satisfies PendingQueueEncryption & PendingQueueReadEncryption;
+            return {
+                outboxScope: route.outboxScope,
+                isCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, route.outboxScope),
+                request: createPendingQueueRequest({
+                    writeTimeoutMs,
+                    request: createSessionRequestForResolvedServerScope({
+                        context,
+                        activeRequest: async () => {
+                            throw new Error('Pending queue owner unexpectedly resolved through the active request');
+                        },
+                    }),
+                }),
+                enqueueEncryption: ownerEncryption,
+                readEncryption: ownerEncryption,
+            };
+        });
+        const entry = {
+            serverUrl: context.targetServerUrl,
+            credentialScopeKey: context.credentialScopeKey,
+            writeTimeoutMs,
+            cryptoContext,
             outboxScope: route.outboxScope,
-            request: ownPendingRequest(createSessionRequestForResolvedServerScope({
-                context: route.context,
-                activeRequest: async () => {
-                    throw new Error('Pending queue owner unexpectedly resolved through the active request');
-                },
-            })),
-            enqueueEncryption: ownerEncryption,
-            readEncryption: ownerEncryption,
+            context: owner,
         };
+        this.scopedPendingQueueOwnerContextBySession.set(sessionId, entry);
+        try {
+            return await owner;
+        } catch (error) {
+            if (this.scopedPendingQueueOwnerContextBySession.get(sessionId) === entry) {
+                this.scopedPendingQueueOwnerContextBySession.delete(sessionId);
+            }
+            throw error;
+        }
     }
 
     private async isPendingQueueOwnerScopeCurrent(
@@ -5593,6 +5778,10 @@ class Sync {
     }
 
     private fetchMessages = async (sessionId: string) => {
+        // Decide what to fetch from the transcript this client has already received: live rows
+        // still waiting for their frame are applied first, so a gap fetch starts at the covered prefix.
+        const settling = settleReceivedSessionMessages(sessionId);
+        if (settling) await settling;
         if (this.hasFetchedSessionsSnapshotForActiveServer && !this.isSessionKnownOnResolvedOwnerServer(sessionId)) {
             // Do not fetch messages when we cannot resolve the session to either the active server
             // or a locally known owner server. This avoids cross-server message fetches. The owner
@@ -7709,6 +7898,8 @@ class Sync {
               refreshedByCatchUp: { ...refreshedByCatchUp },
           });
 
+          if (!this.credentials) return finish('aborted');
+
           const canWriteCursor = (): boolean => {
               if (shouldContinue()) {
                   return true;
@@ -7929,6 +8120,7 @@ class Sync {
                             if (!serverId) {
                                 throw new Error('Cannot refresh session organization without an active server');
                             }
+                            const refreshGeneration = this.serverScopeGeneration;
                             await fetchAndApplySessionOrganizationSnapshot({
                                 credentials: this.credentials,
                                 serverId,
@@ -7945,6 +8137,7 @@ class Sync {
                                     tagIds: plan.tagIds,
                                     orderScopes: plan.orderScopes,
                                 },
+                                shouldContinue: () => this.serverScopeGeneration === refreshGeneration,
                             });
                         },
                         convergePendingForSession: (sessionId) => this.fetchPendingMessages(sessionId),
@@ -8028,6 +8221,10 @@ class Sync {
             });
             if (!shouldContinue()) return;
             if (!result.ok) {
+                if (result.errorCode === 'not_found') {
+                    this.retireLocalSession(normalized, scopedServerId);
+                    return;
+                }
                 log.log(`[Sync.socketHydrateSession] ${reason} failed for ${normalized}: ${result.errorCode ?? 'unknown'}`);
                 this.sessionsSync.invalidate();
                 return;
@@ -8054,6 +8251,8 @@ class Sync {
     }
 
     private handleUpdate = async (update: unknown) => {
+          // Signed out: this update belongs to the Account that left.
+          if (!this.credentials) return;
           const sourceServerId = String(getActiveServerSnapshot().serverId ?? '').trim() || null;
           const { shouldContinue } = createSyncGenerationGuard({
               getCurrentGeneration: () => this.serverScopeGeneration,
@@ -8068,7 +8267,10 @@ class Sync {
               sourceServerId,
               shouldContinue,
               artifactDataKeys: this.artifactDataKeys,
-              applySessions: (sessions) => this.applySessions(sessions),
+              retireSession: ({ sessionId }) => this.retireLocalSession(sessionId, sourceServerId),
+              // Stable identity: the socket session coalescer flushes everything queued when its
+              // apply handler changes, so a per-update closure would publish every arrival alone.
+              applySessions: this.applySessions,
               fetchSessions: () => {
                   fireAndForget(this.fetchSessions(), {
                       tag: 'Sync.handleUpdate.fetchSessions',
@@ -8084,6 +8286,10 @@ class Sync {
               },
               applyMessages: (sessionId, messages) => this.applyMessages(sessionId, messages),
                 onSessionVisible: (sessionId) => this.onSessionVisible(sessionId),
+              onPendingQueueSettled: (sessionId) => this.requestTranscriptReconciliationForUncommittedLocalOutbound(
+                  sessionId,
+                  'socket_pending_changed',
+              ),
                 isSessionMessagesLoaded: (sessionId) => storage.getState().sessionMessages[sessionId]?.isLoaded === true,
                 getSessionMaterializedMaxSeq: (sessionId) => this.sessionMaterializedMaxSeqById[sessionId] ?? 0,
               markSessionMaterializedMaxSeq: (sessionId, seq) => this.markSessionMaterializedMaxSeq(sessionId, seq),
@@ -8092,7 +8298,7 @@ class Sync {
               markSessionTranscriptDeferred: (sessionId, marker) => this.markSessionTranscriptDeferred(sessionId, marker),
               markSessionTranscriptStale: (sessionId, marker) => this.markSessionTranscriptStale(sessionId, marker),
               markSessionStateHydrationDeferred: (sessionId) => this.markSessionStateHydrationDeferred(sessionId),
-              onReadyProjectionAdvance: (sessionId, seq) => this.notifyReadyProjectionAdvance(sessionId, seq, sourceServerId),
+              onReadyProjectionAdvance: (sessionId, seq) => this.notifyReadyProjectionAdvance(sessionId, seq),
               assumeUsers: (userIds) => this.assumeUsers(userIds),
               applyTodoSocketUpdates: (changes) => this.applyTodoSocketUpdates(changes),
               invalidateMachines: () => this.machinesSync.invalidate(),
@@ -8113,7 +8319,7 @@ class Sync {
         flushActivityUpdatesEngine({
             updates,
             sourceServerId: options?.sourceServerId,
-            applySessions: (sessions) => this.applySessions(sessions),
+            applySessions: this.applySessions,
         });
     }
 
@@ -8126,6 +8332,7 @@ class Sync {
     }
 
     private handleEphemeralUpdate = (update: unknown) => {
+        if (!this.credentials) return;
         if (parseSessionDraftSocketWake(update)) {
             const capturedScope = getActiveServerAccountScope();
             if (!capturedScope) return;
@@ -8214,21 +8421,7 @@ class Sync {
             [sessionId]: {
                 seq: normalizedSeq,
                 transcriptNotified: false,
-                activityNotified: false,
             },
-        };
-        return true;
-    }
-
-    /** Claims the activity notification for one ready turn; false when that turn already notified. */
-    private claimReadyActivityNotification(sessionId: string, seq: number | null): boolean {
-        if (seq === null || !Number.isFinite(seq)) return true;
-        const progress = this.readyNotificationProgressBySessionId[sessionId];
-        if (!progress || progress.seq !== Math.trunc(seq)) return true;
-        if (progress.activityNotified) return false;
-        this.readyNotificationProgressBySessionId = {
-            ...this.readyNotificationProgressBySessionId,
-            [sessionId]: { ...progress, activityNotified: true },
         };
         return true;
     }
@@ -8244,7 +8437,6 @@ class Sync {
                 [sessionId]: {
                     seq: normalizedSeq,
                     transcriptNotified: true,
-                    activityNotified: false,
                 },
             };
             return true;
@@ -8253,7 +8445,7 @@ class Sync {
             this.readyNotificationProgressBySessionId = {
                 ...this.readyNotificationProgressBySessionId,
                 [sessionId]: {
-                    ...previous,
+                    seq: normalizedSeq,
                     transcriptNotified: true,
                 },
             };
@@ -8262,18 +8454,9 @@ class Sync {
         return false;
     }
 
-    private notifyReadyProjectionAdvance(sessionId: string, seq: number, sourceServerId?: string | null): void {
+    private notifyReadyProjectionAdvance(sessionId: string, seq: number): void {
         if (!this.shouldNotifyReadyProjectionSeq(sessionId, seq)) return;
         voiceHooks.onReady(sessionId, []);
-        // A hidden session is routed projection-only, so its transcript (and the ready event in it)
-        // is not applied live: this projection is its only ready signal. Live transcript consumers
-        // notify from the transcript instead, which carries the preview text.
-        if (
-            !resolveSessionLiveConsumption(sessionId, sourceServerId).isFullContentConsumer
-            && this.claimReadyActivityNotification(sessionId, seq)
-        ) {
-            notifyActivityReady(sessionId, [], { origin: 'projection' });
-        }
     }
 
     private applyMessages = (
@@ -8334,8 +8517,8 @@ class Sync {
                 if (notifyVoice) {
                     voiceHooks.onReady(sessionId, liveEffectMessages);
                 }
-                if (notifyActivity && this.claimReadyActivityNotification(sessionId, result.latestReadyEventSeq)) {
-                    notifyActivityReady(sessionId, liveEffectMessages);
+                if (notifyActivity) {
+                    notifyActivityReady(sessionId, liveEffectMessages, result.latestReadyEventSeq);
                 }
             }
         }
@@ -8631,6 +8814,11 @@ export async function syncSwitchServer(credentials: AuthCredentials | null): Pro
     }
 
     await sync.switchServer(credentials);
+}
+
+export async function syncLogout(): Promise<void> {
+    await syncSwitchServer(null);
+    sync.retireAccountDataForEveryHome();
 }
 
 async function syncInit(credentials: AuthCredentials, restore: boolean) {

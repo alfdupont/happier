@@ -19,7 +19,6 @@ describe('buildActivityLocalNotificationContent', () => {
         const notification = buildActivityLocalNotificationContent({
             event: {
                 kind: 'ready',
-                origin: 'transcript',
                 sessionId: 'session-1',
                 messages: [
                     {
@@ -61,7 +60,6 @@ describe('buildActivityLocalNotificationContent', () => {
         const notification = buildActivityLocalNotificationContent({
             event: {
                 kind: 'ready',
-                origin: 'transcript',
                 sessionId: 'session-1',
                 messages: [
                     {

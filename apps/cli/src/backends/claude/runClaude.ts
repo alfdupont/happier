@@ -37,6 +37,7 @@ import { projectPath } from '../../projectPath';
 import { resolve } from 'node:path';
 import { startOfflineReconnection, connectionState } from '@/api/offline/serverConnectionErrors';
 import { claudeLocal } from '@/backends/claude/claudeLocal';
+import { withClaudeSessionModelArgs } from '@/backends/claude/cli/terminalOptions';
 import { createSessionScanner } from '@/backends/claude/utils/sessionScanner';
 import type { TerminalRuntimeFlags } from '@/terminal/runtime/terminalRuntimeFlags';
 import { buildTerminalMetadataFromRuntimeFlags } from '@/terminal/runtime/terminalMetadata';
@@ -46,6 +47,7 @@ import { applyStartupMetadataUpdateToSession, buildModelOverride, buildPermissio
 import { initializeRuntimeOverridesSynchronizer } from '@/agent/runtime/runtimeOverridesSynchronizer';
 import { createBaseSessionForAttach } from '@/agent/runtime/createBaseSessionForAttach';
 import { createSessionMetadata } from '@/agent/runtime/createSessionMetadata';
+import { readSessionTranscriptStorage } from '@/agent/runtime/readSessionTranscriptStorage';
 import { resolveClaudeConfigDirEnvOverlay } from './utils/resolveClaudeConfigDirEnvOverlay';
 import { readSessionAttachMetadataIdentityPolicyFromEnv } from '@/agent/runtime/readSessionAttachMetadataIdentityPolicyFromEnv';
 import { hashClaudeEnhancedModeForQueue } from '@/backends/claude/remote/modeHash';
@@ -369,6 +371,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     const { state, metadata } = createSessionMetadata({
         flavor: 'claude',
+        transcriptStorage: existingSessionId ? undefined : readSessionTranscriptStorage(),
         nativeAgentEnvironment: resolveClaudeConfigDirEnvOverlay(process.env),
         machineId,
         directory: workingDirectory,
@@ -470,7 +473,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                                 onSessionFound: (id) => { offlineSessionId = id; },
                                 onThinkingChange: () => {},
                                 abort: abortController.signal,
-                                claudeArgs: options.claudeArgs,
+                                claudeArgs: withClaudeSessionModelArgs(options.claudeArgs, initialModelId),
                                 systemPromptText: offlineSystemPromptText,
                             });
                     } finally {
@@ -860,6 +863,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // (cached, best-effort) and carried on the mode so spawn-time resolution and launch-option
         // hashing both see the same value instead of reading a cache at hash time.
         const modelEffortTracker = createClaudeModelEffortLevelsTracker({
+            cwd: workingDirectory,
             resolveTimeoutMs: () => resolveClaudeHelpProbeTimeoutMs(),
             accountSettings: options.accountSettings ?? null,
         });
@@ -868,6 +872,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         let currentFallbackModel: string | undefined = undefined; // Track current fallback model
         let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
         let currentAppendSystemPrompt: string | undefined = resolveInitialClaudeSystemPromptText({
+            runtimeModeKind: sessionRuntimeModeKind,
             existingSessionId,
             defaultSystemPromptText,
         }); // Track current append system prompt
@@ -1062,6 +1067,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         const baseQueuedText = structuredRouting?.queuedText ?? message.content.text;
         const deliveryAttribution = {
+            providerPromptMeta: message.meta,
             userMessageSeq: deliveryInfo?.seq ?? null,
             userMessageLocalId: message.localId ?? null,
             providerAcceptancePending: deliveryInfo?.providerAcceptancePending === true,
@@ -1527,7 +1533,8 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     try {
     let endpointArtifactsOwnedByAttachment = false;
     let stopTerminalHostForExplicitStop: (() => Promise<void>) | null = null;
-    let didPublishSessionModelsMetadata = false;
+    let attachedSessionForModelPublication: ApiSessionClient | null = null;
+    let publishSessionModelsOnAttach: ((session: ApiSessionClient) => void) | null = null;
     let userMessageHandlerReady = false;
     let currentPermissionMode: PermissionMode = options.permissionMode ?? 'default';
     let currentAgentModeId: string | null =
@@ -1539,6 +1546,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     let currentReasoningEffortUpdatedAt = 0;
     // See the sibling runtime path above: tiers travel on the mode so hashing stays pure.
     const modelEffortTracker = createClaudeModelEffortLevelsTracker({
+        cwd: workingDirectory,
         resolveTimeoutMs: () => resolveClaudeHelpProbeTimeoutMs(),
         accountSettings: options.accountSettings ?? null,
     });
@@ -1551,6 +1559,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     const seedInitialAppendSystemPrompt = (defaultSystemPromptText?: string | null): void => {
         if (currentAppendSystemPromptSeeded) return;
         currentAppendSystemPrompt = resolveInitialClaudeSystemPromptText({
+            runtimeModeKind: sessionRuntimeModeKind,
             existingSessionId,
             defaultSystemPromptText,
         });
@@ -1698,6 +1707,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
 
                 const { state, metadata } = createSessionMetadata({
                     flavor: 'claude',
+                    transcriptStorage: existingSessionId ? undefined : readSessionTranscriptStorage(),
                     nativeAgentEnvironment: resolveClaudeConfigDirEnvOverlay(process.env),
                     machineId,
                     directory: workingDirectory,
@@ -1989,6 +1999,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                     }, installedRuntimeCapabilities);
                     const baseQueuedText = structuredRouting?.queuedText ?? message.content.text;
                     const deliveryAttribution = {
+                        providerPromptMeta: message.meta,
                         userMessageSeq: deliveryInfo?.seq ?? null,
                         userMessageLocalId: message.localId ?? null,
                         providerAcceptancePending: deliveryInfo?.providerAcceptancePending === true,
@@ -2010,6 +2021,9 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                         messageQueue.push(baseQueuedText, enhancedMode, deliveryAttribution);
                     }
                 });
+
+                attachedSessionForModelPublication = session;
+                publishSessionModelsOnAttach?.(session);
 
                 if (timing.enabled) {
                     logger.debug(
@@ -2173,25 +2187,24 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                                 readReasoningEffortState: () => ({ value: currentReasoningEffort, updatedAt: currentReasoningEffortUpdatedAt }),
                                 installedRuntimeCapabilities,
                             });
-                            const currentModelId = initialState.modelId;
                             if (initialState.reasoningEffortUpdatedAt >= currentReasoningEffortUpdatedAt) {
                                 currentReasoningEffort = initialState.reasoningEffort;
                                 currentReasoningEffortUpdatedAt = initialState.reasoningEffortUpdatedAt;
                             }
-                            if (!didPublishSessionModelsMetadata) {
-                                didPublishSessionModelsMetadata = true;
+                            // Local startup can reach readiness before attach. Only the real client can refresh metadata.
+                            publishSessionModelsOnAttach = (session) => {
                                 void publishClaudeSessionModelsMetadataBestEffort({
                                     reconcileModels: sessionInstance.reconcileSessionModels,
                                     cwd: workingDirectory,
                                     timeoutMs: resolveClaudeHelpProbeTimeoutMs(),
-                                    currentModelId,
+                                    currentModelId: currentModel ?? '',
                                     accountSettings: options.accountSettings ?? null,
-                                    session: artifacts.deferredSession as unknown as {
-                                        ensureMetadataSnapshot: (opts: Readonly<{ timeoutMs: number }>) => Promise<unknown>;
-                                        updateMetadata: (updater: (prev: Metadata) => Metadata) => Promise<void>;
-                                    },
+                                    session,
                                     probeInstalledRuntimeCapabilities: async () => installedRuntimeCapabilities,
                                 });
+                            };
+                            if (attachedSessionForModelPublication) {
+                                publishSessionModelsOnAttach(attachedSessionForModelPublication);
                             }
                             const readySessionId = artifacts.deferredSession.sessionId;
                             const readyMetadata = artifacts.deferredSession.getMetadataSnapshot?.() as Metadata | null | undefined;

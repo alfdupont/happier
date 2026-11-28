@@ -15,7 +15,10 @@ import { useLocalSettings, useSettings } from '@/sync/domains/state/storage';
 import { useApplyLocalSettings, useApplySettings } from '@/sync/store/settingsWriters';
 import { t } from '@/text';
 import { sync } from '@/sync/sync';
+import { isTauriDesktop } from '@/utils/platform/tauri';
+import { fireAndForget } from '@/utils/system/fireAndForget';
 import { runPushNotificationPermissionPriming } from '@/activity/notifications/permission/pushNotificationPermissionPriming';
+import { requestWebLocalNotificationPermission } from '@/activity/notifications/channels/sendWebLocalNotification';
 
 import {
     DEFAULT_NOTIFICATIONS_SETTINGS_V1,
@@ -33,7 +36,7 @@ import {
     removeNotificationChannelById,
     updateNotificationChannelById,
 } from './notificationChannels';
-import { resolveDeviceNotificationSurface, useDeviceNotificationPermission } from './useDeviceNotificationPermission';
+import { useTauriNotificationPermissionDiagnostics } from './useTauriNotificationPermissionDiagnostics';
 import { Icon } from '@/components/ui/icons/Icon';
 
 type ForegroundBehavior = 'full' | 'silent' | 'off';
@@ -54,8 +57,8 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
     const showConnectedServiceAccountSwitchNotifications = connectedServiceFallbackNotificationsEnabled;
     const showConnectedServiceQuotaNotifications = connectedServiceQuotaNotificationsEnabled;
     const showConnectedServiceNotificationTopics = showConnectedServiceAccountSwitchNotifications || showConnectedServiceQuotaNotifications;
-    const deviceNotificationSurface = React.useMemo(() => resolveDeviceNotificationSurface(), []);
-    const deviceNotificationPermission = useDeviceNotificationPermission(deviceNotificationSurface);
+    const isDesktopNotificationsSupported = React.useMemo(() => isTauriDesktop(), []);
+    const desktopNotificationPermission = useTauriNotificationPermissionDiagnostics(isDesktopNotificationsSupported);
 
     const notificationsRaw = isRecord(settings) ? settings.notificationsSettingsV1 : undefined;
     const notifications = React.useMemo(() => {
@@ -265,27 +268,8 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
         }));
     }, [setWebhookChannels, webhookChannels]);
 
-    const deviceNotificationPermissionSubtitle = React.useMemo(() => {
-        const status = deviceNotificationPermission.status;
-        if (deviceNotificationSurface === 'browser') {
-            switch (status) {
-                case 'checking':
-                    return t('settingsNotifications.browser.permission.checkingSubtitle');
-                case 'granted':
-                    return t('settingsNotifications.browser.permission.grantedSubtitle');
-                case 'blocked':
-                    return t('settingsNotifications.browser.permission.blockedSubtitle');
-                case 'unsupported':
-                    return t('settingsNotifications.browser.permission.unsupportedSubtitle');
-                case 'error':
-                    return t('settingsNotifications.browser.permission.errorSubtitle');
-                case 'notGranted':
-                default:
-                    return t('settingsNotifications.browser.permission.notGrantedSubtitle');
-            }
-        }
-
-        switch (status) {
+    const desktopPermissionSubtitle = React.useMemo(() => {
+        switch (desktopNotificationPermission.status) {
             case 'checking':
                 return t('settingsNotifications.desktop.permission.checkingSubtitle');
             case 'granted':
@@ -296,14 +280,11 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
             default:
                 return t('settingsNotifications.desktop.permission.notGrantedSubtitle');
         }
-    }, [deviceNotificationPermission.status, deviceNotificationSurface]);
+    }, [desktopNotificationPermission.status]);
 
-    const canRequestDeviceNotificationPermission = deviceNotificationPermission.status === 'notGranted'
-        || deviceNotificationPermission.status === 'error';
-
-    const deviceNotificationPermissionIconColor = deviceNotificationPermission.status === 'granted'
+    const desktopPermissionIconColor = desktopNotificationPermission.status === 'granted'
         ? theme.colors.state.success.foreground
-        : deviceNotificationPermission.status === 'checking'
+        : desktopNotificationPermission.status === 'checking'
             ? theme.colors.text.secondary
             : theme.colors.state.neutral.foreground;
 
@@ -418,7 +399,17 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
                     rightElement={(
                         <Switch
                             value={localSettings.localNotificationsEnabled !== false}
-                            onValueChange={(value) => setLocalSetting({ localNotificationsEnabled: Boolean(value) })}
+                            onValueChange={(value) => {
+                                const enabled = Boolean(value);
+                                setLocalSetting({ localNotificationsEnabled: enabled });
+                                // Browsers only show their permission prompt for a user gesture. The
+                                // desktop app requests permission from its own diagnostics row.
+                                if (enabled && !isDesktopNotificationsSupported) {
+                                    fireAndForget(requestWebLocalNotificationPermission(), {
+                                        tag: 'NotificationsSettingsView.requestWebLocalNotificationPermission',
+                                    });
+                                }
+                            }}
                         />
                     )}
                     showChevron={false}
@@ -490,32 +481,20 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
                 />
             </ItemGroup>
 
-            {deviceNotificationSurface ? (
+            {isDesktopNotificationsSupported ? (
                 <ItemGroup
-                    title={deviceNotificationSurface === 'browser'
-                        ? t('settingsNotifications.browser.title')
-                        : t('settingsNotifications.desktop.title')}
-                    footer={deviceNotificationSurface === 'browser'
-                        ? t('settingsNotifications.browser.footer')
-                        : t('settingsNotifications.desktop.footer')}
+                    title={t('settingsNotifications.desktop.title')}
+                    footer={t('settingsNotifications.desktop.footer')}
                 >
                     <Item
-                        testID={`settings-notifications-${deviceNotificationSurface}-permission`}
-                        title={deviceNotificationSurface === 'browser'
-                            ? t('settingsNotifications.browser.permission.title')
-                            : t('settingsNotifications.desktop.permission.title')}
-                        subtitle={deviceNotificationPermissionSubtitle}
-                        icon={(
-                            <Icon
-                                name={deviceNotificationSurface === 'browser' ? 'globe' : 'desktop'}
-                                size={29}
-                                color={deviceNotificationPermissionIconColor}
-                            />
-                        )}
-                        onPress={canRequestDeviceNotificationPermission
-                            ? () => { void deviceNotificationPermission.requestPermission(); }
-                            : undefined}
-                        showChevron={canRequestDeviceNotificationPermission}
+                        testID="settings-notifications-desktop-permission"
+                        title={t('settingsNotifications.desktop.permission.title')}
+                        subtitle={desktopPermissionSubtitle}
+                        icon={<Icon name="desktop" size={29} color={desktopPermissionIconColor} />}
+                        onPress={desktopNotificationPermission.status === 'granted'
+                            ? undefined
+                            : () => { void desktopNotificationPermission.requestPermission(); }}
+                        showChevron={desktopNotificationPermission.status !== 'granted'}
                     />
                 </ItemGroup>
             ) : null}

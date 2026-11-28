@@ -1,4 +1,3 @@
-import { router } from 'expo-router';
 import * as React from 'react';
 
 import { Platform } from 'react-native';
@@ -6,19 +5,19 @@ import { Platform } from 'react-native';
 import { storage, useLocalSetting } from '@/sync/domains/state/storage';
 import { getActiveViewingSessionId } from '@/sync/domains/session/activeViewingSession';
 import { getActiveServerUrl } from '@/sync/domains/server/serverProfiles';
-import { navigateToSessionRoute } from '@/hooks/session/navigateToSessionRoute';
 import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
-import { isTauriMainWindowActivelyViewed } from '@/desktop/window/isTauriMainWindowActivelyViewed';
 import { isTauriDesktop } from '@/utils/platform/tauri';
-import { isWebDocumentActivelyViewed } from '@/utils/runtime/isWebDocumentActivelyViewed';
+import { isHostActivelyViewed } from '@/utils/runtime/isRuntimeActive';
 import { fireAndForget } from '@/utils/system/fireAndForget';
 
 import { buildActivityLocalNotificationContent } from '../buildActivityLocalNotificationContent';
+import { resolveForegroundNotificationBehavior, type ForegroundNotificationBehavior } from '../resolveForegroundNotificationBehavior';
 import { sendExpoLocalNotification } from '../channels/sendExpoLocalNotification';
 import { sendTauriLocalNotification } from '../channels/sendTauriLocalNotification';
 import { sendWebLocalNotification } from '../channels/sendWebLocalNotification';
-import { resolveForegroundNotificationBehavior } from '../resolveForegroundNotificationBehavior';
 import { subscribeActivityLocalNotifications, type ActivityLocalNotificationEvent } from './activityLocalNotificationBus';
+import { useDesktopNotificationClickRouting } from './useDesktopNotificationClickRouting';
+import { navigateToLocalNotificationSession } from './navigateToLocalNotificationSession';
 import { usePresentedAgentRequestSettlement } from './usePresentedAgentRequestSettlement';
 
 type ActivityLocalNotificationSettings = Readonly<{
@@ -82,42 +81,49 @@ function shouldSuppressSameSessionNotification(event: ActivityLocalNotificationE
         return false;
     }
 
-    if (Platform.OS !== 'web') {
-        return true;
+    // A browser tab or the desktop app can keep a session open while the person works elsewhere.
+    if (Platform.OS === 'web') {
+        return isHostActivelyViewed();
     }
 
-    // Browser tab or desktop window: only suppress while the user is actually looking at it.
-    return isWebDocumentActivelyViewed();
+    return true;
 }
 
-function sendBrowserNotification(
-    event: ActivityLocalNotificationEvent,
-    notification: Readonly<{ title: string; body: string }>,
-): void {
-    // In the background the notification always sounds, like an OS push. While the tab is in
-    // front, the foreground behavior decides, as it does for native in-app presentation.
-    const foregroundBehavior = isWebDocumentActivelyViewed()
-        ? resolveForegroundNotificationBehavior({
-            localSettings: storage.getState().localSettings,
-            accountSettings: storage.getState().settings,
-        })
-        : 'full';
-    if (foregroundBehavior === 'off') {
-        return;
+/**
+ * Every open tab delivers the same event, and the browser replaces a notification with the same
+ * tag, so an event-scoped tag shows one notification per event without merging distinct events.
+ */
+function resolveWebNotificationTag(event: ActivityLocalNotificationEvent): string | undefined {
+    if (event.kind === 'agent-request') {
+        return `happier:${event.sessionId}:request:${event.occurrenceId ?? event.requestId}`;
     }
 
-    fireAndForget(sendWebLocalNotification({
-        title: notification.title,
-        body: notification.body,
-        tag: event.kind === 'ready' ? `happier-ready-${event.sessionId}` : `happier-request-${event.requestId}`,
-        playSound: foregroundBehavior === 'full',
-        onClick: () => navigateToSessionRoute({ router, sessionId: event.sessionId }),
-    }), { tag: 'ActivityLocalNotificationRuntime.sendWebLocalNotification' });
+    if (event.readyEventSeq !== undefined) {
+        return `happier:${event.sessionId}:ready:seq:${event.readyEventSeq}`;
+    }
+    const lastMessageId = event.messages?.at(-1)?.id;
+    return lastMessageId ? `happier:${event.sessionId}:ready:${lastMessageId}` : undefined;
+}
+
+/**
+ * The in-app choice applies while someone is using this browser tab or desktop window. Native
+ * applies the same choice from its Expo foreground handler.
+ */
+function resolveDocumentHostForegroundBehavior(): ForegroundNotificationBehavior {
+    if (!isHostActivelyViewed()) {
+        return 'full';
+    }
+    const state = storage.getState();
+    return resolveForegroundNotificationBehavior({
+        localSettings: state.localSettings,
+        accountSettings: state.settings,
+    });
 }
 
 export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
     const localSettings = useActivityLocalNotificationSettings();
     const reconcilePresentedRequests = usePresentedAgentRequestSettlement();
+    useDesktopNotificationClickRouting();
 
     React.useEffect(() => {
         return subscribeActivityLocalNotifications((event) => {
@@ -125,13 +131,12 @@ export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
                 return;
             }
 
-            // Native apps receive the push notification for a hidden session's ready turn; only
-            // web runtimes (browser and desktop) have no push and rely on the projection signal.
-            if (event.kind === 'ready' && event.origin === 'projection' && Platform.OS !== 'web') {
+            if (shouldSuppressSameSessionNotification(event)) {
                 return;
             }
 
-            if (shouldSuppressSameSessionNotification(event)) {
+            const foregroundBehavior = Platform.OS === 'web' ? resolveDocumentHostForegroundBehavior() : 'full';
+            if (foregroundBehavior === 'off') {
                 return;
             }
 
@@ -140,7 +145,7 @@ export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
                 event,
                 session,
                 serverUrl: getActiveServerUrl(),
-                accountId: event.kind === 'agent-request' ? getActiveServerAccountScope()?.accountId : undefined,
+                accountId: getActiveServerAccountScope()?.accountId,
                 includeReadyMessageText: localSettings.localNotificationsShowReadyMessageText !== false,
                 includeRequestMessageText: localSettings.localNotificationsShowRequestMessageText !== false,
             });
@@ -149,12 +154,21 @@ export function ActivityLocalNotificationRuntime(): React.ReactElement | null {
                 fireAndForget(sendTauriLocalNotification({
                     title: notification.title,
                     body: notification.body,
+                    data: notification.data,
                 }), { tag: 'ActivityLocalNotificationRuntime.sendTauriLocalNotification' });
                 return;
             }
 
             if (Platform.OS === 'web') {
-                sendBrowserNotification(event, notification);
+                fireAndForget(sendWebLocalNotification({
+                    title: notification.title,
+                    body: notification.body,
+                    tag: resolveWebNotificationTag(event),
+                    silent: foregroundBehavior === 'silent',
+                    onClick: () => {
+                        fireAndForget(navigateToLocalNotificationSession(notification.data, () => false), { tag: 'notificationSessionNavigation' });
+                    },
+                }), { tag: 'ActivityLocalNotificationRuntime.sendWebLocalNotification' });
                 return;
             }
 

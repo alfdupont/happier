@@ -36,6 +36,7 @@ import { normalizeCurrentHappierSessionId } from '@/agent/runtime/session/curren
 import type { ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 import { readClaudeMainChainAssistantModelId } from './sessionModels/readClaudeMainChainAssistantModelId';
 import { isLivePrimaryClaudeProviderMessage, isSidechainSessionHook } from './utils/sessionHookAttribution';
+import { completeClaudeRemoteClear } from './remote/localCommands';
 
 function buildClaudeEffortArgs(params: Readonly<{
     modelId: unknown;
@@ -150,6 +151,8 @@ export async function claudeRemote(opts: {
     // Callbacks
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
+    /** Called at a new provider submission, after input selection and before provider effects. */
+    onBeforeProviderPrompt?: () => void | Promise<void>,
     onMessage: (message: SDKMessage) => void,
     /** Live provider ingress, before transcript filtering or buffering. */
     onProviderEvent?: () => void,
@@ -216,13 +219,7 @@ export async function claudeRemote(opts: {
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
-        if (opts.onCompletionEvent) {
-            opts.onCompletionEvent('Context was reset');
-        }
-        if (opts.onSessionReset) {
-            opts.onSessionReset();
-        }
-        promptSettlements.accept(initial);
+        await completeClaudeRemoteClear(opts, () => promptSettlements.accept(initial));
         return;
     }
 
@@ -329,6 +326,7 @@ export async function claudeRemote(opts: {
     let currentProviderSessionId = startFrom;
     let unpublishedLaunchEffort: string | undefined = effortArgs[1];
     // Start the loop
+    if (initial.pendingProviderAction !== 'steer' && opts.onBeforeProviderPrompt) await opts.onBeforeProviderPrompt();
     const response = query({
         prompt: messages,
         options: sdkOptions,
@@ -448,6 +446,7 @@ export async function claudeRemote(opts: {
                 }
                 promptSettlements.track(next);
                 mode = next.mode;
+                if (next.pendingProviderAction !== 'steer' && opts.onBeforeProviderPrompt) await opts.onBeforeProviderPrompt();
                 messages.push({ type: 'user', uuid: promptSettlements.submit(next), message: { role: 'user', content: next.message } });
             }
 

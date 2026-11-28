@@ -13,6 +13,7 @@ import {
 
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
+import { logger } from '@/ui/logger';
 
 import type {
     QueuedSessionMutation,
@@ -21,6 +22,7 @@ import type {
     RuntimeActivitySnapshotMutationV1,
 } from './sessionMutationTypes';
 import {
+    createSessionTurnFailureIssue,
     resolveDaemonObservedExitMutationId,
     resolveLegacyDaemonObservedExitMutationId,
     resolveRuntimeActivitySnapshotMutationId,
@@ -197,12 +199,64 @@ function createDeadLetterEntry(params: Readonly<{
     return entry;
 }
 
+function omitIssuePath(value: unknown, path: readonly PropertyKey[]): unknown {
+    const [key, ...remainingPath] = path;
+    if (key === undefined || (!isRecord(value) && !Array.isArray(value))
+        || !Object.prototype.hasOwnProperty.call(value, key)) return value;
+    const reduced = Array.isArray(value) ? [...value] : { ...value };
+    if (remainingPath.length === 0) {
+        Reflect.deleteProperty(reduced, key);
+    } else {
+        Reflect.set(reduced, key, omitIssuePath(Reflect.get(value, key), remainingPath));
+    }
+    return reduced;
+}
+
 function parseSessionTurnPayload(value: unknown): Readonly<{
     payload: SessionTurnMutationV1 | null;
     diagnostic?: Record<string, unknown>;
 }> {
     const parsed = SessionTurnMutationV1Schema.safeParse(value);
     if (parsed.success) return { payload: parsed.data };
+    if (
+        isRecord(value)
+        && value.action === 'fail'
+        && typeof value.observedAt === 'number'
+        && 'issue' in value
+        && parsed.error.issues.every((issue) => issue.path[0] === 'issue')
+    ) {
+        // Preserve valid nested diagnostics before falling back to an affected field or generic issue.
+        let reducedIssue = value.issue;
+        for (const issue of parsed.error.issues) {
+            const paths = issue.code === 'unrecognized_keys'
+                ? issue.keys.map((key) => [...issue.path.slice(1), key])
+                : [issue.path.slice(1)];
+            for (const path of paths) reducedIssue = omitIssuePath(reducedIssue, path);
+        }
+        let reduced = SessionTurnMutationV1Schema.safeParse({ ...value, issue: reducedIssue });
+        if (!reduced.success) {
+            for (const issue of reduced.error.issues) {
+                if (issue.path[1] !== undefined) reducedIssue = omitIssuePath(reducedIssue, [issue.path[1]]);
+            }
+            reduced = SessionTurnMutationV1Schema.safeParse({ ...value, issue: reducedIssue });
+        }
+        const recovered = reduced.success ? reduced : SessionTurnMutationV1Schema.safeParse({
+            ...value,
+            issue: createSessionTurnFailureIssue({
+                observedAt: value.observedAt,
+                ...(typeof value.provider === 'string' ? { provider: value.provider } : {}),
+                ...(typeof value.providerTurnId === 'string' ? { providerTurnId: value.providerTurnId } : {}),
+            }),
+        });
+        if (recovered.success) {
+            logger.warnFile('[API] Invalid failure issue reduced to preserve terminal session turn', {
+                sessionId: recovered.data.sessionId,
+                mutationId: recovered.data.mutationId,
+                ...summarizeZodIssues(parsed.error),
+            });
+            return { payload: recovered.data };
+        }
+    }
     return {
         payload: null,
         diagnostic: summarizeZodIssues(parsed.error),
@@ -509,66 +563,75 @@ export function parseDaemonTerminalQueuedSessionMutation(
     return broad;
 }
 
+async function readSessionMutationFile(filePath: string): Promise<string | null> {
+    try {
+        return await readFile(filePath, 'utf8');
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
 export async function loadSessionMutationOutbox(
     context: SessionMutationPersistenceContext,
     onQuarantined?: (count: number) => void,
 ): Promise<QueuedSessionMutation[]> {
     const { sessionId } = context;
     const filePath = context.paths.queuePath;
-    let fileContents: string | undefined;
+    const fileContents = await readSessionMutationFile(filePath);
+    if (fileContents === null) return [];
+    let parsed: unknown;
     try {
-        fileContents = await readFile(filePath, 'utf8');
-        const parsed = JSON.parse(fileContents) as unknown;
-        if (!isRecord(parsed) || parsed.v !== 1 || !Array.isArray(parsed.mutations)) {
-            await appendSessionMutationQuarantine(context, [
-                createDeadLetterEntry({
-                    sessionId,
-                    kind: 'outbox_file',
-                    reason: 'invalid_outbox_file',
-                    payload: parsed,
-                }),
-            ]);
-            onQuarantined?.(1);
-            return [];
-        }
-        const mutations: QueuedSessionMutation[] = [];
-        const deadLetters: SessionMutationDeadLetterEntry[] = [];
-        for (const rawMutation of parsed.mutations) {
-            const parsedMutation = context.parseQueuedMutation(rawMutation, sessionId);
-            if (parsedMutation.ok) {
-                mutations.push(parsedMutation.mutation);
-            } else {
-                deadLetters.push(parsedMutation.deadLetter);
-            }
-        }
-        if (deadLetters.length > 0) {
-            await appendSessionMutationQuarantine(context, deadLetters);
-            onQuarantined?.(deadLetters.length);
-        }
-        return mutations;
+        parsed = JSON.parse(fileContents) as unknown;
     } catch (error) {
-        const err = error as NodeJS.ErrnoException;
-        if (err?.code !== 'ENOENT') {
-            await appendSessionMutationQuarantine(context, [
-                createDeadLetterEntry({
-                    sessionId,
-                    kind: 'outbox_file',
-                    reason: 'invalid_outbox_json',
-                    diagnostic: {
-                        errorName: error instanceof Error ? error.name : 'unknown',
-                    },
-                    payload: fileContents,
-                }),
-            ]);
-            onQuarantined?.(1);
-        }
+        await appendSessionMutationQuarantine(context, [
+            createDeadLetterEntry({
+                sessionId,
+                kind: 'outbox_file',
+                reason: 'invalid_outbox_json',
+                diagnostic: {
+                    errorName: error instanceof Error ? error.name : 'unknown',
+                },
+                payload: fileContents,
+            }),
+        ]);
+        onQuarantined?.(1);
         return [];
     }
+    if (!isRecord(parsed) || parsed.v !== 1 || !Array.isArray(parsed.mutations)) {
+        await appendSessionMutationQuarantine(context, [
+            createDeadLetterEntry({
+                sessionId,
+                kind: 'outbox_file',
+                reason: 'invalid_outbox_file',
+                payload: parsed,
+            }),
+        ]);
+        onQuarantined?.(1);
+        return [];
+    }
+    const mutations: QueuedSessionMutation[] = [];
+    const deadLetters: SessionMutationDeadLetterEntry[] = [];
+    for (const rawMutation of parsed.mutations) {
+        const parsedMutation = context.parseQueuedMutation(rawMutation, sessionId);
+        if (parsedMutation.ok) {
+            mutations.push(parsedMutation.mutation);
+        } else {
+            deadLetters.push(parsedMutation.deadLetter);
+        }
+    }
+    if (deadLetters.length > 0) {
+        await appendSessionMutationQuarantine(context, deadLetters);
+        onQuarantined?.(deadLetters.length);
+    }
+    return mutations;
 }
 
 async function loadDeadLetterFile(filePath: string): Promise<SessionMutationDeadLetterEntry[]> {
+    const fileContents = await readSessionMutationFile(filePath);
+    if (fileContents === null) return [];
     try {
-        const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
+        const parsed = JSON.parse(fileContents) as unknown;
         if (!isRecord(parsed) || parsed.v !== 1 || !Array.isArray(parsed.entries)) return [];
         return parsed.entries.filter((entry): entry is SessionMutationDeadLetterEntry => isRecord(entry) && entry.v === 1);
     } catch {

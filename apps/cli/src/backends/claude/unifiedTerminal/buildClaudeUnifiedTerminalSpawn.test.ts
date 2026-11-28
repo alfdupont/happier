@@ -153,6 +153,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     });
     const launch = await readLaunchSpecFromSpawn(spawn);
     const args = launch.args ?? [];
+    expect(args.flatMap((arg, index) => arg === '--model' ? [args[index + 1]] : [])).toEqual([input.model]);
     expect(args.flatMap((arg, index) => arg === '--effort' ? [args[index + 1]] : []))
       .toEqual(input.expected ? [input.expected] : []);
     expect(args).toContain('existing-native-session');
@@ -285,32 +286,39 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
   );
 
   it('preserves Windows verbatim argument handling from the resolved Claude invocation', async () => {
-    const spawn = await buildClaudeUnifiedTerminalSpawn({
-      path: 'C:\\workspace\\project',
-      first: {
-        message: 'hello',
-        mode: {
-          permissionMode: 'default',
+    patchProcessPlatform('win32');
+    await withPatchedEnv({ ProgramFiles: 'C:\\Program Files', 'ProgramFiles(x86)': 'C:\\Program Files (x86)' }, async () => {
+      const spawn = await buildClaudeUnifiedTerminalSpawn({
+        path: 'C:\\workspace\\project',
+        first: {
+          message: 'hello',
+          mode: {
+            permissionMode: 'default',
+          },
         },
-      },
-      deps: {
-        resolveClaudeCliPath: () => 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
-        isClaudeCliJavaScriptFile: () => false,
-        ensureClaudeJsRuntimeExecutable: async () => 'C:\\happier\\runtime.exe',
-        claudeLocalLauncherPath: 'C:\\happier\\scripts\\claude_local_launcher.cjs',
-        terminalLaunchSpecRunnerPath: 'C:\\happier\\scripts\\terminal_launch_spec_runner.cjs',
-        resolveCommandInvocation: () => ({
-          command: 'C:\\Windows\\System32\\cmd.exe',
-          args: ['/d', '/s', '/c', '"C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd"'],
-          windowsVerbatimArguments: true,
-        }),
-      },
-    });
+        deps: {
+          resolveClaudeCliPath: () => 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+          isClaudeCliJavaScriptFile: () => false,
+          ensureClaudeJsRuntimeExecutable: async () => 'C:\\happier\\runtime.exe',
+          claudeLocalLauncherPath: 'C:\\happier\\scripts\\claude_local_launcher.cjs',
+          terminalLaunchSpecRunnerPath: 'C:\\happier\\scripts\\terminal_launch_spec_runner.cjs',
+          resolveCommandInvocation: () => ({
+            command: 'C:\\Windows\\System32\\cmd.exe',
+            args: ['/d', '/s', '/c', '"C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd"'],
+            windowsVerbatimArguments: true,
+          }),
+        },
+      });
 
-    const launchSpec = await readLaunchSpecFromSpawn(spawn);
-    expect(launchSpec).toMatchObject({
-      command: 'C:\\Windows\\System32\\cmd.exe',
-      windowsVerbatimArguments: true,
+      const launchSpec = await readLaunchSpecFromSpawn(spawn);
+      expect(launchSpec).toMatchObject({
+        command: 'C:\\Windows\\System32\\cmd.exe',
+        windowsVerbatimArguments: true,
+      });
+      expect(launchSpec.env).toMatchObject({ ProgramFiles: 'C:\\Program Files', 'ProgramFiles(x86)': 'C:\\Program Files (x86)' });
+      expect(spawn.spawnEnv).toMatchObject({ ProgramFiles: 'C:\\Program Files', 'ProgramFiles(x86)': 'C:\\Program Files (x86)' });
+      // Shell closure cannot prove the native CLI stopped.
+      expect(spawn.providerInvocation).toBeUndefined();
     });
   });
 
@@ -425,6 +433,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     expect(launchSpec.command).toBe('/managed/node');
     expect(launchSpec.args?.[0]).toBe('/happier/scripts/claude_local_launcher.cjs');
+    expect(spawn.providerInvocation).toEqual({ command: launchSpec.command, args: launchSpec.args });
     expect(launchSpec.args).toContain('/tmp/plugin');
     expect(launchSpec.args).toContain('/tmp/settings.json');
     expect(JSON.stringify(launchSpec.args)).not.toContain('synthetic-sensitive-value');
@@ -463,7 +472,7 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
   return JSON.parse(await readFile(overlayArg, 'utf8')) as Record<string, unknown>;
 }
 
-  it('merges ultracode into the single --settings overlay when the mode enables it', async () => {
+  it.each([false, true])('merges ultracode and pool continuation into the single settings overlay (pool %s)', async (pool) => {
     const { mkdtemp, readFile, stat, writeFile } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -474,6 +483,12 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
     try {
       const spawn = await buildClaudeUnifiedTerminalSpawn({
         path: '/workspace/project',
+        envOverlay: pool ? {
+          [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([{
+            kind: 'group', serviceId: 'claude-subscription', groupId: 'pool',
+            activeProfileId: 'work', fallbackProfileId: 'work', generation: 1,
+          }]),
+        } : {},
         first: {
           message: 'hello',
           mode: {
@@ -497,6 +512,7 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       const args = launchSpec.args ?? [];
       const overlay = await readOverlayFromArgs(args, hookSettingsPath);
       expect(overlay.ultracode).toBe(true);
+      expect(overlay.autoContinueAtUsageLimit).toBe(pool ? false : undefined);
       expect(overlay).not.toHaveProperty('skipDangerousModePermissionPrompt');
       // The hook settings content survives the merge.
       expect(overlay.permissions).toEqual({ allow: ['mcp__happier__change_title'] });
@@ -872,6 +888,7 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
     expect(spawn.spawnArgv).not.toContain('/usr/local/bin/claude');
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     expect(launchSpec.command).toBe('/usr/local/bin/claude');
+    expect(spawn.providerInvocation).toEqual({ command: launchSpec.command, args: launchSpec.args });
     expect(launchSpec.env?.DISABLE_AUTOUPDATER).toBe('1');
   });
 

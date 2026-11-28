@@ -495,7 +495,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     }
   });
 
-  it('settles an after-write timeout from the exact resumed-session JSONL prompt after the native continuation hook', async () => {
+  it.each(['text', 'attributed compact'] as const)('settles an after-write timeout from resumed-session JSONL evidence (%s)', async kind => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claude-late-exact-acceptance-'));
     tempDirs.push(dir);
     const workspaceDir = join(dir, 'workspace');
@@ -509,7 +509,18 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
 
-    const prompt = 'Prompt accepted after a resumed terminal write times out before Enter is verified.';
+    const { resolveClaudeQueuedPromptForDispatch } = await import('../runtime/resolveClaudeQueuedPromptForDispatch');
+    const { message: prompt } = await resolveClaudeQueuedPromptForDispatch({
+      sessionClient: { getMetadataSnapshot: () => ({}), updateMetadata: () => {} },
+      batch: {
+        message: kind === 'text' ? 'Prompt accepted after a resumed terminal write times out before Enter is verified.' : '/compact',
+        mode: { replaySeedAllowed: false },
+        ...(kind === 'attributed compact' ? { providerPromptMeta: {
+          happierProvenanceV1: { v: 1, kind: 'happierSession', sourceSessionId: 'compact-sender', via: 'mcp' },
+        } } : {}),
+      },
+      didBootstrap: true,
+    });
     const nextPrompt = 'Next durable prompt drains after exact acceptance.';
     const abortController = new AbortController();
     const onPromptAcceptedByProvider = vi.fn();
@@ -605,7 +616,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         transcript_path: transcriptPath,
         source: 'resume',
       });
-      hook({
+      if (kind === 'text') hook({
         hook_event_name: 'UserPromptSubmit',
         session_id: claudeSessionId,
         prompt_id: 'late-exact-prompt-id',
@@ -614,7 +625,11 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
 
       const acceptedTimestamp = new Date().toISOString();
-      await appendFile(transcriptPath, `${JSON.stringify({
+      await appendFile(transcriptPath, `${JSON.stringify(kind === 'attributed compact' ? {
+        type: 'system', subtype: 'compact_boundary', uuid: 'late-compact-boundary',
+        sessionId: claudeSessionId, timestamp: acceptedTimestamp, isSidechain: false,
+        compactMetadata: { trigger: 'manual', preTokens: 100 },
+      } : {
         type: 'user',
         uuid: 'late-exact-accepted-user-row',
         promptId: 'late-exact-prompt-id',
@@ -914,7 +929,12 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     }
   });
 
-  it.each([true, false])('settles exact resumed prompt custody before enforcing hook activation (hooks active: %s)', async (hooksActive) => {
+  it.each([
+    { hooksActive: true, tabbedReplay: false },
+    { hooksActive: false, tabbedReplay: false },
+    { hooksActive: true, tabbedReplay: true },
+    { hooksActive: false, tabbedReplay: true },
+  ])('settles exact resumed prompt custody before enforcing hook activation (hooks active: $hooksActive, tabbed replay: $tabbedReplay)', async ({ hooksActive, tabbedReplay }) => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claude-unified-resumed-hook-activation-'));
     tempDirs.push(dir);
     const workspaceDir = join(dir, 'workspace');
@@ -928,7 +948,10 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
 
-    const prompt = 'Reply exactly RESUMED_HOOK_ACTIVATION_OK and do not use tools.';
+    const instruction = 'Reply exactly RESUMED_HOOK_ACTIVATION_OK and do not use tools.';
+    const prompt = tabbedReplay
+      ? `${'user:\n\tconst value = 1;\nassistant:\n\tOK\n'.repeat(2_100)}\n${instruction}`
+      : instruction;
     const assistantText = 'RESUMED_HOOK_ACTIVATION_OK';
     const abortController = new AbortController();
     const onMessage = vi.fn<(message: RawJSONLines) => void>();
@@ -987,12 +1010,17 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         const hook = subscribedHook;
         if (!hook) throw new Error('Claude session hook subscription was not registered before injection');
+        // Only the native terminal/provider boundary is replaced. Claude's paste editor expands
+        // tabs before both UserPromptSubmit and the JSONL echo (Claude Code 2.1.316).
+        const providerText = tabbedReplay
+          ? `\n\n<pasted_content id="839a">\n${input.text.replaceAll('\t', '    ')}\n</pasted_content id="839a">\n`
+          : input.text;
         if (hooksActive) hook({
           hook_event_name: 'UserPromptSubmit',
           session_id: claudeSessionId,
           transcript_path: transcriptPath,
           prompt_id: 'resumed-hook-prompt-id',
-          prompt: input.text,
+          prompt: providerText,
         });
         await new Promise((resolve) => setTimeout(resolve, 50));
         await appendFile(transcriptPath, `${JSON.stringify({
@@ -1002,7 +1030,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
           sessionId: claudeSessionId,
           timestamp: new Date().toISOString(),
           isSidechain: false,
-          message: { role: 'user', content: input.text },
+          message: { role: 'user', content: providerText },
         })}\n`);
         // Hold the OS injection boundary open while the real follower reads acceptance.
         if (!hooksActive) {
@@ -1075,6 +1103,9 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         { state: 'idle', activeCount: 0 },
       );
       await waitUntil(() => onPromptAcceptedByProvider.mock.calls.length === 1 || sessionOutcome !== 'pending');
+      expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: 'user', uuid: 'resumed-hook-accepted-user-row',
+      }));
       if (!hooksActive) {
         expect(transcriptObservedDuringInjection).toBe(true);
         await sessionPromise;

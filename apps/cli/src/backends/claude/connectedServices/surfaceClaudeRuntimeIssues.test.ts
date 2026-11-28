@@ -1,5 +1,9 @@
+import type { Query } from '@anthropic-ai/claude-agent-sdk';
+import { claudeRemoteAgentSdk } from '../remote/claudeRemoteAgentSdk';
+import { makeMode } from '../remote/claudeRemoteAgentSdk.testkit';
 import type { notifyDaemonConnectedServiceRuntimeAuthFailure, notifyDaemonConnectedServiceQuotaSnapshot } from '@/daemon/controlClient';
 import { sanitizeConnectedServiceRuntimeFailureClassification } from '@/daemon/connectedServices/runtimeAuth/sanitizeConnectedServiceRuntimeFailureClassification';
+import { resolveRuntimeAuthFailureSourceProfile } from '@/daemon/connectedServices/runtimeAuth/resolveRuntimeAuthFailureSourceProfile';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,18 +11,22 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { logger } from '@/ui/logger';
 import type { SessionRuntimeIssueV1 } from '@happier-dev/protocol';
+import { ConnectedServiceQuotaSnapshotV1Schema } from '@happier-dev/protocol';
+import { createProviderAccountUsageStore } from '@/daemon/connectedServices/accountUsage/store';
 
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import {
   CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS,
   resetConnectedServiceRuntimeAuthFailureReportDedupeForTests,
 } from '@/daemon/connectedServices/runtimeAuth/reportConnectedServiceRuntimeAuthFailureToDaemon';
+import { resetRuntimeAuthFailureReportOutboxDrainSchedulerForTests } from '@/daemon/connectedServices/runtimeAuth/reportOutbox/runtimeAuthFailureReportOutboxDrainScheduler';
 import { buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObservation } from '@/daemon/connectedServices/accountUsage/fromConnectedServiceQuotaObservation';
 import { canRecordProviderAccountUsageSourceLinks } from '@/daemon/connectedServices/accountUsage/record';
 import { recordConnectedServiceRuntimeQuotaSnapshotForSession } from '@/daemon/connectedServices/quotas/recordConnectedServiceRuntimeQuotaSnapshotForSession';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from '@/daemon/connectedServices/accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import { resolveConnectedServiceGroupMemberByProviderAccountId } from '@/daemon/connectedServices/shared/resolveConnectedServiceGroupMemberByProviderAccountId';
 import { readClaudeMaterializedOAuthAccountIdentity } from './resolveClaudeRuntimeProviderAccountIdentity';
+import { parseQueuedSessionMutation } from '@/api/session/mutations/sessionMutationPersistence';
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
 import type { FailTurnInput } from '@/agent/runtime/session/turn/types';
@@ -28,7 +36,7 @@ import type { SessionHookData } from '../utils/startHookServer';
 import type { Session } from '../session';
 import { createSessionScanner } from '../utils/sessionScanner';
 import { createClaudeSessionTranscriptProjector } from '../localControl/createClaudeSessionTranscriptProjector';
-import { mapClaudeProviderFailureToUsageDetails } from './mapClaudeRateLimitEventToUsageDetails';
+import { mapClaudeProviderFailureToUsageDetails, mapClaudeRateLimitEventToQuotaEvidence } from './mapClaudeRateLimitEventToUsageDetails';
 
 import {
   recordClaudeRateLimitQuotaEvidence,
@@ -46,6 +54,11 @@ vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonConnectedServiceQuotaSnapshot: mockNotifyDaemonConnectedServiceQuotaSnapshot,
   notifyDaemonConnectedServiceTurnLifecycle: mockNotifyDaemonConnectedServiceTurnLifecycle,
 }));
+
+afterEach(() => {
+  // Reports without a durable receipt may schedule a later drain; it must not call the next test's IPC mock.
+  resetRuntimeAuthFailureReportOutboxDrainSchedulerForTests();
+});
 
 type ClaudeFailTurn = (params: FailTurnInput) => Promise<void>;
 
@@ -130,6 +143,73 @@ function restoreClaudeSelectionEnv(previous: string | undefined): void {
 }
 
 describe('surfaceClaudeRuntimeIssues runtime-auth projection', () => {
+  it.each([
+    { utilization: 100, planType: null, providerLimitId: 'seven_day', invalidField: null },
+    { utilization: 101, planType: null, providerLimitId: 'seven_day', invalidField: 'utilization' },
+    { utilization: Number.NaN, planType: null, providerLimitId: 'seven_day', invalidField: 'utilization' },
+    { utilization: 100, planType: '', providerLimitId: 'seven_day', invalidField: 'planType' },
+    { utilization: 100, planType: null, providerLimitId: '', invalidField: 'providerLimitId' },
+  ])('queues a terminal failure despite invalid optional provider values ($utilization, $planType, $providerLimitId)', async ({ utilization, planType, providerLimitId, invalidField }) => {
+    const previous = installClaudeSelectionEnv();
+    const warn = vi.spyOn(logger, 'warnFile').mockImplementation(() => {});
+    const admitted: ReturnType<typeof parseQueuedSessionMutation>[] = [];
+    const lifecycle = createSessionTurnLifecycle({
+      sessionId: 'wire-usage-limit',
+      enqueueSessionTurn: async payload => {
+        admitted.push(parseQueuedSessionMutation({
+          kind: 'session_turn', mutationId: payload.mutationId, payload,
+          createdAt: 1_000, attempts: 0, nextAttemptAt: 0,
+        }, 'wire-usage-limit'));
+      },
+    });
+    try {
+      await lifecycle.beginTurn({ provider: 'claude' });
+      await surfaceClaudeRateLimitRuntimeIssue({ client: {
+        sessionId: 'wire-usage-limit', sessionTurnLifecycle: lifecycle,
+      } }, {
+        v: 1, resetAtMs: Date.now() + 604_800_000, retryAfterMs: 604_800_000,
+        providerLimitId, limitCategory: 'usage_limit', quotaScope: 'account',
+        recoverability: 'switch_account', planType, utilization,
+        overage: null, action: null, connectedService: null,
+        providerObservedAtMs: Date.now(), sourceProviderAccountId: 'account-internal',
+        sourceProviderOrganizationId: 'organization-internal', usageLimitNoteKind: 'wrap_up',
+      }, '[test]');
+      const failed = admitted.at(-1);
+      expect(failed).toMatchObject({ ok: true, mutation: { kind: 'session_turn', payload: { action: 'fail' } } });
+      if (invalidField) {
+        expect(failed).toMatchObject({ ok: true, mutation: { payload: { issue: { code: 'usage_limit' } } } });
+        expect(warn).toHaveBeenCalledWith(
+          '[API] Invalid failure issue reduced to preserve terminal session turn',
+          expect.objectContaining({ issues: expect.arrayContaining([expect.objectContaining({ path: expect.stringMatching(/^issue\.usageLimit/) })]) }),
+        );
+      } else {
+        expect(warn).not.toHaveBeenCalled();
+      }
+      if (!failed?.ok || failed.mutation.kind !== 'session_turn' || failed.mutation.payload.action !== 'fail') {
+        throw new Error('Expected admitted terminal failure');
+      }
+      const issue = failed.mutation.payload.issue;
+      if (invalidField === 'providerLimitId') {
+        // The blank ID also makes the synthesized meter window invalid.
+        expect(issue).not.toHaveProperty('usageLimit');
+      } else {
+        expect(issue?.usageLimit).toMatchObject({
+          providerLimitId: 'seven_day',
+          resetAtMs: expect.any(Number),
+          retryAfterMs: 604_800_000,
+          connectedService: { serviceId: 'claude-subscription', groupId: 'team-pool' },
+        });
+        if (invalidField) expect(issue?.usageLimit).not.toHaveProperty(invalidField);
+        expect(issue?.usageLimit).not.toHaveProperty('providerObservedAtMs');
+        expect(issue?.usageLimit).not.toHaveProperty('sourceProviderAccountId');
+        expect(issue?.usageLimit).not.toHaveProperty('sourceProviderOrganizationId');
+        expect(issue?.usageLimit).not.toHaveProperty('usageLimitNoteKind');
+      }
+      expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).toHaveBeenCalled();
+      expect(lifecycle.hasActiveTurn()).toBe(false);
+    } finally { restoreClaudeSelectionEnv(previous); warn.mockRestore(); }
+  });
+
   it('reports duplicate Claude observers once and a fresh begun turn again', async () => {
     const previousSelectionEnv = installClaudeSelectionEnv();
     const mutations: SessionTurnMutationV1[] = [];
@@ -292,6 +372,39 @@ describe('surfaceClaudeRuntimeIssues runtime-auth projection', () => {
     }
   });
 
+  it('records Claude extra usage that keeps serving a spent window as provider credit evidence', async () => {
+    const previousSelectionEnv = installClaudeSelectionEnv();
+    try {
+      await recordClaudeRateLimitQuotaEvidence({
+        client: { sessionId: 'sess_claude_overage_quota', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+      } as any, [{
+        v: 1,
+        resetAtMs: null,
+        retryAfterMs: null,
+        quotaScope: 'account',
+        recoverability: 'wait',
+        providerLimitId: 'seven_day',
+        planType: null,
+        utilization: 100,
+        overage: { status: 'allowed', resetAtMs: 1_779_500_000_000 },
+        action: null,
+        connectedService: null,
+      }], '[claude-test]');
+
+      expect(mockNotifyDaemonConnectedServiceQuotaSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'sess_claude_overage_quota',
+        snapshot: expect.objectContaining({
+          meters: [
+            expect.objectContaining({ meterId: 'seven_day', remainingPct: 0, resetAtMs: null }),
+            expect.objectContaining({ meterId: 'extra_usage', unit: 'credits', isExhausted: false, status: 'ok' }),
+          ],
+        }),
+      }));
+    } finally {
+      restoreClaudeSelectionEnv(previousSelectionEnv);
+    }
+  });
+
   it('records every passive Claude quota window as a labelled meter of one snapshot', async () => {
     const previousSelectionEnv = installClaudeSelectionEnv();
     const passiveWindow = {
@@ -341,51 +454,166 @@ describe('surfaceClaudeRuntimeIssues runtime-auth projection', () => {
     }
   });
 
-  it.each([null, 95])('keeps measured rejected and other windows even with top-level usage %s', async (utilization) => {
-    const previousSelectionEnv = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+  it.each(['assistant', 'result'] as const)('preserves both windows through SDK queued-prompt read-ahead then %s failure', async (failureType) => {
+    const previous = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
     delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
-    const window = {
-      v: 1 as const,
-      retryAfterMs: null,
-      quotaScope: 'account' as const,
-      recoverability: 'wait' as const,
-      planType: null,
-      overage: null,
-      action: null,
-      connectedService: null,
+    const failTurn = createClaudeFailTurnSpy();
+    const session = { client: { sessionId: 'review-sdk-path', sessionTurnLifecycle: { failTurn } } };
+    let inputCount = 0;
+    let releaseQueuedPrompt!: () => void;
+    const queuedPromptAvailable = new Promise<void>(resolve => { releaseQueuedPrompt = resolve; });
+    let markQueuedPromptRead!: () => void;
+    const queuedPromptRead = new Promise<void>(resolve => { markQueuedPromptRead = resolve; });
+    let providerPrompts: AsyncIterator<unknown> | null = null;
+    // Only the external Agent SDK query is replaced; all mapping and projection stay real.
+    const query = {
+      async *[Symbol.asyncIterator]() {
+        if (!providerPrompts) throw new Error('Missing provider prompt iterable');
+        await providerPrompts.next();
+        yield { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour',
+          unifiedWindows: { five_hour: { utilization: 1, resetsAt: 1790378400 }, seven_day: { utilization: 0.42, resetsAt: 1790928000 } } } };
+        await queuedPromptRead;
+        if (failureType === 'result') {
+          yield { type: 'result', subtype: 'error_during_execution', is_error: true,
+            errors: ['Usage limit reached'], apiErrorStatus: 429, error: 'rate_limit', providerLimitId: 'five_hour',
+            uuid: '00000000-0000-4000-8000-000000000944', session_id: 'review-sdk-path' };
+          return;
+        }
+        const failureMessage = { type: 'assistant', parent_tool_use_id: null, isApiErrorMessage: true, apiErrorStatus: 429,
+          error: 'rate_limit', providerLimitId: 'five_hour', utilization: 100,
+          uuid: '00000000-0000-4000-8000-000000000943', session_id: 'review-sdk-path',
+          message: { id: 'review-error', type: 'message', role: 'assistant', model: 'claude',
+            content: [{ type: 'text', text: 'Usage limit reached' }], stop_reason: 'end_turn',
+            usage: { input_tokens: 0, output_tokens: 0 } } };
+        yield failureMessage;
+        yield { type: 'result', subtype: 'success', is_error: false, session_id: 'review-sdk-path',
+          result: '', num_turns: 1, total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1 };
+        // Read-ahead did not submit this prompt; the result now admits its actual send.
+        expect((await providerPrompts.next()).done).toBe(false);
+        yield { ...failureMessage, utilization: null, uuid: '00000000-0000-4000-8000-000000000945' };
+      },
+      close() {}, async setPermissionMode() {}, async setModel() {}, async setMaxThinkingTokens() {},
+      supportedCommands: async () => [], supportedModels: async () => [],
     };
     try {
-      await surfaceClaudeRateLimitRuntimeIssue({
-        client: { sessionId: 'sess_claude_rejected_windows', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
-      } as any, {
-        ...window,
-        limitCategory: 'usage_limit',
-        providerLimitId: 'five_hour',
-        utilization,
-        resetAtMs: 1_790_378_400_000,
-      }, '[claude-test]', {
-        // What the same event reported for every window, the rejected one included.
-        observedWindows: [
-          { ...window, providerLimitId: 'five_hour', utilization: 100, resetAtMs: 1_790_378_400_000 },
-          { ...window, providerLimitId: 'seven_day', utilization: 42, resetAtMs: 1_790_928_000_000 },
-        ],
+      const run = claudeRemoteAgentSdk({ sessionId: null, transcriptPath: null, path: '/tmp',
+        claudeExecutablePath: '/tmp/claude', canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+        isAborted: () => false, nextMessage: async () => {
+          inputCount++;
+          if (inputCount > 2) return null;
+          if (inputCount === 2) {
+            await queuedPromptAvailable;
+            markQueuedPromptRead();
+          }
+          return { message: inputCount === 1 ? 'hello' : 'next request', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }) };
+        }, onReady() {}, onSessionFound() {}, onMessage() {},
+        onBeforeProviderPrompt: () => captureClaudeRuntimeAuthRequestIdentity(session),
+        onQuotaEvidence: async windows => {
+          await recordClaudeRateLimitQuotaEvidence(session, windows, '[review]');
+          releaseQueuedPrompt();
+        },
+        onRateLimitEvent: async details => {
+          await surfaceClaudeRateLimitRuntimeIssue(session, details, '[review]');
+        },
+        createQuery: ({ prompt }) => {
+          if (typeof prompt === 'string') throw new Error('Expected streaming provider prompts');
+          providerPrompts = prompt[Symbol.asyncIterator]();
+          return query as unknown as Query;
+        },
       });
+      if (failureType === 'result') await expect(run).rejects.toBeInstanceOf(Error);
+      else await run;
+      expect(ConnectedServiceQuotaSnapshotV1Schema.parse(mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls[0]?.[0].snapshot).meters).toHaveLength(2);
+      expect(ConnectedServiceQuotaSnapshotV1Schema.parse(mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls[1]?.[0].snapshot).meters).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: 0 }),
+        expect.objectContaining({ meterId: 'seven_day', remainingPct: 58 }),
+      ]);
+      expect(failTurn.mock.calls[0]?.[0].issue?.usageLimit?.allWindows).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: 0 }),
+        expect.objectContaining({ meterId: 'seven_day', remainingPct: 58 }),
+      ]);
+      if (failureType === 'assistant') {
+        expect(failTurn.mock.lastCall?.[0].issue?.usageLimit?.allWindows).toBeUndefined();
+        expect(ConnectedServiceQuotaSnapshotV1Schema.parse(
+          mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.lastCall?.[0].snapshot,
+        ).meters).toEqual([expect.objectContaining({ meterId: 'five_hour', remainingPct: null })]);
+      }
+    } finally { restoreClaudeSelectionEnv(previous); }
+  });
 
-      // Reaching one limit must not drop the other window from the account's usage.
-      expect(mockNotifyDaemonConnectedServiceQuotaSnapshot).toHaveBeenCalledWith(expect.objectContaining({
-        sessionId: 'sess_claude_rejected_windows',
-        snapshot: expect.objectContaining({
-          evidence: expect.objectContaining({ providerLimitId: 'five_hour' }),
-          meters: [
-            expect.objectContaining({ meterId: 'five_hour', utilizationPct: 100 }),
-            expect.objectContaining({ meterId: 'seven_day', utilizationPct: 42 }),
-          ],
-        }),
-      }));
-    } finally {
-      if (previousSelectionEnv === undefined) delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
-      else process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = previousSelectionEnv;
-    }
+  it('retains the rejection reset only in the matching measured window and clears windows on the next request', async () => {
+    const previous = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    const failTurn = createClaudeFailTurnSpy();
+    const details = { v: 1 as const, resetAtMs: 1790378400000, retryAfterMs: null,
+      limitCategory: 'usage_limit' as const, quotaScope: 'account' as const, recoverability: 'wait' as const,
+      providerLimitId: 'five_hour', planType: null, utilization: 100, overage: null, action: null, connectedService: null };
+    try {
+      const session = { client: { sessionId: 'review-reset', sessionTurnLifecycle: { failTurn } } };
+      await captureClaudeRuntimeAuthRequestIdentity(session);
+      await recordClaudeRateLimitQuotaEvidence(session, [
+        { ...details, utilization: 100, resetAtMs: null },
+        { ...details, providerLimitId: 'seven_day', utilization: 42, resetAtMs: null, limitCategory: undefined },
+      ], '[review]');
+      await surfaceClaudeRateLimitRuntimeIssue(session, { ...details, utilization: 95 }, '[review]');
+      expect(failTurn.mock.calls[0]?.[0].issue?.usageLimit?.allWindows).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: 0, resetAtMs: details.resetAtMs }),
+        { meterId: 'seven_day', scope: 'Weekly', remainingPct: 58, status: 'ok' },
+      ]);
+      expect(ConnectedServiceQuotaSnapshotV1Schema.parse(mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.lastCall?.[0].snapshot).meters).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: 0, resetAtMs: details.resetAtMs }),
+        expect.objectContaining({ meterId: 'seven_day', remainingPct: 58, resetAtMs: null }),
+      ]);
+      await captureClaudeRuntimeAuthRequestIdentity(session);
+      await surfaceClaudeRateLimitRuntimeIssue(session, { ...details, utilization: null }, '[review]');
+      expect(failTurn.mock.lastCall?.[0].issue?.usageLimit?.allWindows).toBeUndefined();
+      expect(ConnectedServiceQuotaSnapshotV1Schema.parse(mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.lastCall?.[0].snapshot).meters).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: null }),
+      ]);
+    } finally { restoreClaudeSelectionEnv(previous); }
+  });
+
+  it('does not invent numerical quota from an unmeasured error', async () => {
+    const previous = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    const failTurn = createClaudeFailTurnSpy();
+    const details = mapClaudeProviderFailureToUsageDetails({ type: 'assistant', isApiErrorMessage: true,
+      apiErrorStatus: 429, error: 'rate_limit', message: { content: [{ type: 'text', text: 'Usage limit reached' }] } });
+    if (!details) throw new Error('Expected real mapper to admit error fixture');
+    expect(details.utilization).toBeNull();
+    try {
+      await surfaceClaudeRateLimitRuntimeIssue({ client: { sessionId: 'review-unmeasured', sessionTurnLifecycle: { failTurn } } }, details, '[review]');
+      expect(failTurn.mock.calls[0]?.[0].issue?.usageLimit?.allWindows).toBeUndefined();
+    } finally { restoreClaudeSelectionEnv(previous); }
+  });
+
+  it('retains measured windows when sidechain failure evidence is recorded without failing the parent', async () => {
+    const previous = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    const failTurn = createClaudeFailTurnSpy();
+    const session = { client: { sessionId: 'sidechain-quota-windows', sessionTurnLifecycle: { failTurn } } };
+    try {
+      await captureClaudeRuntimeAuthRequestIdentity(session);
+      await recordClaudeRateLimitQuotaEvidence(session, mapClaudeRateLimitEventToQuotaEvidence({
+        type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning', unifiedWindows: {
+          five_hour: { utilization: 1, resetsAt: 1790378400 },
+          seven_day: { utilization: 0.42, resetsAt: 1790928000 },
+        } },
+      }), '[claude-test]');
+      await recordClaudeRateLimitQuotaEvidence(session, mapClaudeRateLimitEventToQuotaEvidence({
+        type: 'assistant', isSidechain: true, isApiErrorMessage: true,
+        apiErrorStatus: 429, error: 'rate_limit', providerLimitId: 'five_hour',
+        message: { content: [{ type: 'text', text: 'Usage limit reached' }] },
+      }), '[claude-test]');
+      expect(ConnectedServiceQuotaSnapshotV1Schema.parse(
+        mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.lastCall?.[0].snapshot,
+      ).meters).toEqual([
+        expect.objectContaining({ meterId: 'five_hour', remainingPct: 0 }),
+        expect.objectContaining({ meterId: 'seven_day', remainingPct: 58 }),
+      ]);
+      expect(failTurn).not.toHaveBeenCalled();
+      expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
+    } finally { restoreClaudeSelectionEnv(previous); }
   });
 
   it('threads source provider account identity into passive Claude quota evidence delivery', async () => {
@@ -1489,13 +1717,95 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
   }
 
   function deliveredQuotaCall() {
-    const calls = mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls as readonly (readonly unknown[])[];
-    const call = calls.at(-1)?.[0] as
-      | { sourceProviderAccountId?: string; snapshot: import('@happier-dev/protocol').ConnectedServiceQuotaSnapshotV1 }
-      | undefined;
+    const call = mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls.at(-1)?.[0];
     if (!call) throw new Error('expected a quota snapshot delivery');
-    return call;
+    return { ...call, snapshot: ConnectedServiceQuotaSnapshotV1Schema.parse(call.snapshot) };
   }
+
+  it('routes a live wrap-up without a 429 to usage recovery attributed to the issued request', async () => {
+    mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mockClear();
+    await writeMaterializedClaudeConfig({ accountUuid: 'issued-account', organizationUuid: 'issued-org' });
+    const transcriptPath = join(tmpDir, 'wrap-up-session.jsonl');
+    await writeFile(transcriptPath, JSON.stringify({
+      type: 'attachment', sessionId: 'wrap-up-session', timestamp: '2026-10-28T20:35:00.000Z',
+      attachment: { type: 'credential_org', organizationUuid: 'issued-org' },
+    }) + '\n');
+    const failTurn = createClaudeFailTurnSpy();
+    const session = { sessionId: 'wrap-up-session', transcriptPath,
+      client: { sessionId: 'wrap-up-recovery', sessionTurnLifecycle: { failTurn } } };
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    // Another session may have rewritten the shared home before this request's note arrives.
+    await writeMaterializedClaudeConfig({ accountUuid: 'later-account', organizationUuid: 'later-org' });
+    const scanner = await createSessionScanner({ sessionId: 'wrap-up-session', transcriptPath, workingDirectory: tmpDir,
+      onMessage: () => {},
+      onRawJsonlValue: (value, observation) => observeClaudeRuntimeAuthTranscript(session, value, observation) });
+    try {
+      await appendFile(transcriptPath, JSON.stringify({
+        type: 'user', isMeta: true, turnCompanion: true, usageLimitNote: 'wrap_up',
+        sessionId: 'wrap-up-session', timestamp: '2026-10-28T20:35:17.925Z',
+        message: { role: 'user', content: '[Usage limit reached; a short grace allowance remains.]' },
+      }) + '\n');
+      await vi.waitFor(() => expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: 'wrap-up-recovery', classification: expect.objectContaining({
+          kind: 'usage_limit', sourceProviderAccountId: 'issued-account',
+          sourceProviderOrganizationId: 'issued-org', providerReportedOrganizationId: 'issued-org',
+        }) }), expect.anything(),
+      ));
+      expect(failTurn).toHaveBeenCalledWith(expect.objectContaining({
+        issue: expect.objectContaining({ code: 'usage_limit' }),
+      }));
+    } finally { await scanner.cleanup(); }
+  });
+
+  it.each([true, false])('keeps near-limit runnable without publishing quota (attributed=%s)', async (knownIdentity) => {
+    mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mockClear();
+    const log = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    try {
+      await writeMaterializedClaudeConfig({ accountUuid: 'issued-account', organizationUuid: 'issued-org' });
+      const transcriptPath = join(tmpDir, 'near-note.jsonl');
+      const failTurn = createClaudeFailTurnSpy();
+      const session = { sessionId: 'near-note', transcriptPath,
+        client: { sessionId: 'near-note-quota', sessionTurnLifecycle: { failTurn } } };
+      if (knownIdentity) await captureClaudeRuntimeAuthRequestIdentity(session);
+      // A later shared-home identity must never be attributed to this note.
+      await writeMaterializedClaudeConfig({ accountUuid: 'ambient-account', organizationUuid: 'ambient-org' });
+      observeClaudeRuntimeAuthTranscript(session, {
+        type: 'user', isMeta: true, turnCompanion: true, usageLimitNote: 'near_limit',
+        sessionId: 'near-note', timestamp: '2026-10-28T20:35:17.925Z',
+        message: { role: 'user', content: '[Usage limit approaching. Checkpoint now.]' },
+      });
+      // Drain the fire-and-forget intake's already-resolved request identity and delivery microtasks.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mockNotifyDaemonConnectedServiceQuotaSnapshot).not.toHaveBeenCalled();
+      expect(failTurn).not.toHaveBeenCalled();
+      expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('[claude] Native usage-limit advisory', expect.objectContaining({
+        sessionId: 'near-note-quota', sourceSessionId: 'near-note', usageLimitNoteKind: 'near_limit',
+        attribution: knownIdentity ? 'attributed' : 'unattributed',
+        sourceProviderAccountId: knownIdentity ? 'issued-account' : null,
+        sourceProviderOrganizationId: knownIdentity ? 'issued-org' : null,
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  it('does not recover from replay, sidechains, release notes, foreign sessions, or native sessions', () => {
+    mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mockClear();
+    const failTurn = createClaudeFailTurnSpy();
+    const session = { sessionId: 'guarded-note', client: { sessionId: 'guarded-note', sessionTurnLifecycle: { failTurn } } };
+    const note = { type: 'user', isMeta: true, turnCompanion: true, usageLimitNote: 'near_limit',
+      sessionId: 'guarded-note', timestamp: '2026-10-28T20:35:17.925Z',
+      message: { role: 'user', content: '[Usage limit approaching. Checkpoint now.]' } };
+    observeClaudeRuntimeAuthTranscript(session, note, { historicalReplay: true });
+    observeClaudeRuntimeAuthTranscript(session, { ...note, isSidechain: true });
+    observeClaudeRuntimeAuthTranscript(session, { ...note, usageLimitNote: 'release' });
+    observeClaudeRuntimeAuthTranscript(session, { ...note, sessionId: 'foreign-session' });
+    const poolEnv = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    try { observeClaudeRuntimeAuthTranscript(session, note); }
+    finally { restoreClaudeSelectionEnv(poolEnv); }
+    expect(failTurn).not.toHaveBeenCalled();
+    expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
+  });
 
   it.each(['auth', 'quota'] as const)('cross-checks a %s failure against the last credential_org at or before its timestamp', async (kind) => {
     await writeMaterializedClaudeConfig({ accountUuid: 'later-account', organizationUuid: 'later-org' });
@@ -1526,6 +1836,19 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith(expect.objectContaining({
       classification: expect.objectContaining({ providerReportedOrganizationId: 'failing-org' }),
     }), expect.anything());
+    const reported = sanitizeConnectedServiceRuntimeFailureClassification(
+      mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0].classification,
+    );
+    if (!reported) throw new Error('Expected a reported runtime failure');
+    expect(reported).toMatchObject({ sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+    const attributed = await resolveRuntimeAuthFailureSourceProfile({
+      classification: reported,
+      getGroupMembers: async () => [{ profileId: 'claude-main', enabled: true }, { profileId: 'ai1', enabled: true }],
+      // Connected-account credential storage is the daemon's external identity boundary.
+      resolveProviderAccountIdentity: async (profileId) => ({ providerAccountId: profileId,
+        providerOrganizationId: profileId === 'ai1' ? 'failing-org' : 'later-org' }),
+    });
+    expect(attributed).toMatchObject({ profileId: 'ai1', groupGeneration: null, credentialRevision: null });
   });
 
   it('reconciles only fresh credential_org observations through the real scanner raw channel', async () => {
@@ -1571,6 +1894,19 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
         credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS', sourceProviderAccountId: 'issued-account',
         sourceProviderOrganizationId: 'issued-org' }),
     }), expect.anything());
+    const reported = sanitizeConnectedServiceRuntimeFailureClassification(
+      mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0].classification,
+    );
+    if (!reported) throw new Error('Expected a reported runtime failure');
+    const attributed = await resolveRuntimeAuthFailureSourceProfile({
+      classification: reported,
+      getGroupMembers: async () => [{ profileId: 'claude-main', enabled: true }, { profileId: 'ai1', enabled: true }],
+      resolveProviderAccountIdentity: async (profileId) => ({
+        providerAccountId: profileId === 'ai1' ? 'issued-account' : 'later-account',
+        providerOrganizationId: profileId === 'ai1' ? 'issued-org' : 'later-org',
+      }),
+    });
+    expect(attributed).toMatchObject({ profileId: 'ai1', groupGeneration: null, credentialRevision: null });
   });
 
   it('reports a rejected provider organization acknowledgement on the default log', async () => {

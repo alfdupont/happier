@@ -69,7 +69,6 @@ vi.mock('@/activity/notifications/runtime/activityLocalNotificationBus', () => (
     notifyActivityReady: (...args: unknown[]) => notifyActivityReadyMock(...args),
 }));
 
-import { markSessionHidden, markSessionVisible } from './domains/session/activeViewingSession';
 import { storage } from './domains/state/storage';
 import type { Session } from './domains/state/storageTypes';
 import type { NormalizedMessage } from './typesRaw';
@@ -135,15 +134,12 @@ describe('Sync ready notification dedupe', () => {
 
         const { sync } = await import('./sync');
         sync.disconnectServer();
-        markSessionHidden('s1');
     });
 
     it('upgrades projection-only ready advancement with the later transcript payload without duplicating activity notifications', async () => {
         const { sync } = await import('./sync');
         const syncForTest = sync as unknown as SyncReadyNotificationTestAccess;
         storage.getState().applySessions([createSession('s1')]);
-        // A visible session consumes its live transcript, so activity waits for the preview text.
-        markSessionVisible('s1');
 
         syncForTest.notifyReadyProjectionAdvance('s1', 2);
         syncForTest.applyMessages('s1', [
@@ -154,6 +150,8 @@ describe('Sync ready notification dedupe', () => {
 
         expect(voiceOnReadyMock).toHaveBeenCalledTimes(3);
         expect(notifyActivityReadyMock).toHaveBeenCalledTimes(2);
+        // Each activity event carries the ready event's own sequence, the identity every tab shares.
+        expect(notifyActivityReadyMock.mock.calls.map((call) => call[2])).toEqual([2, 3]);
         expect(voiceOnReadyMock).toHaveBeenNthCalledWith(1, 's1', []);
         expect(voiceOnReadyMock).toHaveBeenNthCalledWith(
             2,
@@ -174,28 +172,8 @@ describe('Sync ready notification dedupe', () => {
                     text: 'Ready with transcript context',
                 }),
             ]),
+            2,
         );
-    });
-
-    it('notifies activity from the ready projection of a hidden session and not again when its transcript loads', async () => {
-        const { sync } = await import('./sync');
-        const syncForTest = sync as unknown as SyncReadyNotificationTestAccess;
-        storage.getState().applySessions([createSession('s1')]);
-
-        // Hidden sessions are routed projection-only: their transcript is not applied live.
-        syncForTest.notifyReadyProjectionAdvance('s1', 2);
-        expect(notifyActivityReadyMock).toHaveBeenCalledTimes(1);
-        expect(notifyActivityReadyMock).toHaveBeenLastCalledWith('s1', [], { origin: 'projection' });
-
-        // Opening the session later loads the transcript for the same turn.
-        syncForTest.applyMessages('s1', [
-            assistantTextMessage(1, 'Ready with transcript context'),
-            readyMessage(2),
-        ]);
-        expect(notifyActivityReadyMock).toHaveBeenCalledTimes(1);
-
-        syncForTest.applyMessages('s1', [readyMessage(3)]);
-        expect(notifyActivityReadyMock).toHaveBeenCalledTimes(2);
     });
 
     it('does not send recovered history to live message hooks while queue-dependent output still emits once', async () => {

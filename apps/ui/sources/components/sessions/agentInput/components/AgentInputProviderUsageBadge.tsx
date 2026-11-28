@@ -1,3 +1,4 @@
+import { AgentInputProviderQuotaLabel } from './AgentInputProviderQuotaLabel';
 import * as React from 'react';
 import { Platform, Pressable, View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
@@ -7,16 +8,15 @@ import { Text } from '@/components/ui/text/Text';
 import { TokenUsageRing, type TokenUsageTone } from '@/components/sessions/usage';
 import { Typography } from '@/constants/Typography';
 import { t } from '@/text';
+import {
+    resolveConnectedServiceSubscriptionStatusLabel,
+    resolveConnectedServiceSubscriptionStatusTone,
+} from '@/sync/domains/connectedServices/subscriptionStatus';
 import type {
     ConnectedServiceQuotaGaugeViewModel,
 } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
 
 import { AgentInputContentPopover } from './AgentInputContentPopover';
-
-type WebHoverablePressableState = Readonly<{
-    pressed: boolean;
-    hovered?: boolean;
-}>;
 
 type AgentInputProviderUsageBadgeProps = Readonly<{
     viewModel: ConnectedServiceQuotaGaugeViewModel;
@@ -46,6 +46,7 @@ function areProviderUsageMeterRowsEqual(
             || leftRow.usedLimitSemantics !== rightRow.usedLimitSemantics
             || leftRow.usedLimitLabel !== rightRow.usedLimitLabel
             || leftRow.resetLabel !== rightRow.resetLabel
+            || leftRow.resetAtMs !== rightRow.resetAtMs
             || leftRow.tone !== rightRow.tone
         ) {
             return false;
@@ -92,8 +93,7 @@ function areProviderUsageViewModelsEqual(
     const subscriptionEqual = leftSubscription === rightSubscription || (!!leftSubscription && !!rightSubscription
         && leftSubscription.summary === rightSubscription.summary
         && leftSubscription.period === rightSubscription.period
-        && leftSubscription.renewal === rightSubscription.renewal
-        && leftSubscription.renewalLabel === rightSubscription.renewalLabel
+        && leftSubscription.status === rightSubscription.status
         && leftSubscription.checkedLabel === rightSubscription.checkedLabel
         && leftSubscription.notice === rightSubscription.notice
         && leftSubscription.accessUntilLabel === rightSubscription.accessUntilLabel
@@ -105,6 +105,7 @@ function areProviderUsageViewModelsEqual(
         && left.usedPct === right.usedPct
         && left.valueLabel === right.valueLabel
         && left.ringValueLabel === right.ringValueLabel
+        && left.ringValueAccessibilityLabel === right.ringValueAccessibilityLabel
         && left.badgeLabel === right.badgeLabel
         && left.scopePrefix === right.scopePrefix
         && left.primaryValueSemantics === right.primaryValueSemantics
@@ -145,6 +146,8 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
     props: AgentInputProviderUsageBadgeProps,
 ) {
     const styles = stylesheet;
+    const subscriptionTone = props.viewModel.subscription
+        ? resolveConnectedServiceSubscriptionStatusTone(props.viewModel.subscription.status) : null;
     const anchorRef = React.useRef<any>(null);
     const [isPinnedOpen, setIsPinnedOpen] = React.useState(false);
     const [isHovered, setIsHovered] = React.useState(false);
@@ -159,7 +162,7 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
         ? [props.viewModel.badgeLabel]
         : rings.map((ring) => `${ring.label} ${ring.valueLabel}`);
     const accessibilityLabel = t('agentInput.providerUsage.accessibilityLabel', {
-        value: ringAccessibilityValues.join(', '),
+        value: [props.viewModel.ringValueAccessibilityLabel, ...ringAccessibilityValues].filter(Boolean).join(', '),
     });
     const title = props.viewModel.providerDisplayName
         ? t('agentInput.providerUsage.titleForProvider', { provider: props.viewModel.providerDisplayName })
@@ -180,40 +183,37 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                 }}
                 onHoverIn={Platform.OS === 'web' ? () => setIsHovered(true) : undefined}
                 onHoverOut={Platform.OS === 'web' ? () => setIsHovered(false) : undefined}
-                style={(state) => {
-                    const hovered = (state as WebHoverablePressableState).hovered === true;
-                    return [
-                        styles.badge,
-                        { marginLeft: props.marginLeft ?? 0 },
-                        (state.pressed || hovered) ? styles.badgePressed : null,
-                    ];
-                }}
+                // Press feedback only: hovering opens the preview popover and must not resize the gauge.
+                style={(state) => [
+                    styles.badge,
+                    { marginLeft: props.marginLeft ?? 0 },
+                    state.pressed ? styles.badgePressed : null,
+                ]}
             >
-                {rings.map((ring, index) => {
-                    const testIdSuffix = index === 0 ? '' : `:${ring.meterId}`;
-                    return (
-                        <View key={ring.meterId} style={styles.windowRing}>
-                            {props.showLabels === true || rings.length > 1 ? (
-                                <Text
-                                    testID={`agent-input-provider-usage-meter-label${testIdSuffix}`}
-                                    style={styles.windowLabel}
-                                    numberOfLines={1}
-                                >
-                                    {ring.label}
-                                </Text>
-                            ) : null}
-                            <TokenUsageRing
-                                used={ring.usedPct}
-                                limit={100}
-                                label={rings.length === 1 ? accessibilityLabel : ringAccessibilityValues[index]}
-                                value={ring.ringValueLabel}
-                                tone={mapQuotaToneToTokenTone(ring.tone)}
-                                ringTestID={`agent-input-provider-usage-ring${testIdSuffix}`}
-                                valueTestID={`agent-input-provider-usage-value${testIdSuffix}`}
-                            />
-                        </View>
-                    );
-                })}
+                <View style={styles.windowRing}>
+                    {props.showLabels === true ? (
+                        <Text
+                            testID="agent-input-provider-usage-meter-label"
+                            style={styles.windowLabel}
+                            numberOfLines={1}
+                        >
+                            {rings.map(ring => ring.label).join(' / ')}
+                        </Text>
+                    ) : null}
+                    <TokenUsageRing
+                        measures="remaining"
+                        used={100 - rings[0].usedPct}
+                        limit={100}
+                        rings={rings.map(ring => ({
+                            used: 100 - ring.usedPct, limit: 100, tone: mapQuotaToneToTokenTone(ring.tone),
+                        }))}
+                        label={accessibilityLabel}
+                        value={props.viewModel.ringValueLabel}
+                        tone={mapQuotaToneToTokenTone(props.viewModel.tone)}
+                        ringTestID="agent-input-provider-usage-ring"
+                        valueTestID="agent-input-provider-usage-value"
+                    />
+                </View>
             </Pressable>
             </View>
 
@@ -243,9 +243,9 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                                     <View style={styles.subscriptionStatus}>
                                         <View style={[
                                             styles.subscriptionStatusDot,
-                                            props.viewModel.subscription.renewal === 'on'
+                                            subscriptionTone === 'on'
                                                 ? styles.subscriptionStatusDotOn
-                                                : props.viewModel.subscription.renewal === 'off'
+                                                : subscriptionTone === 'off'
                                                     ? styles.subscriptionStatusDotOff
                                                     : styles.subscriptionStatusDotUnknown,
                                         ]} />
@@ -253,16 +253,18 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                                             testID="agent-input-provider-usage-subscription:renewal"
                                             style={styles.subscriptionRenewal}
                                         >
-                                            {props.viewModel.subscription.renewalLabel}
+                                            {resolveConnectedServiceSubscriptionStatusLabel(props.viewModel.subscription.status)}
                                         </Text>
                                     </View>
                                 </View>
-                                <Text
-                                    testID="agent-input-provider-usage-subscription:summary"
-                                    style={styles.subscriptionSummary}
-                                >
-                                    {props.viewModel.subscription.summary}
-                                </Text>
+                                {props.viewModel.subscription.summary ? (
+                                    <Text
+                                        testID="agent-input-provider-usage-subscription:summary"
+                                        style={styles.subscriptionSummary}
+                                    >
+                                        {props.viewModel.subscription.summary}
+                                    </Text>
+                                ) : null}
                                 {props.viewModel.subscription.period ? (
                                     <Text style={styles.subscriptionMeta}>{props.viewModel.subscription.period}</Text>
                                 ) : null}
@@ -288,7 +290,12 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                                         {row.label}
                                     </Text>
                                     <Text style={styles.meterRight} numberOfLines={1}>
-                                        {row.detailRightLabel}
+                                        <AgentInputProviderQuotaLabel
+                                            resetAtMs={row.resetAtMs}
+                                            remainingPct={row.remainingPct}
+                                            detailLabel={row.detailRightLabel}
+                                            presented={open}
+                                        />
                                     </Text>
                                 </View>
                                 {row.remainingPct !== null ? <MeterBar
@@ -411,6 +418,7 @@ const stylesheet = StyleSheet.create((theme) => ({
         alignItems: 'center',
         justifyContent: 'space-between',
         gap: 12,
+        marginBottom: 8,
     },
     subscriptionLabel: {
         fontSize: 10,
@@ -446,7 +454,6 @@ const stylesheet = StyleSheet.create((theme) => ({
     subscriptionSummary: {
         fontSize: 13,
         lineHeight: 18,
-        marginTop: 8,
         color: theme.colors.text.primary,
         ...Typography.default('semiBold'),
     },
@@ -498,6 +505,7 @@ const stylesheet = StyleSheet.create((theme) => ({
         flexDirection: 'row',
         alignItems: 'flex-start',
         gap: 6,
+        marginTop: 12,
         paddingTop: 12,
         borderTopWidth: 1,
         borderTopColor: theme.colors.border.subtle,

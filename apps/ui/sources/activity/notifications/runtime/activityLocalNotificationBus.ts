@@ -1,18 +1,13 @@
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import type { AgentRequestKind } from '@/utils/sessions/permissions/permissionPromptPolicy';
 
-/**
- * Where a ready turn was observed: in the applied transcript, or only in the session projection of
- * a hidden session whose transcript is not applied live (so no message preview is available).
- */
-export type ActivityReadyOrigin = 'transcript' | 'projection';
-
 export type ActivityLocalNotificationEvent =
     | Readonly<{
         kind: 'ready';
         sessionId: string;
         messages?: Message[];
-        origin: ActivityReadyOrigin;
+        /** The ready event's transcript sequence: the identity every client shares for this turn end. */
+        readyEventSeq?: number;
     }>
     | Readonly<{
         kind: 'agent-request';
@@ -35,11 +30,7 @@ export function subscribeActivityLocalNotifications(listener: Listener): () => v
     };
 }
 
-export function notifyActivityReady(
-    sessionId: string,
-    messages?: Message[],
-    options?: Readonly<{ origin?: ActivityReadyOrigin }>,
-): void {
+export function notifyActivityReady(sessionId: string, messages?: Message[], readyEventSeq?: number | null): void {
     const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
     if (!normalizedSessionId) return;
 
@@ -47,7 +38,7 @@ export function notifyActivityReady(
         kind: 'ready',
         sessionId: normalizedSessionId,
         messages,
-        origin: options?.origin ?? 'transcript',
+        ...(typeof readyEventSeq === 'number' && Number.isFinite(readyEventSeq) ? { readyEventSeq } : {}),
     };
 
     for (const listener of Array.from(listeners)) {

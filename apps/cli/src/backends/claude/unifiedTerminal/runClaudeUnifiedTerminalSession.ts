@@ -7,6 +7,7 @@ import type {
   TerminalInputInjectionV1,
 } from '@happier-dev/agents';
 import {
+  parseSpecialCommand,
   SessionTerminalComposerClearResultV1Schema,
   type SessionTerminalComposerClearFailureStatusV1,
   type SessionTerminalComposerClearRequestV1,
@@ -32,6 +33,7 @@ import { createClaudeUnifiedTranscriptBridge } from './createClaudeUnifiedTransc
 import type { ClaudeEffectiveModelObservation } from '../sessionModels/effectiveModelUpdate';
 import type { ClaudeWorkflowActivityObservationContext } from '../workflows/claudeWorkflowActivitySource';
 import { isClaudeMainChainCompactBoundary } from '../localControl/readClaudeTranscriptTurnSignal';
+import { isClaudeInternalUserTextMessage } from '../utils/readClaudeUserMessageText';
 import type { ClaudeRemoteSubagentFileCollector } from '../remote/sidechains/claudeRemoteSubagentFileCollector';
 import {
   createClaudeUnifiedTerminalReadinessBridge,
@@ -172,6 +174,7 @@ import {
 } from './telemetry';
 import type { NormalizedProviderUsageLimitDetailsV1 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
 import { logger } from '@/ui/logger';
+import { runnerTerminationSignals, type RunnerTerminationSignal } from '@/agent/runtime/runnerTerminationOutcome';
 import {
   clearSessionMarkerTerminalHostHealth,
   publishSessionMarkerTerminalHostHealth,
@@ -196,10 +199,9 @@ type ClaudeUnifiedTerminalAcceptedInput<Mode> =
   ClaudeUnifiedTerminalQueuedInput<Mode> & ClaudeUnifiedPromptAcceptance;
 
 type ClaudeUnifiedTerminalHostPreference = ClaudeUnifiedTerminalHost;
-type ClaudeUnifiedProcessSignal = 'SIGINT' | 'SIGTERM';
 type ClaudeUnifiedProcessSignals = Readonly<{
-  once(event: ClaudeUnifiedProcessSignal, listener: () => void): unknown;
-  removeListener(event: ClaudeUnifiedProcessSignal, listener: () => void): unknown;
+  once(event: RunnerTerminationSignal, listener: () => void): unknown;
+  removeListener(event: RunnerTerminationSignal, listener: () => void): unknown;
 }>;
 
 export class ClaudeUnifiedTerminalHostUnavailableError extends Error {
@@ -797,12 +799,11 @@ function bindProcessSignalCleanup(params: Readonly<{
     });
   };
 
-  params.processSignals.once('SIGINT', onSignal);
-  params.processSignals.once('SIGTERM', onSignal);
+  const signals = runnerTerminationSignals();
+  for (const signal of signals) params.processSignals.once(signal, onSignal);
 
   return () => {
-    params.processSignals.removeListener('SIGINT', onSignal);
-    params.processSignals.removeListener('SIGTERM', onSignal);
+    for (const signal of signals) params.processSignals.removeListener(signal, onSignal);
   };
 }
 
@@ -824,11 +825,6 @@ function isAcceptedPromptTranscriptCandidate(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
   const type = (value as Record<string, unknown>).type;
   return type === 'user' || type === 'queue-operation' || type === 'attachment';
-}
-
-function isCompactSlashCommandPrompt(message: string): boolean {
-  const trimmed = message.trim();
-  return trimmed === '/compact' || trimmed.startsWith('/compact ');
 }
 
 function isDeterministicInvalidPromptTextFailure(
@@ -1183,6 +1179,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
   let spawn: ClaudeUnifiedTerminalSpawn | null = null;
   let spawnArtifactsHandedOff = false;
   let spawnEnvForRuntimeControl: Readonly<Record<string, string>> | null = null;
+  const readProviderInvocation = () => spawn?.providerInvocation;
   const ensureSpawn = async (): Promise<ClaudeUnifiedTerminalSpawn> => {
     if (spawn) return spawn;
     spawn = await (opts.buildSpawn ?? buildDefaultSpawn)({
@@ -1265,6 +1262,14 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit').catch((error) => {
       logger.debug('[unified]: Claude process-exit activity observation failed', error);
     });
+  };
+  const failForTerminalHostLoss = (
+    activeHandle: TerminalHostHandle,
+    error: ClaudeUnifiedTerminalHostDeadError,
+  ): void => {
+    void publishHostDeadHealth(activeHandle, error.liveness);
+    fatalRuntimeError ??= error;
+    if (!runtimeAbortController.signal.aborted) runtimeAbortController.abort(error);
   };
   const expectedProviderResumeSessionId =
     typeof opts.expectedProviderResumeSessionId === 'string'
@@ -2153,7 +2158,16 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       unregisterInFlightSteerAvailabilityRefresh =
         opts.registerInFlightSteerAvailabilityRefresh?.(steerWiring.refreshAvailability) ?? null;
       const arbiter = createClaudeUnifiedInputArbiter<Mode>({
-        injectPrompt: promptInjector.injectPrompt,
+        injectPrompt: async (batch, options) => {
+          // The provider can echo the prompt before the terminal write returns.
+          if (batch.origin.kind !== 'goal_control') recordPromptAcceptanceCorrelation(batch);
+          const result = await promptInjector.injectPrompt(batch, options);
+          if (result.status === 'deferred' || (result.status === 'failed' && result.duplicateRisk === 'none')) {
+            acceptedPromptTranscriptDiscovery.forgetRetiredPromptByBatch(batch);
+            promptAcceptanceCorrelationRecordedBatches.delete(batch);
+          }
+          return result;
+        },
         injectionRetryLimit: configuration.claudeUnifiedTerminalInjectionRetryLimit,
         injectionRetryBaseDelayMs: configuration.claudeUnifiedTerminalInjectionRetryBaseDelayMs,
         evaluateInFlightSteer: steerWiring.evaluateInFlightSteer,
@@ -2197,9 +2211,6 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             return;
           }
           return await notifyTerminalInjectionFailure('[unified]: failed to surface Claude unified terminal injection failure (non-fatal)');
-        },
-        onProviderAcceptancePending: (batch, _acceptance, observedAtMs) => {
-          recordPromptAcceptanceCorrelation(batch, observedAtMs);
         },
         onPromptInjected: async (batch, acceptance) => {
           steerWiring.observeInjectedPrompt(batch, acceptance);
@@ -2362,13 +2373,11 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       const promptAcceptanceCorrelationRecordedBatches = new WeakSet<object>();
       const recordPromptAcceptanceCorrelation = (
         batch: ClaudeUnifiedPromptBatch<Mode>,
-        acceptedAtMs?: number | undefined,
       ): void => {
         if (promptAcceptanceCorrelationRecordedBatches.has(batch)) return;
         promptAcceptanceCorrelationRecordedBatches.add(batch);
         acceptedPromptTranscriptDiscovery.recordAcceptedPrompt({
           message: batch.message,
-          ...(acceptedAtMs === undefined ? {} : { acceptedAtMs }),
           deliveryIdentity: {
             localIds: batch.userMessageLocalIds ?? [],
             userMessageSeq: batch.maxUserMessageSeq ?? null,
@@ -2416,7 +2425,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       };
       const confirmCompactBoundaryPromptAcceptedFromTranscript = (message: RawJSONLines): boolean => {
         if (!isClaudeMainChainCompactBoundary(message)) return false;
-        void arbiter.confirmPromptAcceptedByProviderIf((batch) => isCompactSlashCommandPrompt(batch.message)).catch(() => undefined);
+        void arbiter.confirmPromptAcceptedByProviderIf((batch) => parseSpecialCommand(batch.message).type === 'compact').catch(() => undefined);
         return true;
       };
       const pendingQueuePump = createClaudeUnifiedPendingQueuePump<Mode>({
@@ -2547,6 +2556,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         message: RawJSONLines,
         handler: ((message: RawJSONLines) => void | Promise<void>) | undefined,
       ): Promise<void> => {
+        if (isClaudeInternalUserTextMessage(message)) return;
         if (acceptedPromptTranscriptDiscovery.consumeAcceptedPromptTranscriptEcho(message)) {
           opts.onTranscriptMessageSuppressed?.(message);
           return;
@@ -2595,7 +2605,9 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
               // feeds the centralized goal source; never reaches the visible transcript.
               opts.onRawTranscriptValue?.(value, observation);
             },
-            proveAcceptedMainTranscript: (value) => confirmPromptAcceptedFromTranscript([value]),
+            onMainTranscriptForPromptAcceptance: (value) => {
+              confirmPromptAcceptedFromTranscript([value]);
+            },
             onSubagentFileCollectorChanged: opts.onSubagentFileCollectorChanged,
             onSessionFound: opts.onSessionFound,
             validateSessionStart: (sessionInfo) => {
@@ -2704,6 +2716,19 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             startupGraceMs: configuration.claudeUnifiedTerminalStartupReadinessTimeoutMs,
             startupGraceActive: () => startupHostLivenessGraceActive,
             isExpectedHostExit: (liveness) => expectedPromptInputExit && isCleanTerminalExit(liveness),
+            // Owned processes already deliver qualified exit through IPC. Independently
+            // launched hosts may qualify only the actual provider invocation, never a runner.
+            providerInvocation: currentTerminalProcess ? undefined : readProviderInvocation(),
+            onProviderGone: ({ liveness }) => {
+              observeProviderProcessExit();
+              if (expectedPromptInputExit) {
+                if (!runtimeAbortController.signal.aborted) {
+                  runtimeAbortController.abort('claude-unified-terminal-graceful-exit');
+                }
+                return;
+              }
+              failForTerminalHostLoss(activeHandle, new ClaudeUnifiedTerminalHostDeadError(liveness));
+            },
             onHostExited: () => {
               if (!currentTerminalProcess) {
                 void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit').catch((error) => {
@@ -2715,12 +2740,8 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
               }
             },
             onHostDead: (error) => {
-              if (!currentTerminalProcess) {
-                observeUnverifiedProviderExit(error);
-              }
-              void publishHostDeadHealth(activeHandle, error.liveness);
-              fatalRuntimeError ??= error;
-              runtimeAbortController.abort(error);
+              if (!currentTerminalProcess) observeUnverifiedProviderExit(error);
+              failForTerminalHostLoss(activeHandle, error);
             },
           }),
         ]),

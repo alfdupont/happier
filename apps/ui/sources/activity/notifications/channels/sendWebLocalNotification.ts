@@ -1,34 +1,48 @@
-import { playWebNotificationChime } from './playWebNotificationChime';
-import { showWebNotification } from './webNotificationApi';
+type BrowserNotificationApi = {
+    readonly permission: NotificationPermission;
+    requestPermission(): Promise<NotificationPermission>;
+    new (title: string, options?: NotificationOptions): Pick<Notification, 'close' | 'onclick'>;
+};
+
+function readBrowserNotificationApi(): BrowserNotificationApi | null {
+    const api = (globalThis as { Notification?: unknown }).Notification;
+    return typeof api === 'function' ? (api as BrowserNotificationApi) : null;
+}
 
 /**
- * Shows a browser notification while the Happier tab is open. Permission is requested from
- * Settings → Notifications (it needs a user gesture); until it is granted this is a no-op.
+ * Shows a browser system notification. It never prompts: a background event is no moment to ask,
+ * so permission comes from `requestWebLocalNotificationPermission` on explicit user intent.
  */
 export async function sendWebLocalNotification(params: Readonly<{
     title: string;
     body: string;
-    tag: string;
-    playSound: boolean;
-    onClick: () => void;
+    tag?: string;
+    silent?: boolean;
+    onClick?: () => void;
 }>): Promise<boolean> {
-    const notification = showWebNotification(params.title, {
-        body: params.body,
-        tag: params.tag,
-        silent: true,
-    });
-    if (!notification) {
+    const BrowserNotification = readBrowserNotificationApi();
+    if (BrowserNotification?.permission !== 'granted') {
         return false;
     }
 
+    const notification = new BrowserNotification(params.title, {
+        body: params.body,
+        ...(params.tag ? { tag: params.tag } : {}),
+        ...(params.silent ? { silent: true } : {}),
+    });
     notification.onclick = () => {
-        (globalThis as unknown as { focus?: () => void }).focus?.();
+        (globalThis as { focus?: () => void }).focus?.();
         notification.close();
-        params.onClick();
+        params.onClick?.();
     };
-
-    if (params.playSound) {
-        await playWebNotificationChime();
-    }
     return true;
+}
+
+/** Asks the browser for notification permission while it is undecided. Call it from a user gesture. */
+export async function requestWebLocalNotificationPermission(): Promise<void> {
+    const BrowserNotification = readBrowserNotificationApi();
+    if (BrowserNotification?.permission !== 'default') {
+        return;
+    }
+    await BrowserNotification.requestPermission();
 }

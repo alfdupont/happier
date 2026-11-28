@@ -52,16 +52,7 @@ Platform details:
 - **iOS** can show the tool/request name as a notification subtitle
 - **Android** uses dedicated channels for permission requests and action requests so users can tune them separately at the OS level
 
-## Browser notifications
-
-**This fork's development builds:** the web app shows browser notifications for the same events, using your **Local notifications** settings in **Settings → Notifications**. Open **Browser notifications → Browser permission** and allow notifications when your browser asks. If you blocked them earlier, allow notifications for the site in your browser's settings.
-
-- A Happier tab must be open. It can be in the background, but a closed tab receives nothing. For alerts while no tab is open, use push on your phone or a webhook.
-- While browser notifications are allowed, a hidden Happier tab stays connected so it can notify you. Without them, a hidden tab disconnects to save resources and catches up when you return.
-- A notification for the session you are looking at is skipped while the tab is visible and focused.
-- A background tab always shows the notification and plays a short sound. While the tab is in front, **Foreground behavior** applies: `full` plays the sound, `silent` shows the notification without it, and `off` shows nothing.
-- Happier plays the sound itself and shows the browser notification silently, so you hear the same sound everywhere, including on systems that play none for browser notifications.
-- Clicking a notification focuses the tab and opens the session.
+Development builds add app-rendered Android action buttons to remote permission and input requests when the Android app, relay, and CLI all support the updated delivery path. This requires a new Android app build.
 
 ## Webhook notifications
 
@@ -135,6 +126,18 @@ Current settings include:
 - **In-app notifications** behavior while the app is open: `Full`, `Silent`, or `Off`
 
 When you are already looking at a given session, Happier suppresses notifications for that same session to avoid duplicate noise while you are actively reading it.
+
+### Browser notifications
+
+The web app shows browser system notifications when a turn finishes, and when a session needs a permission decision or your answer. The toggles under **Settings → Notifications → Device notifications** choose which ones appear, and clicking a notification opens its session.
+
+Your browser asks for permission when you turn on **Settings → Notifications → Device notifications → Enabled**. If the switch is already on and your browser never asked, turn it off and back on. If you blocked notifications for the site earlier, allow them in your browser's site settings instead; the switch can't bring the prompt back.
+
+A session open in a visible tab that has focus stays quiet. Switch to another app and that session notifies you as usual.
+
+While the Happier window has focus, **In-app notifications** applies to other sessions: `Silent` shows them without sound and `Off` hides them. The desktop app hides them with `Off` too.
+
+While the tab is hidden, behind another tab or in a minimized window, the web app pauses its connection and notifications stop. To be notified while you work elsewhere, give Happier its own browser window and keep part of it on screen, or use the desktop app, which stays connected in the background.
 
 ## What you need to configure
 

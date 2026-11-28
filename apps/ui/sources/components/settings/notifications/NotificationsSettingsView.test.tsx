@@ -9,6 +9,7 @@ import {
     type NotificationChannelTopicsV1,
     type NotificationsSettingsV1,
 } from '@happier-dev/protocol';
+import { installBrowserNotificationApiStub } from '@/dev/testkit/mocks/browserNotification';
 import { renderSettingsView } from '@/dev/testkit/harness/settingsViewHarness';
 import { installSettingsViewCommonModuleMocks } from '../settingsViewTestHelpers';
 
@@ -351,30 +352,42 @@ describe('NotificationsSettingsView', () => {
         expect(tauriRequestPermissionMock).toHaveBeenCalledTimes(1);
     });
 
-    it('offers browser notification permission in a plain browser tab and requests it on press', async () => {
-        const browserGlobals = globalThis as unknown as { Notification?: unknown };
-        const originalNotification = browserGlobals.Notification;
-        const requestPermission = vi.fn(async () => 'granted' as NotificationPermission);
-        // Browser boundary: the Web Notifications API.
-        browserGlobals.Notification = Object.assign(function FakeNotification() {}, {
-            permission: 'default' as NotificationPermission,
-            requestPermission,
-        });
-
+    it('asks the browser for notification permission when local notifications are turned on', async () => {
+        const browser = installBrowserNotificationApiStub('default');
         try {
             const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
+            const screen = await renderSettingsView(<NotificationsSettingsView />);
+            const enabledItem = requireRow(screen, 'settings-notifications-local-enabled');
 
+            await act(async () => {
+                enabledItem.props.rightElement.props.onValueChange(false);
+            });
+            expect(browser.requestPermission).not.toHaveBeenCalled();
+
+            await act(async () => {
+                enabledItem.props.rightElement.props.onValueChange(true);
+            });
+            expect(applyLocalSettingsMock).toHaveBeenLastCalledWith({ localNotificationsEnabled: true });
+            expect(browser.requestPermission).toHaveBeenCalledTimes(1);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('leaves desktop app notification permission to the desktop diagnostics row', async () => {
+        isTauriDesktopState.value = true;
+        const browser = installBrowserNotificationApiStub('default');
+        try {
+            const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
             const screen = await renderSettingsView(<NotificationsSettingsView />);
             await act(async () => {});
 
-            expect(screen.findRow('settings-notifications-desktop-permission')).toBeNull();
             await act(async () => {
-                screen.pressRow('settings-notifications-browser-permission');
+                requireRow(screen, 'settings-notifications-local-enabled').props.rightElement.props.onValueChange(true);
             });
-
-            expect(requestPermission).toHaveBeenCalledTimes(1);
+            expect(browser.requestPermission).not.toHaveBeenCalled();
         } finally {
-            browserGlobals.Notification = originalNotification;
+            vi.unstubAllGlobals();
         }
     });
 
